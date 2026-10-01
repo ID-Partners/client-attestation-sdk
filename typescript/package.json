@@ -1,0 +1,55 @@
+{
+  "name": "@idpartners/client-attestation-sdk",
+  "version": "0.2.0",
+  "description": "Client-side builder SDK for OAuth Attestation-Based Client Authentication",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./validator": {
+      "types": "./dist/validator/index.d.ts",
+      "import": "./dist/validator/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "emit": "tsx emit.ts",
+    "validate-emit": "tsx validate-emit.ts"
+  },
+  "license": "Apache-2.0",
+  "author": "ID Partners Pty Ltd",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ID-Partners/client-attestation-sdk.git",
+    "directory": "typescript"
+  },
+  "homepage": "https://github.com/ID-Partners/client-attestation-sdk/tree/main/typescript",
+  "dependencies": {
+    "jose": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0"
+  }
+}

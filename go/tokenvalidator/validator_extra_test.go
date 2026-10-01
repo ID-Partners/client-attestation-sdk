@@ -1,0 +1,559 @@
+package tokenvalidator
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v2/jws"
+)
+
+const (
+	testIssuer   = "https://issuer.test"
+	testAudience = "https://api.test"
+)
+
+// newTestKey generates a P-256 signing key (with kid when non-empty) and the
+// matching public JWKS document.
+func newTestKey(t *testing.T, kid string) (jwk.Key, json.RawMessage) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	key, err := jwk.FromRaw(priv)
+	if err != nil {
+		t.Fatalf("import key: %v", err)
+	}
+	if kid != "" {
+		if err := key.Set(jwk.KeyIDKey, kid); err != nil {
+			t.Fatalf("set kid: %v", err)
+		}
+	}
+	pub, err := key.PublicKey()
+	if err != nil {
+		t.Fatalf("public key: %v", err)
+	}
+	pubJSON, err := json.Marshal(pub)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	return key, json.RawMessage(`{"keys":[` + string(pubJSON) + `]}`)
+}
+
+// signPayload signs raw payload bytes with the key (ES256), carrying the key's
+// kid in the protected header when present.
+func signPayload(t *testing.T, key jwk.Key, payload []byte) string {
+	t.Helper()
+	hdrs := jws.NewHeaders()
+	if kid := key.KeyID(); kid != "" {
+		if err := hdrs.Set(jws.KeyIDKey, kid); err != nil {
+			t.Fatalf("set kid header: %v", err)
+		}
+	}
+	signed, err := jws.Sign(payload, jws.WithKey(jwa.ES256, key, jws.WithProtectedHeaders(hdrs)))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return string(signed)
+}
+
+// signClaims signs claims, defaulting iss and aud to the test issuer and audience when absent.
+func signClaims(t *testing.T, key jwk.Key, claims map[string]any) string {
+	t.Helper()
+	if _, ok := claims["iss"]; !ok {
+		claims["iss"] = testIssuer
+	}
+	if _, ok := claims["aud"]; !ok {
+		claims["aud"] = testAudience
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	return signPayload(t, key, payload)
+}
+
+func TestNewRejectsInvalidStaticJWKS(t *testing.T) {
+	if _, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: json.RawMessage(`{`)}); err == nil {
+		t.Error("expected an error for invalid JWKS JSON")
+	}
+}
+
+func TestJWKSURIRefreshResolvesUnknownKid(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	calls := 0
+	val, err := New(&Config{Audiences: []string{testAudience}, Issuer: testIssuer, JWKSURI: "https://as.test/jwks"},
+		WithHTTPGet(func(url string) ([]byte, error) {
+			calls++
+			if url != "https://as.test/jwks" {
+				t.Errorf("fetched %q", url)
+			}
+			return []byte(jwks), nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{
+		"iss": testIssuer, "sub": "agent-1", "exp": time.Now().Unix() + 300,
+	})
+	r := val.Validate(token, nil)
+	if !r.Valid {
+		t.Fatalf("expected valid, got %s: %s", r.Error, r.ErrorDescription)
+	}
+	if calls != 1 {
+		t.Errorf("jwks fetched %d times, want 1", calls)
+	}
+}
+
+func TestJWKSURIFetchFailure(t *testing.T) {
+	key, _ := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKSURI: "https://as.test/jwks"},
+		WithHTTPGet(func(string) ([]byte, error) { return nil, errors.New("boom") }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	r := val.Validate(token, nil)
+	if r.Valid || r.Error != ErrKeyNotFound || !strings.Contains(r.ErrorDescription, "fetch jwks") {
+		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
+	}
+}
+
+func TestJWKSURIUnparseableDocument(t *testing.T) {
+	key, _ := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKSURI: "https://as.test/jwks"},
+		WithHTTPGet(func(string) ([]byte, error) { return []byte("not json"), nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	r := val.Validate(token, nil)
+	if r.Valid || r.Error != ErrKeyNotFound || !strings.Contains(r.ErrorDescription, "parse jwks") {
+		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
+	}
+}
+
+func TestJWKSURIRefreshStillMissingKid(t *testing.T) {
+	key, _ := newTestKey(t, "k1")
+	_, otherJWKS := newTestKey(t, "other")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKSURI: "https://as.test/jwks"},
+		WithHTTPGet(func(string) ([]byte, error) { return []byte(otherJWKS), nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	r := val.Validate(token, nil)
+	if r.Valid || r.Error != ErrKeyNotFound || !strings.Contains(r.ErrorDescription, "no signing key") {
+		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
+	}
+}
+
+func TestNoKeySourceConfigured(t *testing.T) {
+	key, _ := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	r := val.Validate(token, nil)
+	if r.Valid || r.Error != ErrKeyNotFound {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestDefaultHTTPGetFetchesJWKS(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(jwks))
+	}))
+	val, err := New(&Config{Audiences: []string{testAudience}, Issuer: testIssuer, JWKSURI: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{
+		"iss": testIssuer, "exp": time.Now().Unix() + 300,
+	})
+	if r := val.Validate(token, nil); !r.Valid {
+		t.Fatalf("expected valid, got %s: %s", r.Error, r.ErrorDescription)
+	}
+	// A dead endpoint must fail closed through the same default transport.
+	srv.Close()
+	val2, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKSURI: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := val2.Validate(token, nil); r.Valid || r.Error != ErrKeyNotFound {
+		t.Errorf("dead jwks endpoint: got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestSingleKeySetMatchesTokenWithoutKid(t *testing.T) {
+	key, jwks := newTestKey(t, "")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	if r := val.Validate(token, nil); !r.Valid {
+		t.Fatalf("expected valid, got %s: %s", r.Error, r.ErrorDescription)
+	}
+}
+
+func TestMultiKeySetRejectsTokenWithoutKid(t *testing.T) {
+	key, jwks1 := newTestKey(t, "")
+	_, jwks2 := newTestKey(t, "k2")
+	var a, b struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if err := json.Unmarshal(jwks1, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(jwks2, &b); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := json.Marshal(map[string]any{"keys": append(a.Keys, b.Keys...)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: merged})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	if r := val.Validate(token, nil); r.Valid || r.Error != ErrKeyNotFound {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestNotYetValidToken(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	token := signClaims(t, key, map[string]any{"exp": now + 7200, "nbf": now + 3600})
+	if r := val.Validate(token, nil); r.Valid || r.Error != ErrNotYetValid {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestCustomLeewayAllowsRecentlyExpiredToken(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks, LeewaySeconds: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() - 60})
+	if r := val.Validate(token, nil); !r.Valid {
+		t.Errorf("expected valid within leeway, got %s", r.Error)
+	}
+}
+
+func TestMalformedClaimsPayload(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signPayload(t, key, []byte("not-json"))
+	r := val.Validate(token, nil)
+	if r.Valid || r.Error != ErrInvalidToken || !strings.Contains(r.ErrorDescription, "malformed claims") {
+		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
+	}
+}
+
+func TestGarbageTokenIsInvalid(t *testing.T) {
+	_, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := val.Validate("garbage", nil); r.Valid || r.Error != ErrInvalidToken {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestAlgorithmNotAccepted(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks, AcceptedAlgorithms: []string{"RS256"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
+	if r := val.Validate(token, nil); r.Valid || r.Error != ErrUnsupportedAlgorithm {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestIntrospectWithoutConfiguration(t *testing.T) {
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := val.Introspect("tok"); err == nil {
+		t.Error("expected an error with no introspection endpoint")
+	}
+	if r := val.ValidateActive("tok", nil); r.Valid || r.Error != ErrInvalidToken {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestIntrospectionClientSecretPost(t *testing.T) {
+	var gotAuth, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"active":true,"scp":["read",5],"aud":["https://rs.test",7]}`)
+	}))
+	defer srv.Close()
+
+	val, err := New(&Config{Issuer: testIssuer,
+		Audiences: []string{"https://rs.test"},
+		Introspection: &IntrospectionConfig{
+			Endpoint: srv.URL, ClientID: "rs-1", ClientSecret: "s3cret",
+			AuthMethod: "client_secret_post",
+		},
+	}, WithHTTPPost(nil)) // nil forces the defaultHTTPPost fallback inside Introspect
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := val.ValidateActive("opaque", []string{"read"})
+	if !r.Valid {
+		t.Fatalf("expected valid, got %s: %s", r.Error, r.ErrorDescription)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want none for client_secret_post", gotAuth)
+	}
+	if !strings.Contains(gotBody, "client_id=rs-1") || !strings.Contains(gotBody, "client_secret=s3cret") {
+		t.Errorf("body = %q", gotBody)
+	}
+	if len(r.Scopes) != 1 || r.Scopes[0] != "read" {
+		t.Errorf("scopes = %v (non-string scp entries must be dropped)", r.Scopes)
+	}
+	if len(r.Audience) != 1 || r.Audience[0] != "https://rs.test" {
+		t.Errorf("audience = %v (non-string aud entries must be dropped)", r.Audience)
+	}
+}
+
+func TestValidateActiveInsufficientScopeViaConfig(t *testing.T) {
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience},
+		RequiredScopes: []string{"admin"},
+		Introspection:  &IntrospectionConfig{Endpoint: "https://as.test/introspect"},
+	}, WithHTTPPost(func(endpoint, body string, headers map[string]string) (map[string]any, error) {
+		return map[string]any{"active": true, "scope": "read"}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := val.ValidateActive("opaque", nil)
+	if r.Valid || r.Error != ErrInsufficientScope {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestValidateActiveWrongAudience(t *testing.T) {
+	val, err := New(&Config{Issuer: testIssuer,
+		Audiences:     []string{"https://rs.test"},
+		Introspection: &IntrospectionConfig{Endpoint: "https://as.test/introspect"},
+	}, WithHTTPPost(func(endpoint, body string, headers map[string]string) (map[string]any, error) {
+		return map[string]any{"active": true, "aud": "https://other.test"}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := val.ValidateActive("opaque", nil)
+	if r.Valid || r.Error != ErrInvalidAudience {
+		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	}
+}
+
+func TestDefaultHTTPPostErrors(t *testing.T) {
+	newVal := func(endpoint string) *AccessTokenValidator {
+		val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{Endpoint: endpoint}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return val
+	}
+	if _, err := newVal("://bad").Introspect("tok"); err == nil {
+		t.Error("invalid endpoint URL: expected an error")
+	}
+
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead.Close()
+	if _, err := newVal(dead.URL).Introspect("tok"); err == nil {
+		t.Error("unreachable endpoint: expected an error")
+	}
+
+	badJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "not json")
+	}))
+	defer badJSON.Close()
+	if _, err := newVal(badJSON.URL).Introspect("tok"); err == nil {
+		t.Error("unparseable response: expected an error")
+	}
+
+	truncated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		io.WriteString(w, "short")
+	}))
+	defer truncated.Close()
+	if _, err := newVal(truncated.URL).Introspect("tok"); err == nil {
+		t.Error("truncated response body: expected an error")
+	}
+}
+
+func TestClaimHelperTypeBranches(t *testing.T) {
+	if v, ok := toInt64(json.Number("42")); !ok || v != 42 {
+		t.Errorf("toInt64(json.Number) = %v, %v", v, ok)
+	}
+	if v, ok := toInt64(int64(7)); !ok || v != 7 {
+		t.Errorf("toInt64(int64) = %v, %v", v, ok)
+	}
+	if v, ok := toInt64(3); !ok || v != 3 {
+		t.Errorf("toInt64(int) = %v, %v", v, ok)
+	}
+	if _, ok := toInt64("x"); ok {
+		t.Error("toInt64(string) must not convert")
+	}
+	if got := scopesFromClaims(map[string]any{}); got != nil {
+		t.Errorf("scopesFromClaims(missing) = %v", got)
+	}
+	if got := audienceList(42); got != nil {
+		t.Errorf("audienceList(default) = %v", got)
+	}
+	if got := stringClaim(map[string]any{"sub": 5}, "sub"); got != "" {
+		t.Errorf("stringClaim(non-string) = %q", got)
+	}
+}
+
+func TestMetadataPathsForUnparseableResource(t *testing.T) {
+	pr := &ProtectedResource{Resource: "://bad"}
+	if pr.MetadataPath() != wellKnownProtectedResource {
+		t.Errorf("MetadataPath = %q", pr.MetadataPath())
+	}
+	if pr.MetadataURL() != wellKnownProtectedResource {
+		t.Errorf("MetadataURL = %q", pr.MetadataURL())
+	}
+}
+
+// signClaimsTyp signs claims (with the signClaims defaults) carrying the given typ header.
+func signClaimsTyp(t *testing.T, key jwk.Key, claims map[string]any, typ string) string {
+	t.Helper()
+	claims["iss"], claims["aud"] = testIssuer, testAudience
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdrs := jws.NewHeaders()
+	_ = hdrs.Set(jws.KeyIDKey, key.KeyID())
+	_ = hdrs.Set(jws.TypeKey, typ)
+	signed, err := jws.Sign(payload, jws.WithKey(jwa.ES256, key, jws.WithProtectedHeaders(hdrs)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(signed)
+}
+
+func TestNewRequiresIssuerAndAudience(t *testing.T) {
+	_, jwks := newTestKey(t, "k1")
+	if _, err := New(&Config{Audiences: []string{testAudience}, JWKS: jwks}); err == nil {
+		t.Error("expected an error without an issuer")
+	}
+	if _, err := New(&Config{Issuer: testIssuer, JWKS: jwks}); err == nil {
+		t.Error("expected an error without an audience")
+	}
+}
+
+func TestTokenTypeComparisonFollowsRFC7515(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Unix() + 300
+	for typ, want := range map[string]string{"application/at+jwt": ErrValid, "AT+JWT": ErrValid, "JWT": ErrInvalidTokenType} {
+		r := val.Validate(signClaimsTyp(t, key, map[string]any{"exp": exp}, typ), nil)
+		got := ErrValid
+		if !r.Valid {
+			got = r.Error
+		}
+		if got != want {
+			t.Errorf("typ %q: got %s, want %s", typ, got, want)
+		}
+	}
+}
+
+func TestTokenTypeCheckCanBeTurnedOff(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks, DisableTokenTypeCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := val.Validate(signClaimsTyp(t, key, map[string]any{"exp": time.Now().Unix() + 300}, "JWT"), nil); !r.Valid {
+		t.Errorf("expected valid with the typ check off, got %s", r.Error)
+	}
+}
+
+func TestNonNumericExpIsMalformed(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, exp := range []any{"4102444800", true} {
+		if r := val.Validate(signClaims(t, key, map[string]any{"exp": exp}), nil); r.Error != ErrInvalidToken {
+			t.Errorf("exp %v: got %s, want %s", exp, r.Error, ErrInvalidToken)
+		}
+	}
+}
+
+func TestIatWithinLeewayIsAccepted(t *testing.T) {
+	key, jwks := newTestKey(t, "k1")
+	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if r := val.Validate(signClaims(t, key, map[string]any{"exp": now + 300, "iat": now + 30}), nil); !r.Valid {
+		t.Errorf("expected valid, got %s", r.Error)
+	}
+}
+
+func TestJWKDeclaredAlgBindsTheKey(t *testing.T) {
+	// the same EC key published as ES384-only: an ES256 token signed with it must not resolve
+	key, _ := newTestKey(t, "k1")
+	pub, err := key.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Set(jwk.AlgorithmKey, jwa.ES384); err != nil {
+		t.Fatal(err)
+	}
+	pubJSON, _ := json.Marshal(pub)
+	val, err := New(&Config{
+		Issuer: testIssuer, Audiences: []string{testAudience},
+		JWKS: json.RawMessage(`{"keys":[` + string(pubJSON) + `]}`), AcceptedAlgorithms: []string{"ES256", "ES384"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := val.Validate(signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300}), nil); r.Error != ErrKeyNotFound {
+		t.Errorf("got %s, want %s", r.Error, ErrKeyNotFound)
+	}
+}

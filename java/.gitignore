@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+**/*.class
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+
+# Secrets / keys (never commit)
+*.p12
+*.jks
+*.key
+*.pem

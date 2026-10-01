@@ -1,0 +1,28 @@
+{
+  "_comment": "TEST ONLY. These private keys are published test vectors so every port produces comparable artifacts. Never use them, or anything signed with them, for anything real.",
+  "attester": {
+    "iss": "https://attester.example.com",
+    "alg": "ES256",
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "feMWn6MoYzOqnbkGEUYsXNw8dndA9dbaltSbBglCE8o",
+      "y": "D9fBCOOQxbzXy2xZ_rOcg7o4FikjlRE0CHP49dz-aC4",
+      "d": "6NVoyJseFkLBK3XcWkPgYYKpiXQAMeRBEtrMjBngrYg"
+    }
+  },
+  "instance": {
+    "alg": "ES256",
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "R14dLtXfNw_SweH4s14G6evtKpEv1Bsr6DTbTp3jOHI",
+      "y": "yiXPjLxyRju1sCq9IRkiZO-qSCOm3s1x-83lysV_m8g",
+      "d": "Ayyll0PwFAiCVmYrhnRX1KRAznh1tEVnsyAl7WjwO3A"
+    }
+  },
+  "client_id": "https://rp.example.com",
+  "audience": "https://as.example.com",
+  "token_endpoint": "https://as.example.com/as/token.oauth2",
+  "attestation_ttl_seconds": 300
+}

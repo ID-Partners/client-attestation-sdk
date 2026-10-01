@@ -1,0 +1,194 @@
+{
+  "_comment": "Shared vectors for authz_challenge.parse_challenge. Every language port must return the same `expect` for each case: either null (not a challenge) or an object whose listed keys match exactly. Inputs mirror the REAL responses of the demo's PEPs (Kong authzen-pdp handler.lua, coaz-pep pep.go / engine.go) and MCP servers (rs_client.py) — do not tidy them.",
+  "cases": [
+    {
+      "name": "rest_insufficient_scope_kong",
+      "input": {
+        "status": 401,
+        "headers": {"Content-Type": "application/json",
+                    "WWW-Authenticate": "Bearer error=\"insufficient_scope\", scope=\"banking:payments:transfer\""},
+        "body": {"error": "insufficient_scope", "scope": "banking:payments:transfer",
+                 "pep": "PEP#2 (Bank API edge)", "reason": "Payment over the step-up threshold; approval required."}
+      },
+      "expect": {"type": "resource_authorisation", "error": "insufficient_scope",
+                 "scope": "banking:payments:transfer", "pep": "PEP#2 (Bank API edge)",
+                 "reason": "Payment over the step-up threshold; approval required.", "source": "rest"}
+    },
+    {
+      "name": "rest_insufficient_scope_header_only",
+      "input": {
+        "status": 401,
+        "headers": {"www-authenticate": "Bearer error=\"insufficient_scope\", scope=\"banking:payments:transfer\""},
+        "body": ""
+      },
+      "expect": {"type": "resource_authorisation", "error": "insufficient_scope",
+                 "scope": "banking:payments:transfer", "source": "rest"}
+    },
+    {
+      "name": "rest_login_required_kong",
+      "input": {
+        "status": 401,
+        "headers": {"WWW-Authenticate": "Bearer error=\"insufficient_user_authentication\", error_description=\"Login required\", acr_values=\"urn:pingidentity:loa:password\""},
+        "body": {"error": "login_required", "pep": "PEP#1 (MCP edge)",
+                 "reason": "The gateway requires an authenticated user (no valid X-User-Token).",
+                 "acr_values": "urn:pingidentity:loa:password"}
+      },
+      "expect": {"type": "authn", "error": "login_required", "acr_values": "urn:pingidentity:loa:password",
+                 "pep": "PEP#1 (MCP edge)",
+                 "reason": "The gateway requires an authenticated user (no valid X-User-Token).", "source": "rest"}
+    },
+    {
+      "name": "rest_rfc9470_header_only",
+      "input": {
+        "status": 401,
+        "headers": {"WWW-Authenticate": "Bearer error=\"insufficient_user_authentication\", error_description=\"A different authentication level is required\", acr_values=\"myACR\""},
+        "body": null
+      },
+      "expect": {"type": "authn", "error": "insufficient_user_authentication", "acr_values": "myACR",
+                 "reason": "A different authentication level is required", "source": "rest"}
+    },
+    {
+      "name": "rest_identity_verification_required_pepgo",
+      "input": {
+        "status": 401,
+        "headers": {"WWW-Authenticate": "Bearer error=\"identity_verification_required\", doctype=\"org.iso.18013.5.1.mDL\""},
+        "body": {"error": "identity_verification_required", "doctype": "org.iso.18013.5.1.mDL",
+                 "pep": "PEP#2 (Bank API edge)", "reason": "No verified identity-proofing record for this customer."}
+      },
+      "expect": {"type": "identity_proofing", "error": "identity_verification_required",
+                 "doctype": "org.iso.18013.5.1.mDL", "pep": "PEP#2 (Bank API edge)",
+                 "reason": "No verified identity-proofing record for this customer.", "source": "rest"}
+    },
+    {
+      "name": "rest_403_hard_deny_is_not_a_challenge",
+      "input": {
+        "status": 403,
+        "headers": {"X-PDP-Decision": "DENY", "X-PDP-Reason": "Denied by policy."},
+        "body": {"error": "authorization_failed", "pep": "PEP#2 (Bank API edge)", "reason": "Denied by policy."}
+      },
+      "expect": null
+    },
+    {
+      "name": "rest_401_invalid_token_is_not_a_challenge",
+      "input": {
+        "status": 401,
+        "headers": {"WWW-Authenticate": "Bearer error=\"invalid_token\", error_description=\"signature verification failed\""},
+        "body": {"error": "invalid_token"}
+      },
+      "expect": null
+    },
+    {
+      "name": "rest_200_permit_is_not_a_challenge",
+      "input": {"status": 200, "headers": {"X-PDP-Decision": "PERMIT"}, "body": {"authorized": true, "result": {"ok": true}}},
+      "expect": null
+    },
+    {
+      "name": "jsonrpc_structured_data_resource_authorisation",
+      "input": {
+        "status": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": {"jsonrpc": "2.0", "id": 7,
+                 "error": {"code": -32401,
+                           "message": "insufficient_scope scope=banking:payments:transfer :: Payment over the step-up threshold",
+                           "data": {"authz_challenge": {"type": "resource_authorisation", "scope": "banking:payments:transfer",
+                                                        "reason": "Payment over the step-up threshold", "pep": "mcp-edge"}}}}
+      },
+      "expect": {"type": "resource_authorisation", "error": "insufficient_scope",
+                 "scope": "banking:payments:transfer", "reason": "Payment over the step-up threshold",
+                 "pep": "mcp-edge", "source": "jsonrpc"}
+    },
+    {
+      "name": "jsonrpc_structured_data_identity_proofing",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"jsonrpc": "2.0", "id": "abc",
+                 "error": {"code": -32401,
+                           "message": "identity_verification_required doctype=org.iso.18013.5.1.mDL",
+                           "data": {"authz_challenge": {"type": "identity_proofing", "doctype": "org.iso.18013.5.1.mDL", "pep": "mcp-edge"}}}}
+      },
+      "expect": {"type": "identity_proofing", "error": "identity_verification_required",
+                 "doctype": "org.iso.18013.5.1.mDL", "pep": "mcp-edge", "source": "jsonrpc"}
+    },
+    {
+      "name": "jsonrpc_legacy_prose_insufficient_scope",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32401,\"message\":\"insufficient_scope scope=banking:payments:transfer :: Payment over the step-up threshold; approval required.\"}}"
+      },
+      "expect": {"type": "resource_authorisation", "error": "insufficient_scope",
+                 "scope": "banking:payments:transfer",
+                 "reason": "Payment over the step-up threshold; approval required.", "source": "jsonrpc"}
+    },
+    {
+      "name": "jsonrpc_legacy_prose_identity_no_reason",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"jsonrpc": "2.0", "id": 4, "error": {"code": -32401, "message": "identity_verification_required doctype=org.iso.18013.5.1.mDL"}}
+      },
+      "expect": {"type": "identity_proofing", "error": "identity_verification_required",
+                 "doctype": "org.iso.18013.5.1.mDL", "source": "jsonrpc"}
+    },
+    {
+      "name": "jsonrpc_hard_deny_is_not_a_challenge",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"jsonrpc": "2.0", "id": 5, "error": {"code": -32401, "message": "Access denied: Denied by policy."}}
+      },
+      "expect": null
+    },
+    {
+      "name": "jsonrpc_pdp_error_is_not_a_challenge",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"jsonrpc": "2.0", "id": 6, "error": {"code": -32603, "message": "Authorization service unavailable"}}
+      },
+      "expect": null
+    },
+    {
+      "name": "tool_result_insufficient_scope_rs_client",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"authorized": false, "insufficient_scope": true, "scope_required": "banking:payments:transfer",
+                 "pep": "PEP#2 (Bank API edge)",
+                 "message": "STEP-UP REQUIRED at PEP#2 (Bank API edge): scope 'banking:payments:transfer' needed",
+                 "policy_reason": "Payment over the step-up threshold; approval required."}
+      },
+      "expect": {"type": "resource_authorisation", "error": "insufficient_scope",
+                 "scope": "banking:payments:transfer", "pep": "PEP#2 (Bank API edge)",
+                 "reason": "Payment over the step-up threshold; approval required.", "source": "tool_result"}
+    },
+    {
+      "name": "tool_result_identity_proofing_rs_client",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"authorized": false, "identity_proofing_required": true, "doctype": "org.iso.18013.5.1.mDL",
+                 "pep": "PEP#2 (Bank API edge)", "policy_reason": "identity proofing required"}
+      },
+      "expect": {"type": "identity_proofing", "error": "identity_verification_required",
+                 "doctype": "org.iso.18013.5.1.mDL", "pep": "PEP#2 (Bank API edge)",
+                 "reason": "identity proofing required", "source": "tool_result"}
+    },
+    {
+      "name": "tool_result_policy_denied_is_not_a_challenge",
+      "input": {
+        "status": 200,
+        "headers": {},
+        "body": {"authorized": false, "pep": "PEP#2 (Bank API edge)", "pep_action": "make_payment",
+                 "message": "POLICY DENIED by PEP#2 (Bank API edge): Denied by policy.", "policy_reason": "Denied by policy."}
+      },
+      "expect": null
+    },
+    {
+      "name": "empty_inputs",
+      "input": {"status": null, "headers": null, "body": null},
+      "expect": null
+    }
+  ]
+}

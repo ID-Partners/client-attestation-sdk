@@ -1,0 +1,135 @@
+name: release
+
+# Publishing a GitHub release tagged vX.Y.Z (from main) publishes every port at X.Y.Z:
+#   python  -> PyPI  client-attestation-sdk           (trusted publishing, no token)
+#   npm     -> npm   @idpartners/client-attestation-sdk (trusted publishing + provenance, no token)
+#   java    -> GitHub Packages global.idpartners:client-attestation-sdk
+#   go      -> tag go/vX.Y.Z, which is what `go get .../go@vX.Y.Z` resolves
+#
+# Nothing publishes unless the full CI suite passes on the tagged commit and every manifest already says
+# X.Y.Z. The publish jobs run in the `release` environment, which requires a reviewer's approval.
+#
+# One-time setup, outside this repo:
+#   - GitHub: create the `release` environment with required reviewers.
+#   - PyPI: add a trusted publisher for client-attestation-sdk
+#       (owner ID-Partners, repo client-attestation-sdk, workflow release.yml, environment release).
+#   - npm: create the @idpartners org, then add a trusted publisher for @idpartners/client-attestation-sdk
+#       (same repo, workflow release.yml, environment release).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: tag matches every manifest
+    # Releases run only in the public repo. The private source repo publishes there with sync-public.yml.
+    if: github.repository == 'ID-Partners/client-attestation-sdk'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::release tag '$TAG' is not vX.Y.Z"; exit 1 ;; esac
+          v="${TAG#v}"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          python3 scripts/version.py check
+          [ "$(cat VERSION)" = "$v" ] || { echo "::error::VERSION says $(cat VERSION), the tag says $v"; exit 1; }
+          py=$(python3 -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project']['version'])")
+          ts=$(node -p "require('./typescript/package.json').version")
+          java=$(python3 -c "import xml.etree.ElementTree as E; print(E.parse('java/pom.xml').find('{http://maven.apache.org/POM/4.0.0}version').text)")
+          echo "tag=$v python=$py typescript=$ts java=$java"
+          [ "$py" = "$v" ] && [ "$ts" = "$v" ] && [ "$java" = "$v" ] || { echo "::error::manifest versions do not all match $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  python:
+    name: publish python
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        working-directory: python
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: python/dist
+
+  npm:
+    name: publish npm
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
+      - run: npm ci
+      - run: npm run build
+      - run: npm publish --provenance --access public
+
+  java:
+    name: publish java (GitHub Packages)
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: java
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          server-id: github
+      - run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  go:
+    name: tag go module
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GO_TAG: go/v${{ needs.version.outputs.version }}
+        run: |
+          git tag "$GO_TAG" "$GITHUB_SHA"
+          git push origin "$GO_TAG"

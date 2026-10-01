@@ -1,0 +1,6 @@
+# Every change needs a review from an owner. Release plumbing and the shared vectors most of all:
+# a change there alters what all four ports promise.
+*                   @dphhyland
+/.github/           @dphhyland
+/vectors/           @dphhyland
+/validation/        @dphhyland

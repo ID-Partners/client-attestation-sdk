@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Client Attestation SDK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --paper: #f3f4f7;
+    --paper-raised: #ffffff;
+    --ink: #12161d;
+    --muted: #59636f;
+    --line: #dbe0e6;
+    --accent: #146b74;
+    --accent-soft: #e1f0ef;
+    --accent-ink: #ffffff;
+    --issuer: #9a5b12;
+    --issuer-soft: #f6e9d8;
+    --good: #1f8a4c;
+    --good-soft: #e3f3e8;
+    --gap: #a5453f;
+    --gap-soft: #f5e6e4;
+    --code-bg: #eceef2;
+    --shadow: 0 1px 2px rgba(18,22,29,0.06), 0 8px 24px -12px rgba(18,22,29,0.18);
+
+    --font-display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+    --font-body: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #10141b;
+      --paper-raised: #161b24;
+      --ink: #e7ebf1;
+      --muted: #8b96a5;
+      --line: #2a323f;
+      --accent: #4fd1c7;
+      --accent-soft: rgba(79,209,199,0.14);
+      --accent-ink: #08201f;
+      --issuer: #e2a54d;
+      --issuer-soft: rgba(226,165,77,0.14);
+      --good: #4fbf7a;
+      --good-soft: rgba(79,191,122,0.14);
+      --gap: #e2726b;
+      --gap-soft: rgba(226,114,107,0.14);
+      --code-bg: #1b212b;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 28px -12px rgba(0,0,0,0.55);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #10141b;
+    --paper-raised: #161b24;
+    --ink: #e7ebf1;
+    --muted: #8b96a5;
+    --line: #2a323f;
+    --accent: #4fd1c7;
+    --accent-soft: rgba(79,209,199,0.14);
+    --accent-ink: #08201f;
+    --issuer: #e2a54d;
+    --issuer-soft: rgba(226,165,77,0.14);
+    --good: #4fbf7a;
+    --good-soft: rgba(79,191,122,0.14);
+    --gap: #e2726b;
+    --gap-soft: rgba(226,114,107,0.14);
+    --code-bg: #1b212b;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 28px -12px rgba(0,0,0,0.55);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  h1, h2, h3 { font-family: var(--font-display); font-weight: 700; text-wrap: balance; margin: 0; }
+  code, .mono { font-family: var(--font-mono); }
+
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 28px; }
+
+  /* ---------- top bar ---------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--paper) 88%, transparent);
+    backdrop-filter: saturate(140%) blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar-inner {
+    max-width: 980px; margin: 0 auto; padding: 0 28px;
+    display: flex; align-items: center; gap: 24px; height: 56px;
+  }
+  .topbar-mark {
+    font-family: var(--font-display); font-weight: 700; font-size: 17px; letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  .topbar-mark span { color: var(--accent); }
+  .topnav { display: flex; gap: 4px; overflow-x: auto; flex: 1; scrollbar-width: none; }
+  .topnav::-webkit-scrollbar { display: none; }
+  .topnav a {
+    color: var(--muted); text-decoration: none; font-size: 13.5px; font-weight: 500;
+    padding: 8px 10px; border-radius: 6px; white-space: nowrap;
+  }
+  .topnav a:hover { color: var(--ink); background: var(--code-bg); }
+
+  /* ---------- intro ---------- */
+  .intro { padding: 56px 0 40px; }
+  .eyebrow {
+    font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 14px; display: block;
+  }
+  .intro h1 { font-size: clamp(32px, 4.4vw, 46px); line-height: 1.08; max-width: 16ch; }
+  .intro p.lede {
+    font-size: 18px; color: var(--muted); max-width: 62ch; margin-top: 18px; line-height: 1.6;
+  }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; }
+  .badge {
+    font-family: var(--font-mono); font-size: 12.5px; padding: 6px 11px; border-radius: 5px;
+    background: var(--paper-raised); border: 1px solid var(--line); color: var(--muted);
+  }
+  .badge b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- sections ---------- */
+  section { padding: 52px 0; border-top: 1px solid var(--line); }
+  section:first-of-type { border-top: none; }
+  .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; margin-bottom: 8px; }
+  .section-head h2 { font-size: 28px; }
+  .section-num { font-family: var(--font-mono); font-size: 13px; color: var(--muted); }
+  .section-dek { color: var(--muted); max-width: 68ch; margin: 10px 0 30px; font-size: 15.5px; }
+
+  /* ---------- diagram figures ---------- */
+  figure.diagram {
+    margin: 0 0 14px; padding: 22px 20px 14px;
+    background: var(--paper-raised); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: var(--shadow);
+  }
+  figure.diagram .scroller { overflow-x: auto; }
+  figure.diagram svg { display: block; width: 100%; height: auto; min-width: 640px; color: var(--ink); }
+  figure.diagram figcaption {
+    font-size: 13.5px; color: var(--muted); margin-top: 14px; padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  .diagram-note { font-size: 14px; color: var(--muted); margin-top: 4px; }
+  .diagram-note code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+
+  /* ---------- feature matrix ---------- */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--paper-raised); box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 14.5px; }
+  table.matrix { min-width: 780px; }
+  th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--line); }
+  thead th {
+    font-family: var(--font-display); font-weight: 600; font-size: 13px; letter-spacing: 0.03em;
+    text-transform: uppercase; color: var(--muted); background: var(--code-bg); position: sticky; top: 0;
+  }
+  table.matrix th:not(:first-child), table.matrix td:not(:first-child) { text-align: center; width: 108px; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: color-mix(in srgb, var(--accent-soft) 55%, transparent); }
+  .cap-row td { font-weight: 500; }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600;
+    padding: 4px 10px; border-radius: 999px; font-family: var(--font-body); line-height: 1.4;
+  }
+  .chip.yes { background: var(--good-soft); color: var(--good); }
+  .chip.partial { background: var(--issuer-soft); color: var(--issuer); }
+  .chip.no { background: transparent; color: var(--muted); font-weight: 500; }
+  .chip.no::before { content: "—"; }
+  .chip-note { display: block; font-size: 10.5px; color: var(--muted); margin-top: 3px; font-weight: 400; }
+
+  /* ---------- standards ---------- */
+  .std-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+  .std-card {
+    background: var(--paper-raised); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px;
+    box-shadow: var(--shadow);
+  }
+  .std-card h3 { font-size: 15px; margin-bottom: 12px; color: var(--ink); }
+  .std-card ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+  .std-card li { display: flex; gap: 10px; align-items: baseline; font-size: 13.5px; }
+  .std-tag {
+    font-family: var(--font-mono); font-size: 11.5px; color: var(--accent); background: var(--accent-soft);
+    padding: 1px 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0;
+  }
+  .std-card li span.desc { color: var(--muted); }
+
+  /* ---------- contract table ---------- */
+  table.contract td.typ, table.contract td.claims, table.contract td.key { font-family: var(--font-mono); font-size: 12.8px; }
+  table.contract td.claims { color: var(--muted); }
+  table.contract td.claims b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- test coverage ---------- */
+  .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow); }
+  .stat { background: var(--paper-raised); padding: 20px 18px; }
+  .stat .lang { font-family: var(--font-display); font-weight: 700; font-size: 14px; }
+  .stat .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 28px; font-weight: 500; margin-top: 8px; color: var(--accent); }
+  .stat .count small { font-size: 13px; color: var(--muted); font-family: var(--font-body); font-weight: 400; margin-left: 4px; }
+  @media (max-width: 640px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .layer-list { display: flex; flex-direction: column; gap: 14px; margin: 24px 0; }
+  .layer {
+    display: grid; grid-template-columns: 150px 1fr; gap: 18px; padding: 16px 18px;
+    background: var(--paper-raised); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+  }
+  .layer .name { font-family: var(--font-display); font-weight: 600; font-size: 14.5px; color: var(--accent); }
+  .layer p { margin: 0; font-size: 14px; color: var(--muted); }
+  @media (max-width: 620px) { .layer { grid-template-columns: 1fr; } }
+
+  .gate-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+  .gate { display: flex; align-items: center; gap: 8px; font-size: 13.5px; padding: 8px 14px; border-radius: 8px; background: var(--good-soft); color: var(--good); font-weight: 600; }
+  .gate .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); flex-shrink: 0; }
+  .asof { font-size: 12.5px; color: var(--muted); margin-top: 12px; font-family: var(--font-mono); }
+
+  /* ---------- layout tree ---------- */
+  pre.tree {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px;
+    font-family: var(--font-mono); font-size: 13px; overflow-x: auto; line-height: 1.75; margin: 0;
+  }
+  pre.tree .path { color: var(--accent); }
+  pre.tree .desc { color: var(--muted); }
+
+  footer { padding: 40px 0 60px; border-top: 1px solid var(--line); }
+  footer p { color: var(--muted); font-size: 13.5px; max-width: 60ch; }
+  footer a { color: var(--muted); text-decoration-color: var(--line); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; }
+  }
+  html { scroll-behavior: smooth; }
+  section[id] { scroll-margin-top: 70px; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="topbar-mark">client<span>·</span>attestation<span>·</span>sdk</div>
+    <nav class="topnav">
+      <a href="#architecture">Architecture</a>
+      <a href="#features">Feature support</a>
+      <a href="#standards">Standards</a>
+      <a href="#contract">Wire contract</a>
+      <a href="#tests">Test coverage</a>
+      <a href="#layout">Layout</a>
+    </nav>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="intro">
+    <span class="eyebrow">draft-ietf-oauth-attestation-based-client-auth · four languages, one contract</span>
+    <h1>The client's credential is what it is, not a secret it holds.</h1>
+    <p class="lede">
+      client-attestation-sdk builds and verifies OAuth attestation-based client authentication
+      in Go, Java, Python, and TypeScript. A workload proves its platform identity once; every port turns
+      that into the same two artifacts — an attestation JWT and a proof of possession — and the same Java
+      verifier accepts all four.
+    </p>
+    <div class="badges">
+      <span class="badge">Go · Java · Python · TypeScript</span>
+      <span class="badge">ES256 <b>·</b> RFC 7638 <code>kid</code></span>
+      <span class="badge">PoP <b>+</b> DPoP-combined</span>
+      <span class="badge">Interop-verified against a real AS</span>
+    </div>
+  </div>
+
+  <section id="architecture">
+    <div class="section-head">
+      <h2>Architecture</h2>
+      <span class="section-num">01</span>
+    </div>
+    <p class="section-dek">
+      Two shapes, one contract. Every request-time flow ends the same way — an attestation plus a fresh
+      proof, sent to the token endpoint — whichever proof-of-possession method produced it.
+    </p>
+
+    <figure class="diagram">
+      <div class="scroller">
+        <svg viewBox="0 0 860 420" role="img" aria-label="Sequence diagram: the attester mints a Client Attestation JWT bound to the client's instance key; the client fetches a challenge, then builds either a dedicated PoP JWT carrying the challenge or a DPoP proof carrying it as a nonce; either path is verified by the same AS and returns an access token.">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
+            </marker>
+          </defs>
+
+          <!-- lane rules -->
+          <line x1="140" y1="60"  x2="820" y2="60"  stroke="currentColor" stroke-opacity="0.22"></line>
+          <line x1="140" y1="200" x2="820" y2="200" stroke="currentColor" stroke-opacity="0.22"></line>
+          <line x1="140" y1="340" x2="820" y2="340" stroke="currentColor" stroke-opacity="0.22"></line>
+
+          <text x="18" y="56" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">ATTESTER</text>
+          <text x="18" y="196" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">CLIENT</text>
+          <text x="18" y="336" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">AUTH</text>
+          <text x="18" y="349" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">SERVER</text>
+
+          <!-- step 1: mint -->
+          <rect x="140" y="40" width="120" height="40" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="200" y="65" text-anchor="middle" font-size="10.5" fill="currentColor">Builder.build()</text>
+
+          <line x1="200" y1="80" x2="200" y2="176" stroke="currentColor" stroke-opacity="0.6" marker-end="url(#arrow)"></line>
+
+          <rect x="140" y="180" width="120" height="40" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.4"></rect>
+          <text x="200" y="197" text-anchor="middle" font-size="10.2" fill="currentColor">Client Attestation</text>
+          <text x="200" y="211" text-anchor="middle" font-size="10.2" fill="currentColor">JWT</text>
+          <text x="200" y="236" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.6">cnf.jwk = instance pub</text>
+
+          <!-- step 2: challenge round trip -->
+          <line x1="374" y1="200" x2="374" y2="336" stroke="currentColor" stroke-opacity="0.55" stroke-dasharray="4 4" marker-end="url(#arrow)"></line>
+          <line x1="396" y1="340" x2="396" y2="204" stroke="currentColor" stroke-opacity="0.55" stroke-dasharray="4 4" marker-end="url(#arrow)"></line>
+          <text x="404" y="270" font-size="9.5" fill="currentColor" opacity="0.65">GET challenge_endpoint</text>
+          <text x="404" y="282" font-size="9.5" fill="currentColor" opacity="0.65">→ challenge</text>
+
+          <!-- branch point -->
+          <circle cx="480" cy="200" r="3" fill="currentColor"></circle>
+          <line x1="483" y1="197" x2="518" y2="153" stroke="currentColor" stroke-opacity="0.55"></line>
+          <line x1="483" y1="203" x2="518" y2="253" stroke="currentColor" stroke-opacity="0.55"></line>
+
+          <!-- pop path -->
+          <rect x="518" y="103" width="172" height="20" rx="10" fill="var(--accent-soft)"></rect>
+          <text x="604" y="117" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent)">attestation_pop_jwt</text>
+          <rect x="518" y="130" width="172" height="46" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="604" y="149" text-anchor="middle" font-size="10.5" fill="currentColor">PoP JWT</text>
+          <text x="604" y="163" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">challenge claim</text>
+
+          <!-- dpop path -->
+          <rect x="518" y="230" width="172" height="46" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="604" y="249" text-anchor="middle" font-size="10.5" fill="currentColor">DPoP proof</text>
+          <text x="604" y="263" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">nonce claim</text>
+          <rect x="518" y="278" width="172" height="20" rx="10" fill="var(--accent-soft)"></rect>
+          <text x="604" y="292" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent)">dpop_combined</text>
+
+          <!-- converge to AS -->
+          <line x1="690" y1="152" x2="738" y2="322" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow)"></line>
+          <line x1="690" y1="253" x2="782" y2="322" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow)"></line>
+          <text x="700" y="220" font-size="9.5" fill="currentColor" opacity="0.65">POST /as/token.oauth2</text>
+
+          <rect x="690" y="320" width="140" height="40" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="760" y="345" text-anchor="middle" font-size="10.2" fill="currentColor">Verifier.verify()</text>
+
+          <!-- token back -->
+          <line x1="760" y1="320" x2="760" y2="224" stroke="currentColor" stroke-opacity="0.6" marker-end="url(#arrow)"></line>
+          <text x="770" y="278" font-size="9.5" fill="currentColor" opacity="0.65">200 OK</text>
+
+          <rect x="690" y="180" width="140" height="40" rx="6" fill="var(--accent)"></rect>
+          <text x="760" y="205" text-anchor="middle" font-size="11" font-weight="600" fill="var(--accent-ink)">access_token</text>
+        </svg>
+      </div>
+      <figcaption>
+        <strong>One call, two ways to prove possession.</strong> The attestation is minted once and cached;
+        <code>pop_method</code> picks which proof travels with it on every request. A fetched challenge is
+        threaded into whichever one is active: as the PoP JWT's challenge claim, or the DPoP proof's nonce.
+      </figcaption>
+    </figure>
+
+    <figure class="diagram" style="margin-top: 22px;">
+      <div class="scroller">
+        <svg viewBox="0 0 860 190" role="img" aria-label="Flow diagram: a workload proves its SPIFFE identity as a JWT-SVID, AttestationIssuanceClient sends it to the AS's federation attestation endpoint, the AS mints a Client Attestation bound to the workload's own instance key, and the client presents the issued attestation exactly like a self-built one.">
+          <defs>
+            <marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
+            </marker>
+          </defs>
+          <rect x="20" y="70" width="168" height="50" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="104" y="91" text-anchor="middle" font-size="11" fill="currentColor">Workload</text>
+          <text x="104" y="106" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">SPIFFE identity</text>
+
+          <line x1="188" y1="95" x2="248" y2="95" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow2)"></line>
+          <text x="192" y="82" font-size="9.5" fill="currentColor" opacity="0.65">JWT-SVID</text>
+
+          <rect x="250" y="60" width="200" height="70" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="350" y="88" text-anchor="middle" font-size="11" fill="currentColor">AttestationIssuanceClient</text>
+          <text x="350" y="103" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">.bootstrap()</text>
+          <text x="350" y="117" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="currentColor" opacity="0.55">SvidSource: static · http · SPIRE</text>
+
+          <line x1="450" y1="95" x2="510" y2="95" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow2)"></line>
+          <text x="454" y="82" font-size="9.5" fill="currentColor" opacity="0.65">mint request</text>
+
+          <rect x="512" y="60" width="200" height="70" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-opacity="0.6"></rect>
+          <text x="612" y="86" text-anchor="middle" font-size="11" fill="currentColor">Authorization Server</text>
+          <text x="612" y="101" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.7">/federation/attestation</text>
+          <text x="612" y="115" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.7">mints, binds instance key</text>
+
+          <line x1="712" y1="95" x2="772" y2="95" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow2)"></line>
+          <text x="712" y="82" font-size="9.5" fill="currentColor" opacity="0.65">attestation</text>
+
+          <rect x="774" y="60" width="66" height="70" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
+          <text x="807" y="90" text-anchor="middle" font-size="10" fill="currentColor">Client</text>
+          <text x="807" y="103" text-anchor="middle" font-size="9" fill="currentColor" opacity="0.65">.pop()</text>
+          <text x="807" y="115" text-anchor="middle" font-size="9" fill="currentColor" opacity="0.65">.dpop()</text>
+        </svg>
+      </div>
+      <figcaption>
+        <strong>The inverse of the builder.</strong> No attester key lives in the client at all — the AS
+        mints an attestation bound to the workload's own instance key, and the result is presented exactly
+        like a self-built one, via the same symmetric <code>.pop()</code> / <code>.dpop()</code> pair.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="features">
+    <div class="section-head">
+      <h2>Feature support</h2>
+      <span class="section-num">02</span>
+    </div>
+    <p class="section-dek">
+      All four ports share the request-time core. Evidence sources and the authorization-challenge package
+      are where the fleet still diverges by design or by sequencing.
+    </p>
+
+    <div class="table-scroll">
+      <table class="matrix">
+        <thead>
+          <tr><th>Capability</th><th>Go</th><th>Java</th><th>Python</th><th>TypeScript</th></tr>
+        </thead>
+        <tbody>
+          <!-- features:begin -->
+          <tr class="cap-row"><td>One-call token source</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>DPoP-combined mode</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>DPoP-bound tokens at a resource</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Fail-closed defaults</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Name the operator on the one-call class</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Drop the token-endpoint challenge</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Trace every call as curl</td>
+            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+          <tr class="cap-row"><td>Asserted context at mint</td>
+            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+          <tr class="cap-row"><td>Client Attestation builder</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>PoP JWT and DPoP proof builders</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>ES, RS and PS keys at 256, 384 and 512</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td><code>operator</code> claim on the builder</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td><code>workload</code> and <code>authorization_details</code> claims</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>External signer</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Evidence auto-detect</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Azure IMDS evidence</td>
+            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+          <tr class="cap-row"><td>AWS web-identity evidence</td>
+            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+          <tr class="cap-row"><td>SPIFFE issuance bootstrap</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Token validator</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>MCP and A2A protected-resource helper</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Authorization-server metadata discovery</td>
+            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+          <tr class="cap-row"><td>Challenge handling</td>
+            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+<!-- features:end -->
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="standards">
+    <div class="section-head">
+      <h2>Standards supported</h2>
+      <span class="section-num">03</span>
+    </div>
+    <p class="section-dek">
+      Grouped by what each one governs, not by where it's implemented.
+    </p>
+    <div class="std-grid">
+      <div class="std-card">
+        <h3>Attestation &amp; possession</h3>
+        <ul>
+          <li><span class="std-tag">ABCA</span><span class="desc">draft-ietf-oauth-attestation-based-client-auth — the attestation JWT, PoP JWT, and <code>attest_jwt_client_auth</code></span></li>
+          <li><span class="std-tag">RFC 9449</span><span class="desc">DPoP — the combined proof-of-possession mode</span></li>
+          <li><span class="std-tag">RFC 7638</span><span class="desc">JWK Thumbprint — every <code>kid</code> in this SDK</span></li>
+        </ul>
+      </div>
+      <div class="std-card">
+        <h3>Authorization</h3>
+        <ul>
+          <li><span class="std-tag">RFC 9396</span><span class="desc">Rich Authorization Requests — <code>authorization_details</code></span></li>
+          <li><span class="std-tag">RFC 8693</span><span class="desc">Token Exchange — the <code>may_act</code> shape behind the <code>operator</code> claim</span></li>
+          <li><span class="std-tag">RFC 9470</span><span class="desc">Step-Up Authentication Challenge — <code>resource_authorisation</code></span></li>
+        </ul>
+      </div>
+      <div class="std-card">
+        <h3>Resource server</h3>
+        <ul>
+          <li><span class="std-tag">RFC 6750</span><span class="desc">Bearer Token Usage — extraction and challenge headers</span></li>
+          <li><span class="std-tag">RFC 9728</span><span class="desc">Protected Resource Metadata — served at <code>/.well-known/oauth-protected-resource</code></span></li>
+          <li><span class="std-tag">RFC 8707</span><span class="desc">Resource Indicators — binds a token to the resource that validates it</span></li>
+          <li><span class="std-tag">RFC 7662</span><span class="desc">Token Introspection — opaque-token / revocation checks</span></li>
+        </ul>
+      </div>
+      <div class="std-card">
+        <h3>Identity bootstrap &amp; ceremonies</h3>
+        <ul>
+          <li><span class="std-tag">SPIFFE</span><span class="desc">Workload API + JWT-SVID — the input to attestation issuance</span></li>
+          <li><span class="std-tag">CIBA</span><span class="desc">OpenID back-channel authentication — the push a <code>CibaResolver</code> polls (Python)</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="contract">
+    <div class="section-head">
+      <h2>Wire contract</h2>
+      <span class="section-num">04</span>
+    </div>
+    <p class="section-dek">
+      All four ports emit these shapes byte-for-byte identically. ES256; <code>iat</code>/<code>exp</code> are integer epoch seconds.
+    </p>
+    <div class="table-scroll">
+      <table class="contract">
+        <thead><tr><th>Artifact</th><th><code>typ</code></th><th>Key in header</th><th>Key claims</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Attestation</td>
+            <td class="typ">oauth-client-attestation+jwt</td>
+            <td class="key">kid (attester)</td>
+            <td class="claims"><b>iss, sub, iat, exp, cnf.jwk</b> (instance pub, +kid)</td>
+          </tr>
+          <tr>
+            <td>PoP</td>
+            <td class="typ">oauth-client-attestation-pop+jwt</td>
+            <td class="key">kid (instance)</td>
+            <td class="claims"><b>aud, jti, iat</b> (+ optional iss, challenge)</td>
+          </tr>
+          <tr>
+            <td>DPoP</td>
+            <td class="typ">dpop+jwt</td>
+            <td class="key">jwk (instance pub, −kid)</td>
+            <td class="claims"><b>htm, htu, jti, iat</b> (+ optional nonce)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tests">
+    <div class="section-head">
+      <h2>Test coverage</h2>
+      <span class="section-num">05</span>
+    </div>
+    <p class="section-dek">
+      Two layers, deliberately different in scope — cross-language agreement on the low-level builder shapes,
+      and per-language unit coverage of everything the orchestration class decides on its own.
+    </p>
+
+    <div class="layer-list">
+      <div class="layer">
+        <div class="name">Cross-language</div>
+        <p>
+          <code>verify-interop.sh</code> builds a credential in every language from one shared vector and
+          runs each through the real Java <code>ClientAttestationVerifier</code>, in both PoP and DPoP modes.
+          <code>verify-validation.sh</code> has every port's validator agree on the same pre-signed token
+          vectors — valid, expired, wrong issuer/audience, missing scope, bad signature.
+        </p>
+      </div>
+      <div class="layer">
+        <div class="name">Per-language</div>
+        <p>
+          Each suite covers what the shared vectors can't reach: evidence auto-detect precedence, signer and
+          network failures, malformed tokens, and that a fetched challenge actually
+          lands in the token-endpoint PoP JWT's <code>challenge</code> claim or the DPoP proof's
+          <code>nonce</code> claim, in both the one-call flow and the SPIFFE issuance bootstrap.
+        </p>
+      </div>
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat"><div class="lang">Go</div><div class="count">89<small>tests</small></div></div>
+      <div class="stat"><div class="lang">Java</div><div class="count">80<small>tests</small></div></div>
+      <div class="stat"><div class="lang">Python</div><div class="count">151<small>tests</small></div></div>
+      <div class="stat"><div class="lang">TypeScript</div><div class="count">90<small>tests</small></div></div>
+    </div>
+
+    <div class="gate-row">
+      <span class="gate"><span class="dot"></span>Interop — every port accepted by the AS</span>
+      <span class="gate"><span class="dot"></span>Validation — all ports agree on every case</span>
+    </div>
+    <div class="asof">as verified · 2026-09-27</div>
+  </section>
+
+  <section id="layout">
+    <div class="section-head">
+      <h2>Repo layout</h2>
+      <span class="section-num">06</span>
+    </div>
+    <p class="section-dek">Four ports, plus what keeps them honest with each other.</p>
+    <pre class="tree"><span class="path">go/</span>           <span class="desc">builder package + tokenvalidator/                    (lestrrat-go/jwx)</span>
+<span class="path">java/</span>         <span class="desc">builder + one-call client, no validator              (jose4j)</span>
+<span class="path">python/</span>       <span class="desc">client_attestation_sdk + token_validator + authz_challenge   (PyJWT + cryptography)</span>
+<span class="path">typescript/</span>   <span class="desc">src/ builder + src/validator/                        (panva jose; Node 20+)   </span>
+<span class="path">vectors/</span>      <span class="desc">client-builder shared vectors + outputs</span>
+<span class="path">validation/</span>   <span class="desc">token-validator + challenge-parser shared vectors + agreement checker</span>
+<span class="path">interop/</span>      <span class="desc">Java cross-language verifier (builder side)</span></pre>
+  </section>
+
+  <footer>
+    <p>
+      Generated from the current state of <code>client-attestation-sdk</code>. The AS-side
+      verifier that accepts every artifact shown here is a separate project,
+      <a href="https://github.com/dphhyland/client-attestation">client-attestation</a>.
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

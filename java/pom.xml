@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>global.idpartners</groupId>
+    <artifactId>client-attestation-sdk</artifactId>
+    <version>0.2.0</version>
+    <packaging>jar</packaging>
+
+    <name>client-attestation-sdk</name>
+    <description>Client-side builder SDK for OAuth Attestation-Based Client Authentication
+        (draft-ietf-oauth-attestation-based-client-auth): mints the Client Attestation JWT (attester side)
+        and the PoP / DPoP proofs plus request headers (client side). Built on jose4j.</description>
+    <url>https://github.com/ID-Partners/client-attestation-sdk</url>
+
+    <organization>
+        <name>ID Partners Pty Ltd</name>
+        <url>https://idpartners.global</url>
+    </organization>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <name>David Hyland</name>
+            <organization>ID Partners Pty Ltd</organization>
+        </developer>
+    </developers>
+
+    <scm>
+        <url>https://github.com/ID-Partners/client-attestation-sdk</url>
+        <connection>scm:git:https://github.com/ID-Partners/client-attestation-sdk.git</connection>
+    </scm>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>17</maven.compiler.release>
+    </properties>
+
+    <dependencies>
+        <dependency><groupId>org.bitbucket.b_c</groupId><artifactId>jose4j</artifactId><version>0.9.6</version></dependency>
+        <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>
+            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version></plugin>
+            <!-- -sources and -javadoc jars, required for Maven Central -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution><id>attach-sources</id><goals><goal>jar-no-fork</goal></goals></execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <version>3.11.2</version>
+                <configuration>
+                    <quiet>true</quiet>
+                    <doclint>all,-missing</doclint>
+                    <failOnWarnings>false</failOnWarnings>
+                </configuration>
+                <executions>
+                    <execution><id>attach-javadocs</id><goals><goal>jar</goal></goals></execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.12</version>
+                <executions>
+                    <execution><id>prepare-agent</id><goals><goal>prepare-agent</goal></goals></execution>
+                    <execution><id>report</id><phase>verify</phase><goals><goal>report</goal></goals></execution>
+                    <!-- floors are today's measured coverage without the interop profile; raise them, never lower -->
+                    <execution>
+                        <id>check</id>
+                        <phase>verify</phase>
+                        <goals><goal>check</goal></goals>
+                        <configuration>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.91</minimum></limit>
+                                        <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.88</minimum></limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!--
+          Round-trips what the SDK builds against the AS-side verifier (client-attestation), which is not on
+          Maven Central. `mvn verify -Pinterop` where that jar is installed locally; plain `mvn verify` from a
+          clean clone runs everything else.
+        -->
+        <profile>
+            <id>interop</id>
+            <dependencies>
+                <dependency><groupId>com.pingidentity.ps.oidf</groupId><artifactId>client-attestation</artifactId><version>0.1.0</version><scope>test</scope></dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>add-interop-tests</id>
+                                <phase>generate-test-sources</phase>
+                                <goals><goal>add-test-source</goal></goals>
+                                <configuration><sources><source>src/interop-test/java</source></sources></configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages</name>
+            <url>https://maven.pkg.github.com/ID-Partners/client-attestation-sdk</url>
+        </repository>
+    </distributionManagement>
+</project>
