@@ -43,7 +43,7 @@
   },
   "homepage": "https://github.com/ID-Partners/client-attestation-sdk/tree/main/typescript",
   "dependencies": {
-    "jose": "^6.0.0"
+    "jose": "^6.2.12"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
