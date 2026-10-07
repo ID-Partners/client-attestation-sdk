@@ -1,15 +1,19 @@
 package tokenvalidator
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwk"
+
+	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
 // MaxJWKSBytes caps the size of a fetched JWKS document.
@@ -39,6 +43,7 @@ type jwksProvider struct {
 	minRefresh time.Duration
 	maxAge     time.Duration
 	now        func() time.Time
+	logger     *slog.Logger
 
 	refreshMu sync.Mutex // one fetch at a time
 
@@ -131,12 +136,24 @@ func (p *jwksProvider) refresh(kid string) {
 	now := p.now()
 	if !p.lastAttempt.IsZero() && now.Sub(p.lastAttempt) < p.minRefresh {
 		p.mu.Unlock()
+		p.log(slog.LevelDebug, "jwks.refetch_throttled", "host", sdklog.Host(p.jwksURI))
 		return
 	}
 	p.lastAttempt = now
 	p.mu.Unlock()
 
-	set, err := p.fetch()
+	set, reason, err := p.fetch()
+	if err != nil {
+		status := 0
+		var se *statusError
+		if errors.As(err, &se) {
+			status = se.status
+		}
+		p.log(slog.LevelWarn, "jwks.fetch_failed", "host", sdklog.Host(p.jwksURI), "reason", reason,
+			"status", sdklog.NonZero(int64(status)))
+	} else {
+		p.log(slog.LevelDebug, "jwks.fetched", "host", sdklog.Host(p.jwksURI), "keys", set.Len())
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err != nil {
@@ -146,19 +163,25 @@ func (p *jwksProvider) refresh(kid string) {
 	p.set, p.loadedAt, p.lastErr = set, p.now(), nil
 }
 
-func (p *jwksProvider) fetch() (jwk.Set, error) {
+func (p *jwksProvider) log(level slog.Level, event string, kv ...any) {
+	sdklog.Log(context.Background(), p.logger, level, event, kv...)
+}
+
+// fetch gets and parses the key set; on failure reason classifies it for jwks.fetch_failed.
+func (p *jwksProvider) fetch() (set jwk.Set, reason string, err error) {
 	body, err := p.get(p.jwksURI)
 	if err != nil {
-		return nil, fmt.Errorf("fetch jwks: %w", err)
+		reason, _ = failureReason(err)
+		return nil, reason, fmt.Errorf("fetch jwks: %w", err)
 	}
 	if len(body) > MaxJWKSBytes {
-		return nil, fmt.Errorf("fetch jwks: larger than %d bytes", MaxJWKSBytes)
+		return nil, "too_large", fmt.Errorf("fetch jwks: larger than %d bytes", MaxJWKSBytes)
 	}
-	set, err := jwk.Parse(body)
+	set, err = jwk.Parse(body)
 	if err != nil {
-		return nil, fmt.Errorf("parse jwks: %w", err)
+		return nil, "malformed", fmt.Errorf("parse jwks: %w", err)
 	}
-	return set, nil
+	return set, "", nil
 }
 
 var jwksHTTPClient = &http.Client{
@@ -175,14 +198,14 @@ func defaultHTTPGet(url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+		return nil, &statusError{what: "GET " + url, status: resp.StatusCode}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxJWKSBytes+1))
 	if err != nil {
 		return nil, err
 	}
 	if len(body) > MaxJWKSBytes {
-		return nil, fmt.Errorf("GET %s: larger than %d bytes", url, MaxJWKSBytes)
+		return nil, &tooLargeError{msg: fmt.Sprintf("GET %s: larger than %d bytes", url, MaxJWKSBytes)}
 	}
 	return body, nil
 }

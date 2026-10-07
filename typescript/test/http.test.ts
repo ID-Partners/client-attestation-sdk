@@ -180,6 +180,19 @@ describe("request", () => {
     expect((await transportError(request("https://x.example", { maxBytes: 1000 }))).kind).toBe("too_large");
   });
 
+  it("still reports too_large when cancelling the oversized stream itself fails", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new Uint8Array(2000));
+      },
+      cancel() {
+        throw new Error("cancel failed");
+      },
+    });
+    vi.stubGlobal("fetch", async () => ({ status: 200, headers: new Headers(), body }));
+    expect((await transportError(request("https://x.example", { maxBytes: 1000 }))).kind).toBe("too_large");
+  });
+
   it("reports a failure mid-read as a network error", async () => {
     vi.stubGlobal("fetch", async () => ({
       status: 200,

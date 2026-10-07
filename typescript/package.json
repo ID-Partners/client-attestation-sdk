@@ -1,6 +1,6 @@
 {
   "name": "@idpartners/client-attestation-sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Client-side builder SDK for OAuth Attestation-Based Client Authentication",
   "type": "module",
   "main": "dist/index.js",
@@ -43,13 +43,14 @@
   },
   "homepage": "https://github.com/ID-Partners/client-attestation-sdk/tree/main/typescript",
   "dependencies": {
-    "jose": "^6.0.0"
+    "jose": "^6.2.12"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@vitest/coverage-v8": "^2.1.9",
-    "tsx": "^4.0.0",
-    "typescript": "^5.4.0",
-    "vitest": "^2.0.0"
+    "@vitest/coverage-v8": "^4.1.11",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
   }
 }

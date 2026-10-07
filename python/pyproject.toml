@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "client-attestation-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "Client-side builder SDK for OAuth Attestation-Based Client Authentication"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "ID Partners Pty Ltd" }]
@@ -17,15 +17,15 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Typing :: Typed",
 ]
 dependencies = [
-    "pyjwt>=2.8",
+    "pyjwt>=2.10",  # older to_jwk can drop a leading zero byte from an EC x or y
     "cryptography>=42",
 ]
 
@@ -46,11 +46,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 client_attestation_sdk = ["py.typed"]
-token_validator = ["py.typed"]
-authz_challenge = ["py.typed"]
 
 [tool.coverage.run]
-source = ["client_attestation_sdk", "token_validator", "authz_challenge"]
+source = ["client_attestation_sdk"]
 
 [tool.coverage.report]
 # today's measured coverage; raise it, never lower it

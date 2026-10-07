@@ -22,6 +22,10 @@ type StaticSvidSource struct{ SVID string }
 func (s StaticSvidSource) Fetch(string) (string, error) { return s.SVID, nil }
 
 // HTTPSvidSource GETs a URL returning {"svid":"<jwt>"} — e.g. the demo harness /dev/svid endpoint.
+//
+// For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
+// authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
+// file or cloud source.
 type HTTPSvidSource struct {
 	URL    string
 	Client *http.Client

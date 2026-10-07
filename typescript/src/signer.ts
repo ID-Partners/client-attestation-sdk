@@ -4,15 +4,16 @@
  * {@link SigningKeyPair} covers the local-key case; {@link OpenBaoTransitSigner} signs inside an
  * OpenBao / HashiCorp Vault transit engine so the attester's private key never leaves it.
  */
-import { calculateJwkThumbprint, exportJWK, importSPKI, type JWK } from "jose";
+import { base64url, calculateJwkThumbprint, exportJWK, importSPKI, type JWK } from "jose";
 
 import { TransportError } from "./errors.js";
+import { base64Encode } from "./runtime.js";
 import { parseJsonObject, request as httpRequest, snippet, type HttpResponse } from "./http.js";
 
 /** Per-call timeout for the vault. */
 const OPENBAO_TIMEOUT_MS = 5_000;
 
-const b64url = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64url");
+const b64url = (bytes: Uint8Array): string => base64url.encode(bytes);
 
 /** A JWS signing capability whose private key may live outside the process. `sign` returns the RAW JWS
  * signature over the signing input — for ECDSA the fixed-width `r||s`, not ASN.1/DER. */
@@ -93,7 +94,7 @@ export class OpenBaoTransitSigner implements JwsSigner {
 
   async sign(signingInput: Uint8Array): Promise<Uint8Array> {
     const body = JSON.stringify({
-      input: Buffer.from(signingInput).toString("base64"),
+      input: base64Encode(signingInput),
       marshaling_algorithm: "jws",
       hash_algorithm: this.#hash,
       key_version: this.#keyVersion,
@@ -104,7 +105,7 @@ export class OpenBaoTransitSigner implements JwsSigner {
       throw new Error("transit sign response carried no signature");
     }
     const raw = signature.slice(signature.lastIndexOf(":") + 1); // envelope: vault:v<n>:<base64url(r||s)>
-    return new Uint8Array(Buffer.from(raw, "base64url"));
+    return base64url.decode(raw);
   }
 }
 

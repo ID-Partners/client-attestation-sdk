@@ -38,14 +38,21 @@ export class SigningKeyPair {
   }
 
   /**
-   * Generate a fresh extractable key pair for the given JWS algorithm: `ES256` / `ES384` / `ES512`
+   * Generate a fresh key pair for the given JWS algorithm: `ES256` / `ES384` / `ES512`
    * (EC P-256 / P-384 / P-521), or `RS256` / `RS384` / `RS512` / `PS256` / `PS384` / `PS512`
    * (RSA 2048).
+   *
+   * The private key is not extractable unless `options.extractable` is true: nothing in the SDK needs
+   * to export it, so by default it can't leak through `exportJWK`. Pass `{ extractable: true }` only to
+   * persist the key yourself (then restore it with {@link SigningKeyPair.fromJwk}).
    */
-  static async generate(algorithm: string): Promise<SigningKeyPair> {
+  static async generate(
+    algorithm: string,
+    options: { extractable?: boolean } = {},
+  ): Promise<SigningKeyPair> {
     checkAlgorithm(algorithm);
     const { privateKey, publicKey } = await generateKeyPair(algorithm, {
-      extractable: true,
+      extractable: options.extractable ?? false,
       ...(algorithm.startsWith("ES") ? {} : { modulusLength: RSA_MODULUS_BITS }),
     });
     const publicJwk = publicMembers(await exportJWK(publicKey));

@@ -14,7 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from authz_challenge import (
+from client_attestation_sdk.authz_challenge import (
     APPROVED, CHANNEL_DEVICE, CHANNEL_LOCAL, DENIED, EXPIRED, IDENTITY_PROOFING, PENDING,
     Ceremony, CibaClient, Hooks, Pending, PrivateKeyJwtAuth, ProofingResolver, Resolved,
     Unavailable, parse_challenge, transaction_hash,

@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from authz_challenge import CibaClient, CibaError, urllib_http
+from client_attestation_sdk.authz_challenge import CibaClient, CibaError, urllib_http
 from client_attestation_sdk import (
     AttestationIssuanceClient,
     ClientAttestation,
@@ -22,8 +22,8 @@ from client_attestation_sdk import (
 )
 from client_attestation_sdk import _http
 from client_attestation_sdk import evidence as evidence_mod
-from token_validator import AccessTokenValidator, IntrospectionConfig, ValidatorConfig, discover
-from token_validator.jwks import JwksProvider
+from client_attestation_sdk.token_validator import AccessTokenValidator, IntrospectionConfig, ValidatorConfig, discover
+from client_attestation_sdk.token_validator.jwks import JwksProvider
 
 
 class Route:

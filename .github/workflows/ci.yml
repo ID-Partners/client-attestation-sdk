@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.23", "stable"]
+        go: ["1.25", "stable"]
     defaults:
       run:
         working-directory: go
@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     defaults:
       run:
         working-directory: python
@@ -57,6 +57,34 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e '.[test]'
       - run: python -m pytest --cov   # floor is fail_under in pyproject.toml
+
+  python-minimums:
+    # the job above always gets the newest pyjwt and cryptography; this one pins each to the minimum
+    # pyproject.toml declares, on the oldest supported Python, so a floor that no longer works fails here
+    name: python minimums
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Pin the declared minimums
+        run: |
+          python - <<'PY'
+          import re, tomllib
+          deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]
+          pins = [re.sub(r"\s*>=\s*", "==", d.split(";")[0]) for d in deps]
+          bad = [p for p in pins if "==" not in p]
+          if bad:
+              raise SystemExit(f"every runtime dependency needs a >= minimum: {bad}")
+          open("minimums.txt", "w").write("\n".join(pins) + "\n")
+          print("\n".join(pins))
+          PY
+      - run: python -m pip install -c minimums.txt -e '.[test]'
+      - run: python -m pytest
 
   typescript:
     name: node ${{ matrix.node }}
@@ -134,7 +162,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [go, python, typescript, java, validation]
+    needs: [go, python, python-minimums, typescript, java, validation]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed

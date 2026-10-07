@@ -4,7 +4,7 @@ from __future__ import annotations
 
 class ValidationResult:
     """Either a valid token (with its subject, granted scopes, audience and claims) or a failure carrying a
-    stable ``error`` code (see :mod:`token_validator.errors`)."""
+    stable ``error`` code (see :mod:`client_attestation_sdk.token_validator.errors`)."""
 
     def __init__(self, valid, *, error=None, error_description=None, subject=None,
                  scopes=None, audience=None, claims=None, expires_at=None):

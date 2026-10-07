@@ -8,6 +8,14 @@ Python ports — the same AS-side Java verifier accepts all three.
 Package `clientattestation`; signing via
 [`github.com/lestrrat-go/jwx/v2`](https://github.com/lestrrat-go/jwx).
 
+## Install
+
+```bash
+go get github.com/id-partners/client-attestation-sdk/go
+```
+
+Go 1.25 or later. The resource-server validator is the `tokenvalidator` subpackage.
+
 ## Artifacts
 
 | Artifact | `typ` | Key material in header | Notable claims |

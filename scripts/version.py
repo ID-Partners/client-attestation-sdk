@@ -18,8 +18,8 @@ SEMVER = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?"
 COPIES = [
     ("python/pyproject.toml", rf'(?m)^version = "({SEMVER})"$', 1),
     ("python/src/client_attestation_sdk/__init__.py", rf'__version__ = "({SEMVER})"', 1),
-    ("python/src/token_validator/__init__.py", rf'__version__ = "({SEMVER})"', 1),
-    ("python/src/authz_challenge/__init__.py", rf'__version__ = "({SEMVER})"', 1),
+    ("python/src/client_attestation_sdk/token_validator/__init__.py", rf'__version__ = "({SEMVER})"', 1),
+    ("python/src/client_attestation_sdk/authz_challenge/__init__.py", rf'__version__ = "({SEMVER})"', 1),
     ("typescript/package.json", rf'(?m)^  "version": "({SEMVER})"', 1),
     ("typescript/package-lock.json", rf'"name": "@idpartners/client-attestation-sdk",\s*"version": "({SEMVER})"', 2),
     ("typescript/src/index.ts", rf'export const VERSION = "({SEMVER})"', 1),

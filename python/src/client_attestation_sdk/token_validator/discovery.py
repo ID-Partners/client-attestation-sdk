@@ -14,6 +14,6 @@ def discover(metadata_url, http_get=None):
     """Fetch an authorization-server metadata document, e.g.
     ``https://issuer.example.com/.well-known/oauth-authorization-server``. The returned dict carries
     ``issuer``, ``jwks_uri`` and ``introspection_endpoint`` to feed into a
-    :class:`~token_validator.config.ValidatorConfig`."""
+    :class:`~client_attestation_sdk.token_validator.config.ValidatorConfig`."""
     get = http_get or _default_get
     return json.loads(get(metadata_url))

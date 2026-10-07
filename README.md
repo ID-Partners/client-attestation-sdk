@@ -1,8 +1,8 @@
 # client-attestation-sdk
 
 Agent-side OAuth SDKs in **Java, Python, TypeScript, and Go** — for authenticating agents and workloads on
-common runtimes (LangChain, ADK, Node 20+, JVM and Go services, and Bedrock AgentCore from Python). Three
-capabilities:
+common runtimes (LangChain, ADK, Node 20+ and edge runtimes, JVM and Go services, and Bedrock AgentCore
+from Python). Three capabilities:
 
 For a visual tour — architecture diagrams, the full feature-support matrix across all four languages, and
 the standards this SDK implements — open [`docs/explainer.html`](docs/explainer.html), one offline page.
@@ -47,8 +47,16 @@ Pre-1.0. The API can still change between minor versions, and the changelog says
   `/.well-known/client-attester` (evidence audience, attestation, challenge and token endpoints) is a
   PingFederate convention, and the instance proof sent when minting an attestation uses the proprietary
   `typ` `oauth-attestation-instance-proof+jwt`. Both are specific to the attester this SDK was built against.
-- Nothing is on PyPI, npm or Maven Central yet. Each language's README says how to install from this
-  repository.
+- Install:
+
+  | Language | Package | Install |
+  |---|---|---|
+  | Python | [PyPI](https://pypi.org/project/client-attestation-sdk/) | `pip install client-attestation-sdk` |
+  | TypeScript | [npm](https://www.npmjs.com/package/@idpartners/client-attestation-sdk) | `npm install @idpartners/client-attestation-sdk` |
+  | Go | [pkg.go.dev](https://pkg.go.dev/github.com/id-partners/client-attestation-sdk/go) | `go get github.com/id-partners/client-attestation-sdk/go` |
+  | Java | GitHub Packages | `global.idpartners:client-attestation-sdk` – see the [Java README](java/README.md) |
+
+  Java isn't on Maven Central yet, and GitHub Packages needs a GitHub token even to read a public package.
 
 See [CHANGELOG.md](CHANGELOG.md), [SECURITY.md](SECURITY.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -67,6 +75,7 @@ or the explainer drifts from it. A dash means the port doesn't have the feature 
 | Fail-closed defaults | ✓ | ✓ | ✓ | ✓ |
 | Name the operator on the one-call class | ✓ | ✓ | ✓ | ✓ |
 | Drop the token-endpoint challenge | ✓ | ✓ | ✓ | ✓ |
+| Logging hooks | ✓ | ✓ | ✓ | ✓ |
 | Trace every call as curl | — | — | ✓ | — |
 | Asserted context at mint | — | — | ✓ | — |
 | **Building credentials** | | | | |
@@ -123,6 +132,11 @@ Either way, if the attester advertises a `challenge_endpoint`, the SDK fetches a
 it through automatically — as the PoP JWT's `challenge` claim in the default mode, or as the DPoP proof's
 `nonce` claim in `dpop_combined` mode. You never have to plumb it through yourself.
 
+To see what the flow is doing, turn on logging. It is off until you configure it, uses each language's own
+logging (Python `logging`, Go `log/slog`, Java `System.Logger`, a `logger` option in TypeScript), and
+never writes a token, proof, attestation or key. The events and their attributes are the same in every
+port: see [`docs/logging.md`](docs/logging.md).
+
 `java/` is the reference builder (formerly the standalone `client-attestation-sdk` repo). The **AS-side
 verifier** that accepts these credentials is separate:
 [client-attestation](https://github.com/dphhyland/client-attestation).
@@ -136,8 +150,9 @@ reference PEPs answer 401 both for "no user at all" and "user present, scope mis
 normalises first and resolves second:
 
 ```python
-from authz_challenge import (parse_challenge, CibaClient, CibaResolver, PrivateKeyJwtAuth, Hooks,
-                             Pending, Resolved, Unavailable, CHANNEL_DEVICE)
+from client_attestation_sdk.authz_challenge import (
+    parse_challenge, CibaClient, CibaResolver, PrivateKeyJwtAuth, Hooks,
+    Pending, Resolved, Unavailable, CHANNEL_DEVICE)
 
 ch = parse_challenge(resp.status_code, resp.headers, resp.text)     # -> Challenge | None
 if ch and ch.type == "resource_authorisation":
@@ -217,8 +232,8 @@ CI runs all of it on every push and pull request except `verify-interop.sh` (see
 
 ```
 java/         builder + one-call client, no validator     (jose4j)
-python/       client_attestation_sdk + token_validator + authz_challenge   (PyJWT + cryptography)
-typescript/   src/ builder + src/validator/               (panva jose; Node 20+)   
+python/       client_attestation_sdk (+ .token_validator, .authz_challenge)  (PyJWT + cryptography)
+typescript/   src/ builder + src/validator/               (panva jose; Node 20+ or edge)
 go/           builder package + tokenvalidator/           (lestrrat-go/jwx)
 vectors/      client-builder shared vectors + outputs
 validation/   token-validator + challenge-parser shared vectors + agreement checker
@@ -297,7 +312,7 @@ implement `sign(signingInput) → raw r‖s` and plug it in.
 The validator side mirrors the same config→act shape. Representative flow (Python):
 
 ```python
-from token_validator import AccessTokenValidator, ValidatorConfig
+from client_attestation_sdk.token_validator import AccessTokenValidator, ValidatorConfig
 
 validator = AccessTokenValidator(ValidatorConfig(
     issuer="https://issuer.example.com", audiences=["https://api.example.com"],
@@ -323,7 +338,7 @@ conventions on top: RFC 9728 protected-resource metadata, RFC 6750 bearer extrac
 challenges, and a request guard that binds the token to this resource (RFC 8707) and maps failures to 401/403.
 
 ```python
-from token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig
+from client_attestation_sdk.token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig
 
 validator = AccessTokenValidator(ValidatorConfig(
     issuer="https://as.example.com", audiences=["https://mcp.example.com/mcp"],  # audience = this server

@@ -18,6 +18,8 @@
          "ports": ["go", "java", "python", "typescript"]},
         {"label": "Drop the token-endpoint challenge", "sub": "For attesters that accept a challenge only once",
          "ports": ["go", "java", "python", "typescript"]},
+        {"label": "Logging hooks", "sub": "Off by default, one event vocabulary, never a credential (docs/logging.md)",
+         "ports": ["go", "java", "python", "typescript"]},
         {"label": "Trace every call as curl", "sub": "Credentials redacted unless you turn it off",
          "ports": ["python"]},
         {"label": "Asserted context at mint", "sub": "An unverified discriminator for an attester-side resolver",

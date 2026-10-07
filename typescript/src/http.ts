@@ -12,6 +12,7 @@
  *   into a {@link TransportError}.
  */
 import { TransportError } from "./errors.js";
+import { utf8Decode, utf8Encode } from "./runtime.js";
 
 export const DEFAULT_MAX_BYTES = 1024 * 1024;
 export const DEFAULT_TIMEOUT_MS = 20_000;
@@ -125,7 +126,7 @@ async function readCapped(res: Response, maxBytes: number, tooLarge: () => Trans
   if (!res.body) {
     // only reached by stand-in Response objects (tests); a real fetch always has a stream
     const text = await res.text();
-    if (Buffer.byteLength(text, "utf8") > maxBytes) throw tooLarge();
+    if (utf8Encode(text).byteLength > maxBytes) throw tooLarge();
     return text;
   }
   const reader = res.body.getReader();
@@ -141,7 +142,13 @@ async function readCapped(res: Response, maxBytes: number, tooLarge: () => Trans
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  const all = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return utf8Decode(all);
 }
 
 /**

@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from authz_challenge import (
+from client_attestation_sdk.authz_challenge import (
     AUTHN, CHALLENGE_TYPES, IDENTITY_PROOFING, RESOURCE_AUTHORISATION,
     Challenge, parse_challenge, parse_www_authenticate,
 )

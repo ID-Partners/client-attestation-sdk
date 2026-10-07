@@ -1,17 +1,21 @@
 package tokenvalidator
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jws"
+
+	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
 // httpPostFunc performs a form POST and returns the parsed JSON object. Injectable so tests can avoid real
@@ -30,6 +34,7 @@ type AccessTokenValidator struct {
 	jwks     *jwksProvider
 	httpGet  httpGetFunc
 	httpPost httpPostFunc
+	logger   *slog.Logger
 }
 
 // Option customizes a validator (e.g. injecting HTTP transports for tests).
@@ -57,12 +62,18 @@ func New(config *Config, opts ...Option) (*AccessTokenValidator, error) {
 	if err != nil {
 		return nil, err
 	}
+	v.logger = sdklog.OrDiscard(v.logger)
+	provider.logger = v.logger
 	v.jwks = provider
 	return v, nil
 }
 
 // Validate performs local JWT validation. requiredScopes overrides the configured RequiredScopes when non-nil.
 func (v *AccessTokenValidator) Validate(token string, requiredScopes []string) Result {
+	return v.logVerdict(v.validate(token, requiredScopes), "jwt")
+}
+
+func (v *AccessTokenValidator) validate(token string, requiredScopes []string) Result {
 	required := requiredScopes
 	if required == nil {
 		required = v.config.RequiredScopes
@@ -169,11 +180,23 @@ func (v *AccessTokenValidator) Introspect(token string) (map[string]any, error) 
 	if post == nil {
 		post = defaultHTTPPost
 	}
-	return post(cfg.Endpoint, form.Encode(), headers)
+	data, err := post(cfg.Endpoint, form.Encode(), headers)
+	if err != nil {
+		reason, status := failureReason(err)
+		sdklog.Log(context.Background(), v.logger, slog.LevelWarn, "http.failed",
+			"step", "introspection", "method", http.MethodPost,
+			"host", sdklog.Host(cfg.Endpoint), "path", sdklog.Path(cfg.Endpoint),
+			"status", sdklog.NonZero(int64(status)), "reason", reason)
+	}
+	return data, err
 }
 
 // ValidateActive introspects the token and enforces active plus scope/audience from the response.
 func (v *AccessTokenValidator) ValidateActive(token string, requiredScopes []string) Result {
+	return v.logVerdict(v.validateActive(token, requiredScopes), "introspection")
+}
+
+func (v *AccessTokenValidator) validateActive(token string, requiredScopes []string) Result {
 	data, err := v.Introspect(token)
 	if err != nil {
 		return failure(ErrInvalidToken, err.Error())
@@ -220,7 +243,7 @@ func defaultHTTPPost(endpoint, body string, headers map[string]string) (map[stri
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("introspection: status %d", resp.StatusCode)
+		return nil, &statusError{what: "introspection", status: resp.StatusCode}
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxIntrospectionBytes))
 	if err != nil {

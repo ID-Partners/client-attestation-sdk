@@ -8,7 +8,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { type AddressInfo } from "node:net";
 
 import { calculateJwkThumbprint, compactVerify, decodeJwt, decodeProtectedHeader, importJWK, type JWK } from "jose";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ClientAttestation, DpopProofBuilder, SigningKeyPair, StaticSvidSource } from "../src/index.js";
 
@@ -184,6 +184,34 @@ describe("dpop_combined: DPoP-bound tokens at a resource", () => {
     expect(res.status).toBe(401);
     expect(res.headers.get("DPoP-Nonce")).toBe(rs.nonce);
     expect(rs.seen.length).toBe(1);
+  });
+
+  it("retries a nonce challenge even when discarding the challenge's body fails", async () => {
+    const as = await authorizationServer();
+    const rs = await resourceServer(as.boundKeys);
+    const ca = client(as.url);
+    const realFetch = globalThis.fetch;
+    let challenged = false;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!String(input).startsWith(rs.url) || challenged) return realFetch(input, init);
+      challenged = true;
+      const body = new ReadableStream({
+        cancel() {
+          throw new Error("cancel failed");
+        },
+      });
+      return new Response(body, {
+        status: 401,
+        headers: { "WWW-Authenticate": 'DPoP error="use_dpop_nonce"', "DPoP-Nonce": rs.nonce },
+      });
+    });
+    try {
+      const res = await ca.fetch(`${rs.url}/things`);
+      expect(res.status).toBe(200);
+      expect(rs.seen.map((s) => s.proof.nonce)).toEqual([rs.nonce]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("returns a non-nonce failure as is, without retrying", async () => {

@@ -7,7 +7,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from authz_challenge import (
+from client_attestation_sdk.authz_challenge import (
     APPROVED, DENIED, EXPIRED, PENDING,
     CibaClient, CibaError, CibaRequest, PrivateKeyJwtAuth, private_key_jwt_assertion,
 )

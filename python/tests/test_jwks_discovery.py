@@ -6,8 +6,8 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from client_attestation_sdk import SigningKeyPair
-from token_validator import discover
-from token_validator.jwks import JwksProvider
+from client_attestation_sdk.token_validator import discover
+from client_attestation_sdk.token_validator.jwks import JwksProvider
 
 
 class JsonServer:
@@ -216,7 +216,7 @@ def test_a_failed_refresh_keeps_the_keys_already_held():
 
 
 def test_fetch_failure_is_key_not_found_not_an_exception():
-    from token_validator import AccessTokenValidator, ValidatorConfig, errors
+    from client_attestation_sdk.token_validator import AccessTokenValidator, ValidatorConfig, errors
 
     key = SigningKeyPair.generate("ES256")
 

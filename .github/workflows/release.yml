@@ -3,7 +3,9 @@ name: release
 # Publishing a GitHub release tagged vX.Y.Z (from main) publishes every port at X.Y.Z:
 #   python  -> PyPI  client-attestation-sdk           (trusted publishing, no token)
 #   npm     -> npm   @idpartners/client-attestation-sdk (trusted publishing + provenance, no token)
-#   java    -> GitHub Packages global.idpartners:client-attestation-sdk
+#   java    -> Maven Central   global.idpartners:client-attestation-sdk (Central Portal user token + GPG signature)
+#              GitHub Packages global.idpartners:client-attestation-sdk (GITHUB_TOKEN; kept while users move to
+#              Central, to be dropped once a release has gone out to Central)
 #   go      -> tag go/vX.Y.Z, which is what `go get .../go@vX.Y.Z` resolves
 #
 # Nothing publishes unless the full CI suite passes on the tagged commit and every manifest already says
@@ -15,6 +17,11 @@ name: release
 #       (owner ID-Partners, repo client-attestation-sdk, workflow release.yml, environment release).
 #   - npm: create the @idpartners org, then add a trusted publisher for @idpartners/client-attestation-sdk
 #       (same repo, workflow release.yml, environment release).
+#   - Maven Central: verify the global.idpartners namespace in the Central Portal, publish a GPG signing key
+#       to a public keyserver, generate a Central Portal user token, then add four secrets to the `release`
+#       environment: CENTRAL_TOKEN_USERNAME, CENTRAL_TOKEN_PASSWORD (the user token's two halves),
+#       MAVEN_GPG_PRIVATE_KEY (the ASCII-armoured secret key) and MAVEN_GPG_PASSPHRASE. The Central job
+#       fails, naming what's missing, until all four are set.
 on:
   release:
     types: [published]
@@ -95,9 +102,86 @@ jobs:
       - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
       - run: npm ci
       - run: npm run build
-      - run: npm publish --provenance --access public
+      # A version already on npm is skipped, not failed: the first release of a package is published by
+      # hand (npm adds a trusted publisher per package, so the package has to exist first).
+      - id: published
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ "$(npm view "@idpartners/client-attestation-sdk@$v" version 2>/dev/null)" = "$v" ]; then
+            echo "::notice::@idpartners/client-attestation-sdk@$v is already on npm, skipping the publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.published.outputs.skip != 'true'
+        run: npm publish --provenance --access public
 
   java:
+    name: publish java (Maven Central)
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: java
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+      CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+      MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+    steps:
+      # Fail, never skip, when the setup isn't done: a release that quietly leaves Java off Central would
+      # look like a success.
+      - name: Central and GPG secrets are set
+        env:
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+        working-directory: .
+        run: |
+          missing=""
+          for name in CENTRAL_TOKEN_USERNAME CENTRAL_TOKEN_PASSWORD MAVEN_GPG_PRIVATE_KEY MAVEN_GPG_PASSPHRASE; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the release environment is missing the secrets:$missing (see the Maven Central setup at the top of release.yml)"
+            exit 1
+          fi
+      # Central refuses a second upload of a version, so a version already there is skipped, not failed
+      # (re-running a release whose other jobs failed, say). repo1 is Central's public repository, so this
+      # needs no token. A version reaches repo1 a few minutes after the Portal says it is published; a
+      # re-run inside that window uploads again and Central refuses the duplicate.
+      - id: published
+        working-directory: .
+        run: |
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://repo1.maven.org/maven2/global/idpartners/client-attestation-sdk/$VERSION/client-attestation-sdk-$VERSION.pom")
+          case "$status" in
+            200)
+              echo "::notice::global.idpartners:client-attestation-sdk:$VERSION is already on Maven Central, skipping the publish"
+              echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            404) ;;
+            *)
+              echo "::warning::could not tell whether $VERSION is already on Maven Central (HTTP $status); publishing anyway" ;;
+          esac
+      - if: steps.published.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: steps.published.outputs.skip != 'true'
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          server-id: central
+          server-username-env-var: CENTRAL_TOKEN_USERNAME
+          server-password-env-var: CENTRAL_TOKEN_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase-env-var: MAVEN_GPG_PASSPHRASE
+      # The `release` profile signs with GPG and uploads through the Central Portal, then waits until the
+      # version is published (autoPublish, waitUntil=published in pom.xml).
+      - if: steps.published.outputs.skip != 'true'
+        run: mvn -B -P release deploy -DskipTests
+
+  # Kept for one transition release so anyone installing from GitHub Packages still gets it. Drop this job
+  # (and pom.xml's <distributionManagement>) once a version is live on Maven Central.
+  java-github-packages:
     name: publish java (GitHub Packages)
     needs: ci
     runs-on: ubuntu-latest

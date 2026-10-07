@@ -44,7 +44,13 @@ public interface SvidSource {
         }
     }
 
-    /** GET a URL returning {@code {"svid":"<jwt>"}} — e.g. the demo harness {@code /dev/svid} endpoint. */
+    /**
+     * GET a URL returning {@code {"svid":"<jwt>"}} — e.g. the demo harness {@code /dev/svid} endpoint.
+     *
+     * <p>For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
+     * authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
+     * file or cloud source.
+     */
     final class Http implements SvidSource {
         static final Duration TIMEOUT = Duration.ofSeconds(20);
 

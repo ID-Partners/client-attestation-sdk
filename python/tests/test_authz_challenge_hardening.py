@@ -9,14 +9,14 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from authz_challenge import (
+from client_attestation_sdk.authz_challenge import (
     APPROVED, CHANNEL_DEVICE, EXPIRED, IDENTITY_PROOFING, PENDING, RESOURCE_AUTHORISATION,
     Ceremony, CibaClient, CibaRequest, CibaResolver, Hooks, MemoryStore, Pending, PollResult,
     PrivateKeyJwtAuth, ProofingResolver, Resolved, Unavailable, WebConsentResolver, new_code,
     parse_challenge, urllib_http,
 )
-from authz_challenge import ciba as ciba_mod
-from authz_challenge.resolver import new_handle
+from client_attestation_sdk.authz_challenge import ciba as ciba_mod
+from client_attestation_sdk.authz_challenge.resolver import new_handle
 
 BC = "https://pf.example/as/bc-auth.ciba"
 TOK = "https://pf.example/as/token.oauth2"
@@ -197,7 +197,7 @@ def test_verify_resume_age_falls_back_to_created_at_without_approved_at():
     clock = Clock()
     cer = Ceremony(code="PAY-x", kind=RESOURCE_AUTHORISATION, channel=CHANNEL_DEVICE, subject="alice",
                    txn_hash="", instruction=dict(INSTR), initiator="a", created_at=clock.t, status=APPROVED)
-    from authz_challenge.resolver import _bound_hash
+    from client_attestation_sdk.authz_challenge.resolver import _bound_hash
     cer.txn_hash = _bound_hash("alice", INSTR)
     store = MemoryStore()
     store.put(cer)

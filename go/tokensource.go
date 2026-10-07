@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	"unicode/utf16"
 
 	"github.com/google/uuid"
+
+	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
 // DraftRevision is the draft-ietf-oauth-attestation-based-client-auth revision this SDK implements.
@@ -46,6 +49,7 @@ type ClientAttestation struct {
 	httpClient           *http.Client
 	requireChallenge     bool
 	allowInsecure        bool
+	logger               *slog.Logger
 
 	// lock is a 1-buffered channel semaphore guarding the cache and the network flow (single-flight).
 	// Unlike a sync.Mutex, a waiter can give up when its ctx is cancelled.
@@ -179,6 +183,7 @@ func NewClientAttestation(pfHost string, opts ...Option) (*ClientAttestation, er
 		return nil, err
 	}
 	c.httpClient = safeClient(c.httpClient, c.timeout)
+	c.logger = sdklog.OrDiscard(c.logger)
 	return c, nil
 }
 
@@ -250,18 +255,24 @@ func (c *ClientAttestation) tokenState(ctx context.Context, opts ...TokenOption)
 	defer c.release()
 	// Re-checked under the lock: a waiter that queued behind a refresh is served the fresh token.
 	if !o.forceRefresh && c.cachedToken != "" && time.Now().Before(c.expiresAt) {
+		c.log(ctx, slog.LevelDebug, "token.cache_hit", "expires_in", int64(time.Until(c.expiresAt).Seconds()))
 		return boundToken{c.cachedToken, c.tokenType, c.boundKey}, nil
 	}
+	reason := "expired"
+	switch {
+	case o.forceRefresh:
+		reason = "forced"
+	case c.cachedToken == "":
+		reason = "initial"
+	}
+	c.log(ctx, slog.LevelDebug, "token.refreshing", "reason", reason)
 	response, instanceKey, err := c.runFlow(ctx)
 	if err != nil {
 		return boundToken{}, err
 	}
 	c.cachedToken = response.AccessToken
 	c.boundKey = instanceKey
-	c.tokenType = TokenTypeBearer
-	if strings.EqualFold(strings.TrimSpace(response.TokenType), TokenTypeDPoP) {
-		c.tokenType = TokenTypeDPoP
-	}
+	c.tokenType = normalizeTokenType(response.TokenType)
 	if response.ExpiresIn > 0 {
 		c.expiresAt = time.Now().Add(time.Duration(response.ExpiresIn)*time.Second - c.skew)
 	} else {
@@ -371,13 +382,15 @@ type tokenResponse struct {
 // getDiscovery fetches and caches the discovery document. Caller holds c.lock.
 func (c *ClientAttestation) getDiscovery(ctx context.Context) (*discoveryDoc, error) {
 	if c.discovery != nil {
+		c.log(ctx, slog.LevelDebug, "discovery.cached", "host", sdklog.Host(c.baseURL))
 		return c.discovery, nil
 	}
 	var doc discoveryDoc
-	if err := c.getJSON(ctx, http.MethodGet, c.baseURL+wellKnownPath, nil, &doc); err != nil {
+	if err := c.getJSON(ctx, "discover", http.MethodGet, c.baseURL+wellKnownPath, nil, &doc); err != nil {
 		return nil, err
 	}
 	c.discovery = &doc
+	c.log(ctx, slog.LevelDebug, "discovery.fetched", "host", sdklog.Host(c.baseURL))
 	return c.discovery, nil
 }
 
@@ -406,6 +419,7 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 	if err != nil {
 		return nil, nil, err
 	}
+	c.log(ctx, slog.LevelDebug, "evidence.obtained", "source", typeName(source))
 
 	instanceKey, err := Generate(c.algorithm)
 	if err != nil {
@@ -433,6 +447,8 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 	if err != nil {
 		return nil, nil, err
 	}
+	c.log(ctx, slog.LevelDebug, "attestation.minted",
+		"host", sdklog.Host(doc.AttestationEndpoint), "client_id", clientID, "alg", c.algorithm)
 	// See WithChallengeAtToken: some attesters consume the challenge the moment the mint's instance
 	// proof uses it, and reject a token request that presents the same value a second time. Against one
 	// of those, only the mint gets the challenge.
@@ -460,6 +476,8 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 			return nil, nil, err
 		}
 		if nonce, ok := nonceChallenge(res.Status, res.Header, res.Body); ok {
+			c.log(ctx, slog.LevelInfo, "dpop.nonce_retry",
+				"host", sdklog.Host(tokenEndpoint), "status", res.Status, "at", "token_endpoint")
 			if dpop, err = proof(nonce); err != nil {
 				return nil, nil, err
 			}
@@ -467,7 +485,7 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 				return nil, nil, err
 			}
 		}
-		response, err := parseTokenResponse(res)
+		response, err := c.tokenResult(ctx, tokenEndpoint, clientID, res)
 		return response, instanceKey, err
 	}
 
@@ -486,8 +504,34 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 	if err != nil {
 		return nil, nil, err
 	}
-	response, err := parseTokenResponse(res)
+	response, err := c.tokenResult(ctx, tokenEndpoint, clientID, res)
 	return response, instanceKey, err
+}
+
+// tokenResult parses the token endpoint's answer, logging token.obtained or http.failed.
+func (c *ClientAttestation) tokenResult(ctx context.Context, endpoint, clientID string, res *httpResult) (*tokenResponse, error) {
+	response, err := parseTokenResponse(res)
+	if err != nil {
+		reason := "malformed"
+		if !res.ok() {
+			reason = "status"
+		}
+		c.logHTTPFailure(ctx, "token", http.MethodPost, endpoint, res.Status, reason)
+		return nil, err
+	}
+	c.log(ctx, slog.LevelInfo, "token.obtained",
+		"host", sdklog.Host(endpoint), "client_id", clientID,
+		"token_type", normalizeTokenType(response.TokenType),
+		"expires_in", sdklog.NonZero(response.ExpiresIn), "pop_method", c.popMethod)
+	return response, nil
+}
+
+// normalizeTokenType maps a token response's token_type to TokenTypeDPoP or TokenTypeBearer.
+func normalizeTokenType(tokenType string) string {
+	if strings.EqualFold(strings.TrimSpace(tokenType), TokenTypeDPoP) {
+		return TokenTypeDPoP
+	}
+	return TokenTypeBearer
 }
 
 // fetchChallenge asks the challenge endpoint for a challenge if one is advertised. No advertised
@@ -503,12 +547,13 @@ func (c *ClientAttestation) fetchChallenge(ctx context.Context, doc *discoveryDo
 	var body struct {
 		AttestationChallenge string `json:"attestation_challenge"`
 	}
-	err := c.getJSON(ctx, http.MethodPost, doc.ChallengeEndpoint, nil, &body)
+	err := c.getJSON(ctx, "challenge", http.MethodPost, doc.ChallengeEndpoint, nil, &body)
 	if err == nil && body.AttestationChallenge == "" {
 		err = &ClientAttestationError{Message: "challenge endpoint response has no attestation_challenge"}
 	}
 	if err != nil {
 		if !c.requireChallenge {
+			c.log(ctx, slog.LevelWarn, "challenge.skipped", "host", sdklog.Host(doc.ChallengeEndpoint))
 			return "", nil
 		}
 		var caErr *ClientAttestationError
@@ -523,6 +568,7 @@ func (c *ClientAttestation) fetchChallenge(ctx context.Context, doc *discoveryDo
 			Message: fmt.Sprintf("could not obtain an attestation challenge from %s: %v", doc.ChallengeEndpoint, err),
 		}
 	}
+	c.log(ctx, slog.LevelDebug, "challenge.fetched", "host", sdklog.Host(doc.ChallengeEndpoint))
 	return body.AttestationChallenge, nil
 }
 
@@ -561,7 +607,7 @@ func (c *ClientAttestation) mint(ctx context.Context, doc *discoveryDoc, instanc
 	if err := c.checkSecure(doc.AttestationEndpoint); err != nil {
 		return "", err
 	}
-	if err := c.getJSON(ctx, http.MethodPost, doc.AttestationEndpoint, body, &response); err != nil {
+	if err := c.getJSON(ctx, "mint", http.MethodPost, doc.AttestationEndpoint, body, &response); err != nil {
 		return "", err
 	}
 	if response.Attestation == "" {
@@ -586,12 +632,17 @@ func (c *ClientAttestation) sendTokenRequest(ctx context.Context, endpoint, atte
 		values.Set("operator", op)
 	}
 	form := values.Encode()
-	return doRequest(ctx, c.httpClient, http.MethodPost, endpoint, map[string]string{
+	res, err := doRequest(ctx, c.httpClient, http.MethodPost, endpoint, map[string]string{
 		"Content-Type":    "application/x-www-form-urlencoded",
 		"Accept":          "application/json",
 		AttestationHeader: attestation,
 		popHeaderName:     pop,
 	}, []byte(form), defaultMaxResponseBytes)
+	if err != nil {
+		reason, status := transportReason(err)
+		c.logHTTPFailure(ctx, "token", http.MethodPost, endpoint, status, reason)
+	}
+	return res, err
 }
 
 // compactSortedJSON renders v as compact JSON with object keys sorted (encoding/json sorts map keys),
@@ -642,7 +693,8 @@ func parseTokenResponse(res *httpResult) (*tokenResponse, error) {
 }
 
 // getJSON performs an HTTP request with an optional JSON body and decodes a JSON response into out.
-func (c *ClientAttestation) getJSON(ctx context.Context, method, target string, jsonBody any, out any) error {
+// step names the call in an http.failed event.
+func (c *ClientAttestation) getJSON(ctx context.Context, step, method, target string, jsonBody any, out any) error {
 	headers := map[string]string{"Accept": "application/json"}
 	var data []byte
 	if jsonBody != nil {
@@ -654,12 +706,22 @@ func (c *ClientAttestation) getJSON(ctx context.Context, method, target string, 
 	}
 	res, err := doRequest(ctx, c.httpClient, method, target, headers, data, defaultMaxResponseBytes)
 	if err != nil {
+		reason, status := transportReason(err)
+		c.logHTTPFailure(ctx, step, method, target, status, reason)
 		return err
 	}
 	if len(res.Body) == 0 {
 		out = nil // an empty 2xx body leaves out untouched
 	}
-	return decodeJSONOK(res, method+" "+target, out)
+	if err := decodeJSONOK(res, method+" "+target, out); err != nil {
+		reason := "malformed"
+		if !res.ok() {
+			reason = "status"
+		}
+		c.logHTTPFailure(ctx, step, method, target, res.Status, reason)
+		return err
+	}
+	return nil
 }
 
 // ClientAttestationError is returned when a step in the flow fails. Status and Body are set for HTTP

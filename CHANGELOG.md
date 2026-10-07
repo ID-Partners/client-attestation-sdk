@@ -5,6 +5,61 @@ and versions follow [semver](https://semver.org/) as described under "Status and
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-08
+
+### Added
+
+- **Logging hooks in all four ports**, off by default. Python logs through the standard `logging`
+  module under `client_attestation_sdk` (with a `NullHandler`); Go takes a `*slog.Logger`
+  (`WithLogger`, for the token source and the validator); TypeScript takes a `logger` option with
+  `debug`/`info`/`warn`/`error`; Java takes a `System.Logger` (`.logger(...)`, no SLF4J dependency). Every
+  port emits the same events with the same attribute keys: discovery, evidence, challenge, mint, token
+  obtained / cached / refreshed (with expiry), DPoP nonce retries, HTTP failures (host and path, never a
+  query string), JWKS fetches and throttling, validation verdicts, and in Python the CIBA and challenge
+  resolver steps. No token, attestation, proof, SVID, challenge, secret or key is ever logged, and each port
+  has a test that runs a full flow at the most verbose level to prove it. See
+  [`docs/logging.md`](docs/logging.md).
+
+### Changed
+
+- **Go: the module now needs Go 1.25 or later** (it was 1.23, which is out of support). It comes with
+  `lestrrat-go/jwx/v2` 2.1.7 and `golang.org/x/crypto` 0.53, which need 1.25.
+- **TypeScript: `jose` 6.2.12 or later.**
+- **Python: the package now needs Python 3.11 or later** (it was 3.10, which reaches end of life this
+  month). CI runs 3.11 to 3.14, and a separate job tests the declared minimum `pyjwt` and `cryptography`.
+- **Python: `token_validator` and `authz_challenge` now live under `client_attestation_sdk`.** Import
+  `client_attestation_sdk.token_validator` and `client_attestation_sdk.authz_challenge` instead. The old
+  top-level names were generic enough to collide with other packages in the same environment.
+- **Java publishes to Maven Central** from this release, at the same coordinates
+  (`global.idpartners:client-attestation-sdk`) and signed with GPG, so installing it no longer needs the
+  GitHub Packages repository or a token. GitHub Packages gets this release as well, and is then dropped.
+- **TypeScript: `SigningKeyPair.generate` makes a non-extractable private key.** Nothing in the SDK needs
+  to export it, so it can no longer leak through `exportJWK`. Pass `{ extractable: true }` if you persist
+  the key yourself.
+- **`HttpSvidSource` is documented as development-only** in all four ports. It has no caller
+  authentication, so anyone who can reach its URL can get the workload's SVID.
+
+### Deprecated
+
+- **Python: the top-level `token_validator` and `authz_challenge` packages.** They are now thin aliases
+  that re-export the new modules (submodule imports such as `from token_validator.jwks import ...` still
+  work) and raise a `DeprecationWarning`. They will be removed in 0.4.0.
+
+### Fixed
+
+- **Python: PyJWT 2.10 or later** (it was 2.8). Before 2.10, PyJWT's `to_jwk` sometimes dropped a leading
+  zero byte from an EC `x` or `y`, so about one generated key in 170 had a public JWK that RFC 7518
+  §6.2.1.2 says is invalid. That JWK also changed the key's RFC 7638 thumbprint (`kid`), and a strict
+  verifier would refuse it.
+- **TypeScript: the package loads on edge runtimes** (Cloudflare Workers, Vercel Edge, Deno Deploy without
+  Node compatibility). It used to import `node:child_process`, `node:fs` and `node:crypto` at load time and
+  use `Buffer` and `process.env`, so importing anything from it failed there. Crypto, encoding and HTTP now
+  use WebCrypto, `TextEncoder`/`TextDecoder`, `btoa` and `fetch`. The three evidence sources that need Node
+  (`SpireWorkloadApiSvidSource`, `FileTokenSvidSource`, and the file and socket probes in
+  `autoDetectEvidence`) load the built-in on first use, and throw a `ClientAttestationError` naming the
+  source when the runtime has none. The public API is unchanged. A new test bundles the package for a
+  neutral platform with esbuild and runs it with `process`, `Buffer` and `require` removed.
+
 ## [0.2.0] - 2026-10-02
 
 ### Changed

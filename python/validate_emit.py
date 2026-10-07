@@ -2,7 +2,7 @@
 import json
 import os
 
-from token_validator import AccessTokenValidator, ValidatorConfig
+from client_attestation_sdk.token_validator import AccessTokenValidator, ValidatorConfig
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VALIDATION = os.path.normpath(os.path.join(HERE, "..", "validation"))

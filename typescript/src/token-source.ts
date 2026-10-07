@@ -19,14 +19,16 @@
  *     // or build the headers for any other client:
  *     const headers = await ca.requestHeaders("GET", "https://api.example.com/things");
  */
-import { randomUUID } from "node:crypto";
+import { base64url } from "jose";
 
 import { DpopProofBuilder } from "./builders.js";
 import { ClientAttestationCredential, DPOP_HEADER } from "./credential.js";
-import { ClientAttestationError } from "./errors.js";
+import { ClientAttestationError, TransportError } from "./errors.js";
 import { autoDetectEvidence } from "./evidence.js";
 import { INSTANCE_PROOF_TYP } from "./issuance.js";
 import { jsonOk, request, type HttpRequestOptions, type HttpResponse } from "./http.js";
+import { emit, failureReason, hostOf, NOOP_LOGGER, urlParts, type Logger } from "./logging.js";
+import { utf8Decode } from "./runtime.js";
 import { SigningKeyPair, signCompact } from "./signing-key-pair.js";
 import type { SvidSource } from "./svid-source.js";
 
@@ -101,6 +103,12 @@ export interface ClientAttestationOptions {
    * `false`). Loopback hosts (`localhost`, `127.0.0.1`, `::1`) are always allowed.
    */
   allowInsecure?: boolean;
+  /**
+   * Where to send log events (see docs/logging.md). Any object with `debug`, `info`, `warn` and
+   * `error(msg, attrs)` works, `console` included. Unset, nothing is logged. Tokens, proofs,
+   * attestations, SVIDs and key material are never logged.
+   */
+  logger?: Logger;
 }
 
 /** A minted token with everything needed to present it: its scheme and, for DPoP, the bound key. */
@@ -140,6 +148,7 @@ export class ClientAttestation {
   readonly #popMethod: "attestation_pop_jwt" | "dpop_combined";
   readonly #requireChallenge: boolean;
   readonly #allowInsecure: boolean;
+  readonly #logger: Logger;
 
   /** The token, its type and its bound key: always replaced together, never one without the others. */
   #state: TokenState | null = null;
@@ -160,6 +169,7 @@ export class ClientAttestation {
     this.#popMethod = opts.popMethod ?? "attestation_pop_jwt";
     this.#requireChallenge = opts.requireChallenge ?? true;
     this.#allowInsecure = opts.allowInsecure ?? false;
+    this.#logger = opts.logger ?? NOOP_LOGGER;
     this.#checkSecure(this.baseUrl, "pfHost");
   }
 
@@ -228,6 +238,7 @@ export class ClientAttestation {
     const nonce = first.headers.get(DPOP_NONCE_HEADER);
     if (nonce) this.#nonces.set(originOf(url), nonce);
     if (!nonce || !replayable(init.body) || !(await isNonceChallenge(first))) return first;
+    emit(this.#logger, "info", "dpop.nonce_retry", { host: hostOf(url), status: first.status, at: "resource" });
     await first.body?.cancel().catch(() => undefined);
     return send();
   }
@@ -235,7 +246,10 @@ export class ClientAttestation {
   /** The attester's `/.well-known/client-attester` document (fetched once, then cached). */
   async discovery(): Promise<AttesterDiscovery> {
     if (this.#discovery === null) {
-      this.#discovery = await this.#getJson<AttesterDiscovery>("GET", this.baseUrl + WELL_KNOWN_PATH);
+      this.#discovery = await this.#getJson<AttesterDiscovery>("discover", "GET", this.baseUrl + WELL_KNOWN_PATH);
+      emit(this.#logger, "debug", "discovery.fetched", { host: hostOf(this.baseUrl) });
+    } else {
+      emit(this.#logger, "debug", "discovery.cached", { host: hostOf(this.baseUrl) });
     }
     return this.#discovery;
   }
@@ -245,9 +259,15 @@ export class ClientAttestation {
   async #current(opts: { forceRefresh?: boolean }): Promise<TokenState> {
     const state = this.#state;
     if (!opts.forceRefresh && state && Date.now() < state.expiresAt) {
+      emit(this.#logger, "debug", "token.cache_hit", {
+        expires_in: Math.max(0, Math.round((state.expiresAt - Date.now()) / 1000)),
+      });
       return state;
     }
     if (!this.#refreshing) {
+      emit(this.#logger, "debug", "token.refreshing", {
+        reason: opts.forceRefresh ? "forced" : state ? "expired" : "initial",
+      });
       this.#refreshing = this.#refresh().finally(() => {
         this.#refreshing = null;
       });
@@ -277,6 +297,7 @@ export class ClientAttestation {
 
     const evidenceSource = this.#evidence ?? (await autoDetectEvidence());
     const svid = await evidenceSource.fetch(audience);
+    emit(this.#logger, "debug", "evidence.obtained", { source: evidenceSource.constructor?.name });
 
     const instanceKey = await SigningKeyPair.generate(this.#algorithm);
     const challenge = await this.#fetchChallenge(doc);
@@ -287,6 +308,11 @@ export class ClientAttestation {
     const tokenEndpoint = doc.token_endpoint || this.baseUrl + "/as/token.oauth2";
     this.#checkSecure(tokenEndpoint, "token_endpoint");
     const clientId = jwtSub(attestation);
+    emit(this.#logger, "debug", "attestation.minted", {
+      host: hostOf(doc.attestation_endpoint as string),
+      client_id: clientId,
+      alg: this.#algorithm,
+    });
     // The PoP audience must be PF's configured issuer, which the attester advertises as pop_audience.
     // Falling back to the token endpoint URL only works when the dialed URL matches PF's issuer (no
     // proxy in between) — so prefer the advertised value.
@@ -297,9 +323,20 @@ export class ClientAttestation {
     const tokenChallenge = this.#challengeAtToken ? challenge : undefined;
 
     const credential = new ClientAttestationCredential(attestation, instanceKey);
+    const obtained = (response: TokenResponse) => {
+      const expiresIn = Number(response.expires_in);
+      emit(this.#logger, "info", "token.obtained", {
+        host: hostOf(tokenEndpoint),
+        client_id: clientId,
+        token_type: typeof response.token_type === "string" && response.token_type ? response.token_type : "Bearer",
+        expires_in: response.expires_in != null && Number.isFinite(expiresIn) ? expiresIn : undefined,
+        pop_method: this.#popMethod,
+      });
+      return { response, key: instanceKey };
+    };
     if (this.#popMethod !== "dpop_combined") {
       const headers = await credential.popHeaders(clientId, popAudience, tokenChallenge ?? null);
-      return { response: await this.#callTokenEndpoint(tokenEndpoint, headers), key: instanceKey };
+      return obtained(this.#tokenResponse(tokenEndpoint, await this.#postToken(tokenEndpoint, headers)));
     }
 
     // DPoP combined: the attester challenge rides as the DPoP nonce. If the AS demands its own nonce
@@ -308,9 +345,10 @@ export class ClientAttestation {
     const serverNonce = res.headers.get(DPOP_NONCE_HEADER);
     if (serverNonce) this.#nonces.set(originOf(tokenEndpoint), serverNonce);
     if (res.status === 400 && serverNonce && jsonError(res.body) === USE_DPOP_NONCE) {
+      emit(this.#logger, "info", "dpop.nonce_retry", { host: hostOf(tokenEndpoint), status: res.status, at: "token_endpoint" });
       res = await this.#postToken(tokenEndpoint, await credential.dpopHeaders("POST", tokenEndpoint, serverNonce));
     }
-    return { response: tokenResponse(res), key: instanceKey };
+    return obtained(this.#tokenResponse(tokenEndpoint, res));
   }
 
   async #fetchChallenge(doc: AttesterDiscovery): Promise<string | undefined> {
@@ -321,10 +359,13 @@ export class ClientAttestation {
     // closed unless the caller opted out with requireChallenge: false.
     let body: { attestation_challenge?: unknown };
     try {
-      body = await this.#getJson<{ attestation_challenge?: unknown }>("POST", endpoint);
+      body = await this.#getJson<{ attestation_challenge?: unknown }>("challenge", "POST", endpoint);
     } catch (err) {
       if (!(err instanceof ClientAttestationError)) throw err;
-      if (!this.#requireChallenge) return undefined;
+      if (!this.#requireChallenge) {
+        emit(this.#logger, "warn", "challenge.skipped", { host: hostOf(endpoint) });
+        return undefined;
+      }
       throw new ClientAttestationError(`could not fetch the attestation challenge from ${endpoint}: ${err.message}`, {
         status: err.status,
         body: err.body,
@@ -332,8 +373,14 @@ export class ClientAttestation {
       });
     }
     const challenge = body.attestation_challenge;
-    if (typeof challenge === "string" && challenge) return challenge;
-    if (!this.#requireChallenge) return undefined;
+    if (typeof challenge === "string" && challenge) {
+      emit(this.#logger, "debug", "challenge.fetched", { host: hostOf(endpoint) });
+      return challenge;
+    }
+    if (!this.#requireChallenge) {
+      emit(this.#logger, "warn", "challenge.skipped", { host: hostOf(endpoint) });
+      return undefined;
+    }
     throw new ClientAttestationError(`challenge endpoint ${endpoint} returned no attestation_challenge`);
   }
 
@@ -350,7 +397,7 @@ export class ClientAttestation {
     const now = Math.floor(Date.now() / 1000);
     const proofClaims: Record<string, unknown> = {
       aud: doc.evidence_audience,
-      jti: randomUUID(),
+      jti: crypto.randomUUID(),
       iat: now,
     };
     if (challenge) proofClaims.challenge = challenge;
@@ -366,6 +413,7 @@ export class ClientAttestation {
     if (this.#operator) body.operator = this.#operator;
 
     const response = await this.#getJson<{ attestation?: string }>(
+      "mint",
       "POST",
       doc.attestation_endpoint,
       body,
@@ -378,8 +426,19 @@ export class ClientAttestation {
     return response.attestation;
   }
 
-  async #callTokenEndpoint(endpoint: string, authHeaders: Record<string, string>): Promise<TokenResponse> {
-    return tokenResponse(await this.#postToken(endpoint, authHeaders));
+  /** The parsed token response; a failure is logged as `http.failed` before it is thrown. */
+  #tokenResponse(endpoint: string, res: HttpResponse): TokenResponse {
+    try {
+      return tokenResponse(res);
+    } catch (err) {
+      const reason = err instanceof TransportError ? failureReason(err) : res.ok ? "malformed" : "status";
+      this.#failed("token", "POST", endpoint, reason, res.status);
+      throw err;
+    }
+  }
+
+  #failed(step: string, method: string, url: string, reason: string, status?: number): void {
+    emit(this.#logger, "warn", "http.failed", { step, method, ...urlParts(url), status, reason });
   }
 
   #postToken(endpoint: string, authHeaders: Record<string, string>): Promise<HttpResponse> {
@@ -388,7 +447,7 @@ export class ClientAttestation {
     // this repeats the operator on the wire for an AS that maps it into may_act.
     if (this.#operator) params.set("operator", canonicalJson(this.#operator));
     const form = params.toString();
-    return this.#send(endpoint, {
+    return this.#send("token", endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -414,19 +473,34 @@ export class ClientAttestation {
     );
   }
 
-  async #getJson<T>(method: string, url: string, jsonBody?: Record<string, unknown>): Promise<T> {
+  async #getJson<T>(step: string, method: string, url: string, jsonBody?: Record<string, unknown>): Promise<T> {
     const headers: Record<string, string> = { Accept: "application/json" };
     let body: string | undefined;
     if (jsonBody !== undefined) {
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(jsonBody);
     }
-    return jsonOk<T>(await this.#send(url, { method, headers, body }), { allowEmpty: true });
+    const res = await this.#send(step, url, { method, headers, body });
+    try {
+      return jsonOk<T>(res, { allowEmpty: true });
+    } catch (err) {
+      this.#failed(step, method, url, failureReason(err), res.status);
+      throw err;
+    }
   }
 
-  /** Every call the flow makes goes through the shared transport, with this client's timeout. */
-  #send(url: string, opts: HttpRequestOptions): Promise<HttpResponse> {
-    return request(url, { ...opts, timeoutMs: this.#timeoutMs });
+  /**
+   * Every call the flow makes goes through the shared transport, with this client's timeout. A call that
+   * gets no usable response is logged as `http.failed`.
+   */
+  async #send(step: string, url: string, opts: HttpRequestOptions): Promise<HttpResponse> {
+    try {
+      return await request(url, { ...opts, timeoutMs: this.#timeoutMs });
+    } catch (err) {
+      const status = err instanceof ClientAttestationError ? err.status : undefined;
+      this.#failed(step, opts.method ?? "GET", url, failureReason(err), status);
+      throw err;
+    }
   }
 }
 
@@ -529,7 +603,7 @@ export function jwtSub(compactJwt: string): string {
   const payload = compactJwt.split(".")[1] ?? "";
   let claims: { sub?: string } | null;
   try {
-    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: string } | null;
+    claims = JSON.parse(utf8Decode(base64url.decode(payload))) as { sub?: string } | null;
   } catch {
     throw new ClientAttestationError("minted attestation is not a well-formed JWT");
   }

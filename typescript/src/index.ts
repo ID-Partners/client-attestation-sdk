@@ -52,8 +52,10 @@ export {
 } from "./token-source.js";
 export type { ClientAttestationOptions } from "./token-source.js";
 export type { TransportFailure } from "./errors.js";
+export { NOOP_LOGGER } from "./logging.js";
+export type { Logger, LogAttributes, LogLevel } from "./logging.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 /** draft-ietf-oauth-attestation-based-client-auth revision this SDK implements. */
 export const DRAFT_REVISION = "10";

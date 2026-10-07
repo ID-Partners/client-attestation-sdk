@@ -8,6 +8,7 @@
  */
 import { compactVerify, decodeProtectedHeader } from "jose";
 
+import { base64Encode, utf8Encode } from "../runtime.js";
 import * as errors from "./errors.js";
 import {
   normaliseType,
@@ -16,7 +17,9 @@ import {
   type ResolvedConfig,
   type ValidatorConfig,
 } from "./config.js";
+import { TransportError } from "../errors.js";
 import { jsonOk, request } from "../http.js";
+import { emit, failureReason, NOOP_LOGGER, urlParts, type Logger } from "../logging.js";
 import { JwksProvider, type HttpGet } from "./jwks.js";
 import { failure, success, type ValidationResult } from "./result.js";
 
@@ -36,13 +39,18 @@ export type HttpPost = (
 export interface ValidatorOptions {
   httpPost?: HttpPost;
   httpGet?: HttpGet;
+  /**
+   * Where to send log events (`token.validated`, `jwks.*`, `http.failed`; see docs/logging.md). Unset,
+   * nothing is logged. Tokens and client secrets are never logged.
+   */
+  logger?: Logger;
 }
 
 const defaultPost: HttpPost = async (url, body, headers) => {
   // the shared transport never follows a redirect: it would carry the resource server's credentials
   const resp = await request(url, { method: "POST", body, headers, timeoutMs: 10_000 });
   if (!resp.ok) {
-    throw new Error(`introspection failed: ${resp.status}`);
+    throw new TransportError(`introspection failed: ${resp.status}`, "status", { status: resp.status });
   }
   return jsonOk<Claims>(resp);
 };
@@ -52,6 +60,7 @@ export class AccessTokenValidator {
   readonly config: ResolvedConfig;
   readonly #jwks: JwksProvider;
   readonly #httpPost: HttpPost;
+  readonly #logger: Logger;
 
   constructor(config: ValidatorConfig, opts: ValidatorOptions = {}) {
     this.config = resolveConfig(config);
@@ -59,8 +68,10 @@ export class AccessTokenValidator {
       jwks: this.config.jwks,
       jwksUri: this.config.jwksUri,
       httpGet: opts.httpGet,
+      logger: opts.logger,
     });
     this.#httpPost = opts.httpPost ?? defaultPost;
+    this.#logger = opts.logger ?? NOOP_LOGGER;
   }
 
   /**
@@ -68,6 +79,16 @@ export class AccessTokenValidator {
    * success result exposing subject / scopes / audience / claims.
    */
   async validate(token: string, requiredScopes?: string[]): Promise<ValidationResult> {
+    return this.#verdict("jwt", await this.#validate(token, requiredScopes));
+  }
+
+  /** Log a verdict (its error code only, never the token) and return it. */
+  #verdict(mode: "jwt" | "introspection", result: ValidationResult): ValidationResult {
+    emit(this.#logger, result.valid ? "debug" : "info", "token.validated", { result: result.valid ? "valid" : result.error, mode });
+    return result;
+  }
+
+  async #validate(token: string, requiredScopes?: string[]): Promise<ValidationResult> {
     const required = requiredScopes ?? this.config.requiredScopes;
 
     let header: { alg?: string; kid?: string; typ?: string };
@@ -170,13 +191,28 @@ export class AccessTokenValidator {
       form.set("client_id", cfg.clientId);
       form.set("client_secret", cfg.clientSecret);
     }
-    return this.#httpPost(cfg.endpoint, form.toString(), headers);
+    try {
+      return await this.#httpPost(cfg.endpoint, form.toString(), headers);
+    } catch (err) {
+      emit(this.#logger, "warn", "http.failed", {
+        step: "introspection",
+        method: "POST",
+        ...urlParts(cfg.endpoint),
+        status: err instanceof TransportError ? err.status : undefined,
+        reason: failureReason(err),
+      });
+      throw err;
+    }
   }
 
   /**
    * Introspect the token and enforce `active` plus scope/audience from the response.
    */
   async validateActive(token: string, requiredScopes?: string[]): Promise<ValidationResult> {
+    return this.#verdict("introspection", await this.#validateActive(token, requiredScopes));
+  }
+
+  async #validateActive(token: string, requiredScopes?: string[]): Promise<ValidationResult> {
     const data = await this.introspect(token);
     if (!data.active) {
       return failure(errors.INACTIVE, "token is not active");
@@ -233,7 +269,7 @@ function scopesOf(claims: Claims): string[] {
 }
 
 function base64(value: string): string {
-  return Buffer.from(value, "utf8").toString("base64");
+  return base64Encode(utf8Encode(value));
 }
 
 function errMessage(exc: unknown): string {

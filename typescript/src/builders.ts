@@ -1,10 +1,10 @@
 /**
  * Builders for the attestation, PoP and DPoP JWTs (draft-ietf-oauth-attestation-based-client-auth).
  */
-import { createHash, randomUUID } from "node:crypto";
-import type { JWK } from "jose";
+import { base64url, type JWK } from "jose";
 
 import { SigningKeyPair, requireText, signCompact } from "./signing-key-pair.js";
+import { utf8Encode } from "./runtime.js";
 import { type JwsSigner, signExternal } from "./signer.js";
 
 export const ATTESTATION_TYP = "oauth-client-attestation+jwt";
@@ -197,7 +197,7 @@ export class PopBuilder {
     }
     const claims: Record<string, unknown> = {
       aud: this.#audience,
-      jti: this.#jwtId ?? randomUUID(),
+      jti: this.#jwtId ?? crypto.randomUUID(),
       iat: this.#issuedAt !== null ? this.#issuedAt : nowSeconds(),
     };
     if (this.#clientId) {
@@ -219,7 +219,7 @@ export class DpopProofBuilder {
   #htm = "POST";
   #htu: string | null = null;
   #nonce: string | null = null;
-  #ath: string | null = null;
+  #accessToken: string | null = null;
   #jwtId: string | null = null;
   #issuedAt: number | null = null;
 
@@ -255,7 +255,7 @@ export class DpopProofBuilder {
    * Leave unset for a proof sent to the token endpoint.
    */
   accessToken(accessToken: string | null): this {
-    this.#ath = accessToken ? accessTokenHash(accessToken) : null;
+    this.#accessToken = accessToken || null;
     return this;
   }
 
@@ -276,22 +276,23 @@ export class DpopProofBuilder {
     const claims: Record<string, unknown> = {
       htm: this.#htm.toUpperCase(),
       htu: normalizeHtu(this.#htu),
-      jti: this.#jwtId ?? randomUUID(),
+      jti: this.#jwtId ?? crypto.randomUUID(),
       iat: this.#issuedAt !== null ? this.#issuedAt : nowSeconds(),
     };
     if (this.#nonce) {
       claims.nonce = this.#nonce;
     }
-    if (this.#ath) {
-      claims.ath = this.#ath;
+    if (this.#accessToken) {
+      claims.ath = await accessTokenHash(this.#accessToken);
     }
     return signCompact(claims, this.#instanceKey, DPOP_TYP, true);
   }
 }
 
 /** RFC 9449 `ath`: base64url(SHA-256(ASCII access token)). */
-export function accessTokenHash(accessToken: string): string {
-  return createHash("sha256").update(accessToken, "ascii").digest("base64url");
+export async function accessTokenHash(accessToken: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", utf8Encode(accessToken));
+  return base64url.encode(new Uint8Array(digest));
 }
 
 /**

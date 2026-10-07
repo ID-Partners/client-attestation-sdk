@@ -8,8 +8,8 @@ import jwt
 import pytest
 
 from client_attestation_sdk import SigningKeyPair
-from token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig, errors
-from token_validator.resource import _quote
+from client_attestation_sdk.token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig, errors
+from client_attestation_sdk.token_validator.resource import _quote
 
 ISSUER = "https://issuer.example.com"
 AUDIENCE = "https://api.example.com"

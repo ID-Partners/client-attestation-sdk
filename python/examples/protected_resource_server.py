@@ -14,7 +14,7 @@ then:
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig
+from client_attestation_sdk.token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig
 
 RESOURCE = "http://localhost:8770"          # this server's canonical URI (RFC 8707) — the token audience
 ISSUER = "https://issuer.example.com"       # the authorization server clients get a token from

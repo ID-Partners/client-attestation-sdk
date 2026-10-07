@@ -6,8 +6,6 @@
  * (PingFederate) validates it and **mints** a Client Attestation bound to the workload's own instance
  * key — bootstrapping a client credential from infra identity, no pre-shared secret.
  */
-import { randomUUID } from "node:crypto";
-
 import { DpopProofBuilder, PopBuilder } from "./builders.js";
 import { jsonOk, request } from "./http.js";
 import { SigningKeyPair, signCompact } from "./signing-key-pair.js";
@@ -88,7 +86,7 @@ export class AttestationIssuanceClient {
 
     const proofClaims: Record<string, unknown> = {
       aud: this.attesterIssuer,
-      jti: randomUUID(),
+      jti: crypto.randomUUID(),
       iat: Math.floor(Date.now() / 1000),
     };
     if (challenge) proofClaims.challenge = challenge;

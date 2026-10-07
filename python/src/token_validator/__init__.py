@@ -1,22 +1,24 @@
-"""Resource-server access-token validation: JWT signature + scope/audience checks, optional RFC 7662
-introspection, AS-metadata discovery, and JWKS caching."""
-from . import errors
-from .config import DEFAULT_ALGORITHMS, IntrospectionConfig, ValidatorConfig
-from .discovery import discover
-from .resource import AuthDecision, ProtectedResource, bearer_token
-from .result import ValidationResult
-from .validator import AccessTokenValidator
+"""Deprecated alias for :mod:`client_attestation_sdk.token_validator`. Removed in 0.4.0.
 
-__all__ = [
-    "AccessTokenValidator",
-    "ValidatorConfig",
-    "IntrospectionConfig",
-    "ValidationResult",
-    "DEFAULT_ALGORITHMS",
-    "discover",
-    "ProtectedResource",
-    "AuthDecision",
-    "bearer_token",
-    "errors",
-]
-__version__ = "0.2.0"
+Importing this package warns once and re-exports the new package's public API. Submodule imports
+(``from token_validator.jwks import JwksProvider``) resolve to the same module objects.
+"""
+import sys as _sys
+import warnings as _warnings
+
+from client_attestation_sdk import token_validator as _new
+from client_attestation_sdk.token_validator import *  # noqa: F401,F403
+from client_attestation_sdk.token_validator import (  # noqa: F401
+    __all__, __version__, config, discovery, errors, jwks, resource, result, validator,
+)
+
+_warnings.warn(
+    "the top-level 'token_validator' package is deprecated; import from "
+    "'client_attestation_sdk.token_validator' instead. The 'token_validator' alias will be removed in 0.4.0.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+for _name in ("config", "discovery", "errors", "jwks", "resource", "result", "validator"):
+    _sys.modules[f"{__name__}.{_name}"] = getattr(_new, _name)
+del _name

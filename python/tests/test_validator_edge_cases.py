@@ -8,7 +8,7 @@ import jwt
 import pytest
 
 from client_attestation_sdk import SigningKeyPair
-from token_validator import (
+from client_attestation_sdk.token_validator import (
     AccessTokenValidator,
     IntrospectionConfig,
     ValidationResult,
@@ -207,7 +207,7 @@ def test_jwk_declared_alg_binds_the_key():
 
 
 def test_protected_resource_refuses_a_validator_for_another_audience():
-    from token_validator import ProtectedResource
+    from client_attestation_sdk.token_validator import ProtectedResource
 
     validator = AccessTokenValidator(_config())
     with pytest.raises(ValueError):

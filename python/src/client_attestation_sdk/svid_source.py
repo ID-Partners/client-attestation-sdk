@@ -31,7 +31,12 @@ class StaticSvidSource:
 
 
 class HttpSvidSource:
-    """GET a URL returning ``{"svid": "<jwt>"}`` — e.g. the demo harness ``/dev/svid`` endpoint."""
+    """GET a URL returning ``{"svid": "<jwt>"}`` — e.g. the demo harness ``/dev/svid`` endpoint.
+
+    For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
+    authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
+    file or cloud source.
+    """
 
     def __init__(self, url: str):
         self._url = url

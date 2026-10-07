@@ -9,7 +9,7 @@ missing the feature, not quietly left behind.
 
 ## Running everything
 
-You need Go 1.23+, Python 3.10+, Node 20+, a JDK 17+ and Maven.
+You need Go 1.25+, Python 3.11+, Node 20+, a JDK 17+ and Maven.
 
 ```bash
 (cd go && go vet ./... && go test -race -cover ./...)
@@ -43,8 +43,8 @@ comes back in the next release. The pull request is closed with a link to that r
 1. `python3 scripts/version.py set X.Y.Z` (writes `VERSION` and every copy; CI checks they agree).
 2. Move `[Unreleased]` in `CHANGELOG.md` to that version and date it.
 3. Run `./verify-interop.sh`.
-4. In the source repo, merge and push the tag `vX.Y.Z` on `main`. That publishes the tree here as one
-   commit tagged `vX.Y.Z`.
+4. In the source repo, merge, tag `vX.Y.Z` on `main` and run the publish workflow for that tag. That
+   publishes the tree here as one commit tagged `vX.Y.Z`.
 5. Here, publish a GitHub release for that tag. `release.yml` checks the versions, runs CI, waits for
-   approval in the `release` environment, then publishes to PyPI, npm and GitHub Packages and tags
-   `go/vX.Y.Z` for the Go module.
+   approval in the `release` environment, then publishes to PyPI, npm, Maven Central and GitHub
+   Packages and tags `go/vX.Y.Z` for the Go module.

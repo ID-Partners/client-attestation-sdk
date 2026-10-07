@@ -6,7 +6,7 @@
 
     <groupId>global.idpartners</groupId>
     <artifactId>client-attestation-sdk</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
     <packaging>jar</packaging>
 
     <name>client-attestation-sdk</name>
@@ -30,15 +30,22 @@
 
     <developers>
         <developer>
-            <name>David Hyland</name>
+            <name>ID Partners Pty Ltd</name>
             <organization>ID Partners Pty Ltd</organization>
+            <organizationUrl>https://idpartners.global</organizationUrl>
         </developer>
     </developers>
 
     <scm>
         <url>https://github.com/ID-Partners/client-attestation-sdk</url>
         <connection>scm:git:https://github.com/ID-Partners/client-attestation-sdk.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/ID-Partners/client-attestation-sdk.git</developerConnection>
     </scm>
+
+    <issueManagement>
+        <system>GitHub</system>
+        <url>https://github.com/ID-Partners/client-attestation-sdk/issues</url>
+    </issueManagement>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -46,14 +53,14 @@
     </properties>
 
     <dependencies>
-        <dependency><groupId>org.bitbucket.b_c</groupId><artifactId>jose4j</artifactId><version>0.9.6</version></dependency>
-        <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>
+        <dependency><groupId>org.bitbucket.b_c</groupId><artifactId>jose4j</artifactId><version>0.9.7</version></dependency>
+        <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>6.1.3</version><scope>test</scope></dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>
-            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version></plugin>
+            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.16.0</version></plugin>
+            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.6.0</version></plugin>
             <!-- -sources and -javadoc jars, required for Maven Central -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -66,11 +73,12 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-javadoc-plugin</artifactId>
-                <version>3.11.2</version>
+                <version>3.12.0</version>
                 <configuration>
                     <quiet>true</quiet>
+                    <!-- every doclint check except "missing" (an undocumented getter, say) fails the build -->
                     <doclint>all,-missing</doclint>
-                    <failOnWarnings>false</failOnWarnings>
+                    <failOnWarnings>true</failOnWarnings>
                 </configuration>
                 <executions>
                     <execution><id>attach-javadocs</id><goals><goal>jar</goal></goals></execution>
@@ -79,7 +87,7 @@
             <plugin>
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
-                <version>0.8.12</version>
+                <version>0.8.15</version>
                 <executions>
                     <execution><id>prepare-agent</id><goals><goal>prepare-agent</goal></goals></execution>
                     <execution><id>report</id><phase>verify</phase><goals><goal>report</goal></goals></execution>
@@ -107,6 +115,55 @@
 
     <profiles>
         <!--
+          Maven Central release: `mvn -P release deploy`, run by .github/workflows/release.yml. Signs every
+          artifact with GPG and uploads the bundle through the Sonatype Central Portal, which validates it,
+          publishes it and waits until it is live. Needs a `central` server (a Central Portal user token) in
+          settings.xml and a GPG secret key whose passphrase is in MAVEN_GPG_PASSPHRASE. Plain `mvn verify`
+          never touches any of this. `mvn -P release -Dgpg.skip verify` builds everything a release
+          uploads (jar, -sources, -javadoc, pom), unsigned.
+        -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.8</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals><goal>sign</goal></goals>
+                                <configuration>
+                                    <!-- no TTY in CI: gpg takes the passphrase from MAVEN_GPG_PASSPHRASE, never prompts -->
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.11.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <deploymentName>${project.artifactId} ${project.version}</deploymentName>
+                            <!-- publish as soon as validation passes (no manual click in the portal), and
+                                 fail the build unless the release is actually live -->
+                            <autoPublish>true</autoPublish>
+                            <waitUntil>published</waitUntil>
+                            <waitMaxTime>3600</waitMaxTime>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
           Round-trips what the SDK builds against the AS-side verifier (client-attestation), which is not on
           Maven Central. `mvn verify -Pinterop` where that jar is installed locally; plain `mvn verify` from a
           clean clone runs everything else.
@@ -121,7 +178,7 @@
                     <plugin>
                         <groupId>org.codehaus.mojo</groupId>
                         <artifactId>build-helper-maven-plugin</artifactId>
-                        <version>3.6.0</version>
+                        <version>3.6.2</version>
                         <executions>
                             <execution>
                                 <id>add-interop-tests</id>
@@ -136,6 +193,7 @@
         </profile>
     </profiles>
 
+    <!-- GitHub Packages, for a plain `mvn deploy`. The `release` profile deploys to Maven Central instead. -->
     <distributionManagement>
         <repository>
             <id>github</id>

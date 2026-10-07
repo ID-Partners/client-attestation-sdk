@@ -6,10 +6,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
 // DpopNonceHeader is the response header a server uses to hand the client a DPoP nonce (RFC 9449 §8).
@@ -167,6 +170,8 @@ func (rt *authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	if err != nil {
 		return resp, nil
 	}
+	rt.source.log(req.Context(), slog.LevelInfo, "dpop.nonce_retry",
+		"host", sdklog.Host(target), "status", resp.StatusCode, "at", "resource")
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxNonceChallengeBody))
 	_ = resp.Body.Close()
 	applyHeaders(retry, headers)

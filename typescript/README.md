@@ -17,10 +17,26 @@ ports and is judged by a shared Java verifier. Built on [panva `jose`](https://g
 
 ## Install / build
 
-Requires **Node 20+**. The package uses Node built-ins (`node:crypto`, `node:fs`, and
-`node:child_process` for the SPIRE evidence source), so it does not run on edge or browser runtimes.
+Requires **Node 20+**, or an edge runtime with WebCrypto and `fetch` (Cloudflare Workers, Vercel Edge,
+Deno Deploy) with no Node compatibility layer needed. Crypto, encoding and HTTP use web-standard APIs, and
+nothing imports a Node built-in at load time, so the builders, the one-call `ClientAttestation` flow, the
+issuance client and the token validator all work on the edge.
 
-Not on npm yet (it will publish as `@idpartners/client-attestation-sdk`). Build from a clone:
+Evidence gathering is the part that needs Node. Each of these loads the built-in it needs on first use; the
+two sources throw a `ClientAttestationError` naming themselves from `fetch` on a runtime without it:
+
+- `SpireWorkloadApiSvidSource` runs the `spire-agent` CLI (`node:child_process`);
+- `FileTokenSvidSource` reads a projected token file (`node:fs`);
+- `autoDetectEvidence` reads environment variables and probes for token files and the SPIRE socket. On
+  the edge those all read as absent, so it falls through to the GCP metadata server and then throws
+  `EvidenceNotFound`. Pass an explicit `SvidSource` to `ClientAttestation` there: `StaticSvidSource`,
+  your own, or `HttpSvidSource` in development.
+
+```bash
+npm install @idpartners/client-attestation-sdk
+```
+
+To build from a clone:
 
 ```bash
 npm install

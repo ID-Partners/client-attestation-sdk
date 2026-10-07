@@ -1,7 +1,7 @@
 import json
 import os
 
-from token_validator import AccessTokenValidator, IntrospectionConfig, ValidatorConfig, errors
+from client_attestation_sdk.token_validator import AccessTokenValidator, IntrospectionConfig, ValidatorConfig, errors
 
 VALIDATION = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "validation"))
 

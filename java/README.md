@@ -17,15 +17,42 @@ round-trip tested against it.
 
 ## Install
 
-Not on Maven Central yet: install from this repository (`mvn install` in `java/`), then
-
 ```xml
 <dependency>
   <groupId>global.idpartners</groupId>
   <artifactId>client-attestation-sdk</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
+
+The SDK isn't on Maven Central yet; it will be from a coming release, at the same coordinates. Until then
+it's published to GitHub Packages, which needs a GitHub token even to read public packages. Add the
+repository to your `pom.xml`:
+
+```xml
+<repositories>
+  <repository>
+    <id>github-idpartners</id>
+    <url>https://maven.pkg.github.com/ID-Partners/client-attestation-sdk</url>
+  </repository>
+</repositories>
+```
+
+and a matching server to `~/.m2/settings.xml`, with a
+[personal access token (classic)](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-apache-maven-registry#authenticating-to-github-packages)
+that has the `read:packages` scope:
+
+```xml
+<servers>
+  <server>
+    <id>github-idpartners</id>
+    <username>YOUR_GITHUB_USERNAME</username>
+    <password>YOUR_TOKEN</password>
+  </server>
+</servers>
+```
+
+Or build it from this repository with `mvn install` in `java/`.
 
 ## Attester: issue an attestation
 

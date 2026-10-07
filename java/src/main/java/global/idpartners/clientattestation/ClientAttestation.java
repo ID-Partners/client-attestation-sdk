@@ -87,6 +87,7 @@ public final class ClientAttestation {
     private final boolean requireChallenge;
     private final boolean allowInsecure;
     private final HttpClient http;
+    private final SdkLogging log;
 
     private final Object lock = new Object();
     private String cachedToken;
@@ -118,6 +119,7 @@ public final class ClientAttestation {
         this.timeout = b.timeout;
         this.requireChallenge = b.requireChallenge;
         this.allowInsecure = b.allowInsecure;
+        this.log = new SdkLogging(b.logger);
         requireSecure(this.baseUrl, "pf_host", this.allowInsecure);
         this.http = HttpTransport.client(b.timeout);
     }
@@ -219,14 +221,20 @@ public final class ClientAttestation {
         if (!isNonceChallenge(response.statusCode(), response.headers(), bodyText(response.body()))) {
             return response;
         }
+        this.log.info("dpop.nonce_retry", "host", SdkLogging.host(uri.toString()), "status", response.statusCode(),
+                "at", "resource");
         return client.send(authorize(base.copy(), method, uri).build(), handler);
     }
 
     /** The attester's {@code /.well-known/client-attester} document (fetched once, then cached). */
     public Map<String, Object> discovery() throws Exception {
         synchronized (this.lock) {
+            String url = this.baseUrl + WELL_KNOWN_PATH;
             if (this.discovery == null) {
-                this.discovery = getJson("GET", this.baseUrl + WELL_KNOWN_PATH, null);
+                this.discovery = getJson("discover", "GET", url, null);
+                this.log.debug("discovery.fetched", "host", SdkLogging.host(url));
+            } else {
+                this.log.debug("discovery.cached", "host", SdkLogging.host(url));
             }
             return this.discovery;
         }
@@ -246,15 +254,19 @@ public final class ClientAttestation {
     }
 
     /** A token response together with the instance key whose attestation obtained it. */
-    private record Minted(Map<String, Object> response, SigningKeyPair key) {
+    private record Minted(Map<String, Object> response, SigningKeyPair key, String tokenEndpoint,
+            String clientId) {
     }
 
     private TokenState current(boolean forceRefresh) {
         synchronized (this.lock) {
-            if (!forceRefresh && this.cachedToken != null
-                    && System.currentTimeMillis() / 1000L < this.expiresAt) {
+            long nowSeconds = System.currentTimeMillis() / 1000L;
+            if (!forceRefresh && this.cachedToken != null && nowSeconds < this.expiresAt) {
+                this.log.debug("token.cache_hit", "expires_in", this.expiresAt - nowSeconds);
                 return new TokenState(this.cachedToken, this.cachedTokenType, this.cachedKey);
             }
+            this.log.debug("token.refreshing", "reason",
+                    this.cachedToken == null ? "initial" : forceRefresh ? "forced" : "expired");
             Minted minted;
             try {
                 minted = runFlow();
@@ -272,6 +284,10 @@ public final class ClientAttestation {
             this.expiresAt = expiresIn instanceof Number
                     ? System.currentTimeMillis() / 1000L + ((Number) expiresIn).longValue() - this.skewSeconds
                     : 0L;
+            this.log.info("token.obtained", "host", SdkLogging.host(minted.tokenEndpoint()),
+                    "client_id", minted.clientId(), "token_type", this.cachedTokenType,
+                    "expires_in", expiresIn instanceof Number ? ((Number) expiresIn).longValue() : null,
+                    "pop_method", this.popMethod);
             return new TokenState(this.cachedToken, this.cachedTokenType, this.cachedKey);
         }
     }
@@ -287,6 +303,7 @@ public final class ClientAttestation {
 
         SvidSource evidenceSource = this.evidence != null ? this.evidence : Evidence.autoDetect();
         String svid = evidenceSource.fetch(audience);
+        this.log.debug("evidence.obtained", "source", evidenceSource.getClass().getSimpleName());
 
         SigningKeyPair instanceKey = SigningKeyPair.generate(this.algorithm);
         String challenge = fetchChallenge(doc);
@@ -297,6 +314,8 @@ public final class ClientAttestation {
         String tokenEndpoint = optString(doc, "token_endpoint", this.baseUrl + "/as/token.oauth2");
         requireSecure(tokenEndpoint, "token_endpoint", this.allowInsecure);
         String clientId = jwtSub(attestation);
+        this.log.debug("attestation.minted", "host", SdkLogging.host(optString(doc, "attestation_endpoint", "")),
+                "client_id", clientId, "alg", this.algorithm);
         // The PoP audience must be PF's configured issuer, which the attester advertises as pop_audience.
         // Falling back to the token endpoint URL only works when the dialed URL matches PF's issuer.
         String popAudience = optString(doc, "pop_audience", tokenEndpoint);
@@ -318,7 +337,7 @@ public final class ClientAttestation {
             response = callTokenEndpoint(tokenEndpoint, attestation, POP_HEADER, tokenChallenge, nonce -> pop,
                     false);
         }
-        return new Minted(response, instanceKey);
+        return new Minted(response, instanceKey, tokenEndpoint, clientId);
     }
 
     private String fetchChallenge(Map<String, Object> doc) {
@@ -328,15 +347,17 @@ public final class ClientAttestation {
         }
         requireSecure(endpoint, "challenge_endpoint", this.allowInsecure);
         try {
-            Map<String, Object> body = getJson("POST", endpoint, null);
+            Map<String, Object> body = getJson("challenge", "POST", endpoint, null);
             String challenge = optString(body, "attestation_challenge", null);
             if (challenge == null) {
                 throw new ClientAttestationException("challenge endpoint returned no attestation_challenge", 200,
                         JsonUtil.toJson(body));
             }
+            this.log.debug("challenge.fetched", "host", SdkLogging.host(endpoint));
             return challenge;
         } catch (Exception e) {
             if (!this.requireChallenge) {
+                this.log.warn("challenge.skipped", "host", SdkLogging.host(endpoint));
                 return null;  // opted out: proceed without a challenge, as before
             }
             int status = e instanceof ClientAttestationException ? ((ClientAttestationException) e).status() : 0;
@@ -380,7 +401,7 @@ public final class ClientAttestation {
             throw new ClientAttestationException("attester discovery document has no attestation_endpoint");
         }
         requireSecure(attestationEndpoint, "attestation_endpoint", this.allowInsecure);
-        Map<String, Object> response = getJson("POST", attestationEndpoint, body);
+        Map<String, Object> response = getJson("mint", "POST", attestationEndpoint, body);
         Object attestation = response.get("attestation");
         if (attestation == null) {
             throw new ClientAttestationException("attester response contained no attestation",
@@ -397,14 +418,17 @@ public final class ClientAttestation {
     private Map<String, Object> callTokenEndpoint(String endpoint, String attestation, String proofHeaderName,
             String nonce, UnaryOperator<String> proofForNonce, boolean dpop) {
         String form = tokenForm(this.operator);
-        HttpTransport.Response resp = send(tokenRequest(endpoint, attestation, proofHeaderName,
-                proofForNonce.apply(nonce), form));
+        HttpTransport.Response resp = send("token", "POST", endpoint, tokenRequest(endpoint, attestation,
+                proofHeaderName, proofForNonce.apply(nonce), form));
         if (dpop && isNonceChallenge(resp.status(), resp.headers(), resp.body())) {
             String serverNonce = resp.headers().firstValue(DPOP_NONCE_HEADER).orElseThrow();
-            resp = send(tokenRequest(endpoint, attestation, proofHeaderName, proofForNonce.apply(serverNonce),
+            this.log.info("dpop.nonce_retry", "host", SdkLogging.host(endpoint), "status", resp.status(),
+                    "at", "token_endpoint");
+            resp = send("token", "POST", endpoint, tokenRequest(endpoint, attestation, proofHeaderName, proofForNonce.apply(serverNonce),
                     form));
         }
         if (!resp.ok()) {
+            httpFailed("token", "POST", endpoint, resp.status(), "status");
             // Full error body kept on the exception: callers read the OAuth error JSON from body().
             throw new ClientAttestationException("token endpoint returned HTTP " + resp.status(),
                     resp.status(), resp.body());
@@ -413,6 +437,7 @@ public final class ClientAttestation {
         try {
             parsed = HttpTransport.jsonOk(resp);
         } catch (TransportException e) {
+            httpFailed("token", "POST", endpoint, resp.status(), "malformed");
             throw new ClientAttestationException("token endpoint returned an unparseable response",
                     resp.status(), resp.body(), e);
         }
@@ -482,7 +507,7 @@ public final class ClientAttestation {
                 .POST(HttpRequest.BodyPublishers.ofString(form));
     }
 
-    private Map<String, Object> getJson(String method, String url, Map<String, Object> jsonBody)
+    private Map<String, Object> getJson(String step, String method, String url, Map<String, Object> jsonBody)
             throws Exception {
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
                 .header("Accept", "application/json");
@@ -492,8 +517,9 @@ public final class ClientAttestation {
         } else {
             builder.method(method, HttpRequest.BodyPublishers.noBody());
         }
-        HttpTransport.Response resp = send(builder);
+        HttpTransport.Response resp = send(step, method, url, builder);
         if (!resp.ok()) {
+            httpFailed(step, method, url, resp.status(), "status");
             throw new ClientAttestationException(method + " " + url + " returned HTTP " + resp.status(),
                     resp.status(), resp.body());
         }
@@ -503,18 +529,41 @@ public final class ClientAttestation {
         try {
             return HttpTransport.jsonOk(resp);
         } catch (TransportException e) {
+            httpFailed(step, method, url, resp.status(), "malformed");
             throw new ClientAttestationException(method + " " + url + " returned an unparseable response",
                     resp.status(), resp.body(), e);
         }
     }
 
     /** The shared transport, with transport failures surfaced as {@link ClientAttestationException}. */
-    private HttpTransport.Response send(HttpRequest.Builder request) {
+    private HttpTransport.Response send(String step, String method, String url, HttpRequest.Builder request) {
         try {
             return HttpTransport.send(this.http, request, this.timeout);
         } catch (TransportException e) {
+            httpFailed(step, method, url, e.status(), failureReason(e));
             throw new ClientAttestationException(e.getMessage(), e.status(), e.body(), e);
         }
+    }
+
+    private void httpFailed(String step, String method, String url, int status, String reason) {
+        this.log.warn("http.failed", "step", step, "method", method, "host", SdkLogging.host(url),
+                "path", SdkLogging.path(url), "status", status > 0 ? status : null, "reason", reason);
+    }
+
+    /** The {@code reason} attribute for a transport failure (see docs/logging.md). */
+    static String failureReason(TransportException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof java.util.concurrent.TimeoutException
+                || cause instanceof java.net.http.HttpTimeoutException) {
+            return "timeout";
+        }
+        if (e.status() >= 300 && e.status() < 400) {
+            return "redirect";
+        }
+        if (String.valueOf(e.getMessage()).contains("response body exceeds")) {
+            return "too_large";
+        }
+        return "network";
     }
 
     // ── DPoP nonce handling ─────────────────────────────────────────────────────────────────────────
@@ -682,6 +731,7 @@ public final class ClientAttestation {
         private Duration timeout = Duration.ofSeconds(20);
         private boolean requireChallenge = true;
         private boolean allowInsecure;
+        private System.Logger logger;
 
         public Builder(String pfHost) {
             this.pfHost = pfHost;
@@ -768,6 +818,18 @@ public final class ClientAttestation {
          */
         public Builder allowInsecure(boolean allowInsecure) {
             this.allowInsecure = allowInsecure;
+            return this;
+        }
+
+        /**
+         * Where the SDK logs what it does (discovery, minting, the token endpoint, DPoP nonce retries, HTTP
+         * failures). Default: nothing is logged. Pass {@code System.getLogger(SdkLogging.LOGGER_NAME)} to
+         * route through {@code java.util.logging} or whatever {@link System.LoggerFinder} is installed.
+         * Tokens, attestations, proofs, SVIDs and key material are never logged. Events and attributes are
+         * listed in docs/logging.md.
+         */
+        public Builder logger(System.Logger logger) {
+            this.logger = logger;
             return this;
         }
 

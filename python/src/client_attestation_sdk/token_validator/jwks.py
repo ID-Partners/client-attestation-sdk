@@ -7,16 +7,19 @@ made-up ``kid`` values turns every request into a request to the issuer."""
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 
 import jwt
 
-from client_attestation_sdk import _http
+from client_attestation_sdk import _http, _log
 
 MAX_JWKS_BYTES = 512 * 1024
 DEFAULT_MIN_REFRESH_SECONDS = 30
 DEFAULT_MAX_AGE_SECONDS = 3600
+
+_logger = _log.get("validator")
 
 
 class JwksFetchError(Exception):
@@ -106,6 +109,7 @@ class JwksProvider:
             with self._lock:
                 now = self._clock()
                 if self._last_attempt is not None and now - self._last_attempt < self._min_refresh:
+                    _log.emit(_logger, logging.DEBUG, "jwks.refetch_throttled", host=_log.host(self._jwks_uri))
                     return
                 self._last_attempt = now
             try:
@@ -115,8 +119,13 @@ class JwksProvider:
                 keys = self._parse(json.loads(body))
             except Exception as exc:  # keep serving the keys already held
                 self.last_error = f"JWKS fetch failed: {exc}"
+                reason = "malformed" if isinstance(exc, (ValueError, AttributeError)) and \
+                    "larger than" not in str(exc) else _log.failure_reason(exc)
+                _log.emit(_logger, logging.WARNING, "jwks.fetch_failed", host=_log.host(self._jwks_uri),
+                          reason=reason, status=getattr(exc, "status", None))
                 return
             with self._lock:
                 self._keys = keys
                 self._loaded_at = self._clock()
                 self.last_error = None
+            _log.emit(_logger, logging.DEBUG, "jwks.fetched", host=_log.host(self._jwks_uri), keys=len(keys))

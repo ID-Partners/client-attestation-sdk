@@ -13,11 +13,9 @@
  * can write `new ClientAttestation(pfHost)` and have it work without naming the source. Override by
  * passing an explicit {@link SvidSource} to {@link ClientAttestation}.
  */
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-
 import { TransportError } from "./errors.js";
 import { request, snippet } from "./http.js";
+import { envVar, importNodeBuiltin } from "./runtime.js";
 import { SpireWorkloadApiSvidSource, StaticSvidSource, type SvidSource } from "./svid-source.js";
 
 /** Environment variable holding the evidence token itself (static). */
@@ -51,11 +49,18 @@ export class EvidenceNotFound extends Error {
  * Kubernetes and GKE mount a short-lived, auto-rotated service-account token into the pod as a file
  * (a projected `serviceAccountToken` volume). Reading it fresh each time picks up the rotation. The
  * file's audience must already be the attester's evidence audience — set it when you declare the volume.
+ *
+ * Needs a filesystem: `node:fs/promises` is loaded on the first `fetch`, which throws a
+ * `ClientAttestationError` on a runtime without it.
  */
 export class FileTokenSvidSource implements SvidSource {
   constructor(private readonly path: string) {}
 
   async fetch(_audience: string): Promise<string> {
+    const { readFile } = await importNodeBuiltin<typeof import("node:fs/promises")>(
+      "fs/promises",
+      "FileTokenSvidSource",
+    );
     const contents = await readFile(this.path, "utf8");
     return contents.trim();
   }
@@ -95,6 +100,19 @@ export class GoogleMetadataSvidSource implements SvidSource {
   }
 }
 
+/**
+ * A path-existence check, or one that always answers `false` on a runtime with no filesystem (an edge
+ * runtime), where the file and socket sources cannot apply.
+ */
+async function pathProbe(): Promise<(path: string) => boolean> {
+  try {
+    const { existsSync } = await importNodeBuiltin<typeof import("node:fs")>("fs", "autoDetectEvidence");
+    return existsSync;
+  } catch {
+    return () => false;
+  }
+}
+
 async function gcpMetadataAvailable(base: string, timeoutMs = 300): Promise<boolean> {
   try {
     const res = await request(base + "/computeMetadata/v1/", {
@@ -131,37 +149,38 @@ export interface AutoDetectOptions {
  * exist throws {@link EvidenceNotFound} naming the variable; it never falls through to the next source.
  */
 export async function autoDetectEvidence(opts: AutoDetectOptions = {}): Promise<SvidSource> {
+  const exists = await pathProbe();
   const defaultTokenFile = opts.defaultTokenFile ?? DEFAULT_TOKEN_FILE;
   const defaultSocket = opts.defaultSpiffeSocket ?? DEFAULT_SPIFFE_SOCKET;
   const metadataBase = (opts.gcpMetadataBase ?? GCP_METADATA_BASE).replace(/\/+$/, "");
 
-  const staticToken = process.env[ENV_SVID];
+  const staticToken = envVar(ENV_SVID);
   if (staticToken) {
     return new StaticSvidSource(staticToken.trim());
   }
 
   // An explicitly configured source that is missing is a misconfiguration: fail closed rather than
   // fall through to a different identity the operator did not choose.
-  const tokenFile = process.env[ENV_TOKEN_FILE];
+  const tokenFile = envVar(ENV_TOKEN_FILE);
   if (tokenFile) {
-    if (!existsSync(tokenFile)) {
+    if (!exists(tokenFile)) {
       throw new EvidenceNotFound(`${ENV_TOKEN_FILE} is set to ${tokenFile}, but no such file exists`);
     }
     return new FileTokenSvidSource(tokenFile);
   }
-  if (existsSync(defaultTokenFile)) {
+  if (exists(defaultTokenFile)) {
     return new FileTokenSvidSource(defaultTokenFile);
   }
 
-  const socket = process.env[ENV_SPIFFE_SOCKET];
+  const socket = envVar(ENV_SPIFFE_SOCKET);
   if (socket) {
     const socketPath = socket.replace(/^unix:\/\//, "");
-    if (!existsSync(socketPath)) {
+    if (!exists(socketPath)) {
       throw new EvidenceNotFound(`${ENV_SPIFFE_SOCKET} is set to ${socket}, but no such socket exists`);
     }
     return new SpireWorkloadApiSvidSource(socketPath);
   }
-  if (existsSync(defaultSocket)) {
+  if (exists(defaultSocket)) {
     return new SpireWorkloadApiSvidSource(defaultSocket);
   }
 

@@ -30,6 +30,8 @@ capability) slots in behind the same interface once the AS accepts it on the bac
 from __future__ import annotations
 
 import json
+import logging
+import re
 import ssl
 import threading
 import time
@@ -41,7 +43,7 @@ from typing import Callable, Optional, Protocol
 
 import jwt
 
-from client_attestation_sdk import _http
+from client_attestation_sdk import _http, _log
 from client_attestation_sdk.errors import TransportError
 
 # ---- outcomes -----------------------------------------------------------------------------------
@@ -51,6 +53,8 @@ DENIED = "denied"       # access_denied
 EXPIRED = "expired"     # expired_token, or PF's invalid_grant after it killed the request
 
 CIBA_GRANT = "urn:openid:params:grant-type:ciba"
+_logger = _log.get("authz")
+_OAUTH_ERROR_CODE = re.compile(r"^[a-z_]{1,64}$")
 _JWT_BEARER = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 
 
@@ -255,8 +259,14 @@ class CibaClient:
             form["authorization_details"] = json.dumps(authorization_details, separators=(",", ":"))
         self.client_auth.apply(self.bc_auth_endpoint, form)
 
-        status, text = self.http("POST", self.bc_auth_endpoint, form, {})
+        try:
+            status, text = self.http("POST", self.bc_auth_endpoint, form, {})
+        except Exception as exc:
+            self._log_failed("ciba_request", self.bc_auth_endpoint, getattr(exc, "status", None),
+                             _log.failure_reason(exc))
+            raise
         if status != 200:
+            self._log_failed("ciba_request", self.bc_auth_endpoint, status, "status")
             raise CibaError(f"bc-auth {status}: {text[:300]}", status=status, body=text)
         try:
             body = json.loads(text) if text else {}
@@ -276,8 +286,15 @@ class CibaClient:
         auth_req_id = str(body.get("auth_req_id") or "")
         if not auth_req_id:
             raise CibaError("bc-auth returned no auth_req_id", status=status, body=text)
+        _log.emit(_logger, logging.INFO, "authz.ciba_requested", host=_log.host(self.bc_auth_endpoint),
+                  interval=interval, expires_in=expires_in)
         return CibaRequest(auth_req_id=auth_req_id, interval=interval, expires_in=expires_in,
                            requested_at=float(self.clock()))
+
+    @staticmethod
+    def _log_failed(step: str, url: str, status, reason: str) -> None:
+        _log.emit(_logger, logging.WARNING, "http.failed", step=step, method="POST", host=_log.host(url),
+                  path=_log.path(url), status=status, reason=reason)
 
     # ---- token poll -----------------------------------------------------------------------------
     def poll(self, req: CibaRequest) -> str:
@@ -309,8 +326,11 @@ class CibaClient:
                 status, text = self.http("POST", self.token_endpoint, form, {})
             except Exception as exc:  # noqa: BLE001 — a transport blip is not a verdict
                 req.last_error = f"transport: {exc}"
+                self._log_failed("ciba_poll", self.token_endpoint, getattr(exc, "status", None),
+                                 _log.failure_reason(exc))
                 return req.last_outcome
             outcome = PENDING
+            err = ""
             if status == 200:
                 outcome = APPROVED
                 try:
@@ -343,4 +363,6 @@ class CibaClient:
                     pass
                 # anything else: stay pending; last_error carries the detail for logs
             req.last_outcome = outcome
+            _log.emit(_logger, logging.DEBUG, "authz.ciba_polled", outcome=outcome, status=status,
+                      error=err if _OAUTH_ERROR_CODE.match(err) else None)
             return outcome

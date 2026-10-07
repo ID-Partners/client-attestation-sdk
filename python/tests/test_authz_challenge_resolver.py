@@ -4,7 +4,7 @@ import json
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from authz_challenge import (
+from client_attestation_sdk.authz_challenge import (
     APPROVED, ASSURANCE_DEVICE_APPROVED, ASSURANCE_WEB_CONSENT, CHANNEL_DEVICE, CHANNEL_LOCAL,
     CHANNEL_WEB, DENIED, EXPIRED, PENDING, RESOURCE_AUTHORISATION,
     Ceremony, CibaClient, CibaResolver, Hooks, MemoryStore, Pending, PrivateKeyJwtAuth,
@@ -291,7 +291,7 @@ def test_poll_unknown_code_is_none_and_rehydrate_path():
 def test_ceremony_roundtrip():
     c = Ceremony(code="PAY-1", kind=RESOURCE_AUTHORISATION, channel=CHANNEL_DEVICE, subject="alice",
                  txn_hash="h", instruction=INSTR, initiator="i", created_at=1.0, extra={"scope": "s"})
-    from authz_challenge import CibaRequest
+    from client_attestation_sdk.authz_challenge import CibaRequest
     c.ciba = CibaRequest(auth_req_id="r", interval=3, expires_in=120, requested_at=1.0)
     d = json.loads(json.dumps(c.to_dict()))
     back = Ceremony.from_dict(d)

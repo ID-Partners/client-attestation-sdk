@@ -9,7 +9,14 @@ TypeScript, and Go ports.
 
 ## Install
 
-Not on PyPI yet. Install from a clone of this repository:
+```bash
+pip install client-attestation-sdk
+```
+
+The optional integrations are extras: `client-attestation-sdk[httpx]`,
+`[requests]` and `[aws]`.
+
+To work on the SDK itself, install from a clone with the test extras:
 
 ```bash
 pip install -e '.[test]'
@@ -69,11 +76,11 @@ Other options on `ClientAttestation`:
 
 ## Token validator
 
-The same distribution ships a resource-server validator (`token_validator`) — the side that *receives* and
+The same distribution ships a resource-server validator (`client_attestation_sdk.token_validator`) — the side that *receives* and
 checks a token:
 
 ```python
-from token_validator import AccessTokenValidator, ValidatorConfig
+from client_attestation_sdk.token_validator import AccessTokenValidator, ValidatorConfig
 
 validator = AccessTokenValidator(ValidatorConfig(
     issuer="https://issuer.example.com", audiences=["https://api.example.com"],

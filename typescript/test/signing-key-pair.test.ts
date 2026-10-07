@@ -14,7 +14,7 @@ describe("SigningKeyPair", () => {
   it.each(["ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512"])(
     "generates %s keys that sign verifiably and round-trip through fromJwk",
     async (alg) => {
-      const key = await SigningKeyPair.generate(alg);
+      const key = await SigningKeyPair.generate(alg, { extractable: true });
       expect(key.algorithm).toBe(alg);
       const pub = key.publicJwk();
       expect(pub.kty).toBe(alg.startsWith("ES") ? "EC" : "RSA");
@@ -38,7 +38,7 @@ describe("SigningKeyPair", () => {
   );
 
   it("fromJwk restores the same key (matching kid) and signs verifiably", async () => {
-    const original = await SigningKeyPair.generate("ES256");
+    const original = await SigningKeyPair.generate("ES256", { extractable: true });
     const privateJwk = (await exportJWK(original.privateKey)) as JWK;
     const restored = await SigningKeyPair.fromJwk(privateJwk, "ES256");
 
@@ -53,6 +53,13 @@ describe("SigningKeyPair", () => {
     expect(payload.ping).toBe("pong");
   });
 
+  it("generates a private key that can't be exported unless asked", async () => {
+    const key = await SigningKeyPair.generate("ES256");
+    expect(key.privateKey.extractable).toBe(false);
+    await expect(exportJWK(key.privateKey)).rejects.toThrow();
+    expect((await SigningKeyPair.generate("ES256", { extractable: true })).privateKey.extractable).toBe(true);
+  });
+
   it("fromJwk rejects a JWK without the private component", async () => {
     const original = await SigningKeyPair.generate("ES256");
     await expect(SigningKeyPair.fromJwk(original.publicJwk(), "ES256")).rejects.toThrow(
@@ -61,7 +68,7 @@ describe("SigningKeyPair", () => {
   });
 
   it("fromJwk rejects unsupported algorithms", async () => {
-    const original = await SigningKeyPair.generate("ES256");
+    const original = await SigningKeyPair.generate("ES256", { extractable: true });
     const privateJwk = (await exportJWK(original.privateKey)) as JWK;
     await expect(SigningKeyPair.fromJwk(privateJwk, "EdDSA")).rejects.toThrow(
       "unsupported signing algorithm: EdDSA",

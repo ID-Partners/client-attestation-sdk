@@ -2,17 +2,22 @@
 from __future__ import annotations
 
 import base64
+import logging
 import time
 import urllib.parse
 
 import jwt
 
-from client_attestation_sdk import _http
+from client_attestation_sdk import _http, _log
+from client_attestation_sdk.errors import TransportError
 
 from . import errors
 from .config import normalise_type
 from .jwks import JwksProvider
 from .result import ValidationResult
+
+
+_logger = _log.get("validator")
 
 
 def _default_post(url, body, headers):
@@ -36,6 +41,9 @@ class AccessTokenValidator:
         self._http_post = http_post or _default_post
 
     def validate(self, token, required_scopes=None):
+        return _verdict(self._validate(token, required_scopes), "jwt")
+
+    def _validate(self, token, required_scopes):
         required = self.config.required_scopes if required_scopes is None else list(required_scopes)
 
         try:
@@ -114,10 +122,19 @@ class AccessTokenValidator:
         else:
             form["client_id"] = cfg.client_id
             form["client_secret"] = cfg.client_secret
-        return self._http_post(cfg.endpoint, urllib.parse.urlencode(form), headers)
+        try:
+            return self._http_post(cfg.endpoint, urllib.parse.urlencode(form), headers)
+        except TransportError as error:
+            _log.emit(_logger, logging.WARNING, "http.failed", step="introspection", method="POST",
+                      host=_log.host(cfg.endpoint), path=_log.path(cfg.endpoint), status=error.status,
+                      reason=_log.failure_reason(error))
+            raise
 
     def validate_active(self, token, required_scopes=None):
         """Introspect the token and enforce ``active`` plus scope/audience from the response."""
+        return _verdict(self._validate_active(token, required_scopes), "introspection")
+
+    def _validate_active(self, token, required_scopes):
         data = self.introspect(token)
         if not data.get("active"):
             return ValidationResult.failure(errors.INACTIVE, "token is not active")
@@ -130,6 +147,13 @@ class AccessTokenValidator:
         if self.config.audiences and audience and not any(a in audience for a in self.config.audiences):
             return ValidationResult.failure(errors.INVALID_AUDIENCE, "token audience is not accepted")
         return ValidationResult.success(data, granted, audience)
+
+
+def _verdict(result, mode):
+    """Log a verdict (its stable code, never the token or its claims) and return it."""
+    code = errors.VALID if result.valid else result.error
+    _log.emit(_logger, logging.DEBUG if result.valid else logging.INFO, "token.validated", result=code, mode=mode)
+    return result
 
 
 def _numeric(claims, name):

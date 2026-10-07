@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import shlex
 import threading
@@ -30,7 +31,10 @@ import time
 import urllib.parse
 import uuid
 
-from . import _http
+from . import _http, _log
+from ._redact import PRIVATE_JWK_MEMBERS as _PRIVATE_JWK_MEMBERS  # noqa: F401 - kept importable
+from ._redact import SECRET_FIELDS as _SECRET_FIELDS  # noqa: F401 - kept importable
+from ._redact import redact_json as _redact_json, redacted as _redacted
 from .builders import DpopProofBuilder, PopBuilder, url_origin as _origin
 from .errors import ClientAttestationError, TransportError  # noqa: F401 - re-exported
 from .evidence import auto_detect_evidence
@@ -47,11 +51,12 @@ DEFAULT_EXPIRY_SKEW_SECONDS = 30
 DPOP_NONCE_HEADER = "DPoP-Nonce"
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
-# Trace redaction (see `trace_redact`): header names and JSON/form members whose values are credentials.
+# Trace redaction (see `trace_redact`): header names whose values are credentials. The JSON/form members
+# and private JWK members live in `_redact`, shared with the loggers.
 _SECRET_HEADERS = frozenset(h.lower() for h in ("Authorization", DPOP_HEADER, ATTESTATION_HEADER, POP_HEADER))
-_SECRET_FIELDS = frozenset({"svid", "proof", "assertion", "client_assertion", "subject_token", "actor_token",
-                            "client_secret", "attestation", "access_token", "refresh_token", "id_token"})
-_PRIVATE_JWK_MEMBERS = frozenset({"d", "p", "q", "dp", "dq", "qi", "k", "oth"})
+
+# Logs the flow's lifecycle (docs/logging.md). Silent unless the application configures logging.
+_logger = _log.get("token_source")
 
 
 class ClientAttestation:
@@ -150,9 +155,14 @@ class ClientAttestation:
         """`(access_token, token_type, instance_key)`, read or minted together under one lock so a
         DPoP-bound token is never paired with a key other than the one it was bound to."""
         with self._lock:
+            now = time.time()
             if asserted_context is None and not force_refresh \
-                    and self._cached_token and time.time() < self._expires_at:
+                    and self._cached_token and now < self._expires_at:
+                _log.emit(_logger, logging.DEBUG, "token.cache_hit", expires_in=int(self._expires_at - now))
                 return self._cached_token, self._token_type, self._token_key
+            reason = ("asserted_context" if asserted_context is not None else "forced" if force_refresh
+                      else "initial" if not self._cached_token else "expired")
+            _log.emit(_logger, logging.DEBUG, "token.refreshing", reason=reason)
             response, instance_key = self._run_flow(asserted_context=asserted_context)
             access_token = response["access_token"]
             token_type = _token_type(response)
@@ -212,6 +222,7 @@ class ClientAttestation:
                                                  response.headers, lambda: response.content)
                 if nonce is None or not _replayable(response.request.body):
                     return response
+                _log_nonce_retry(response.request.url, response.status_code, "resource")
                 retry = response.request.copy()
                 retry.hooks = {"response": []}
                 retry.headers.update(source.request_headers(retry.method, retry.url))
@@ -244,6 +255,7 @@ class ClientAttestation:
                                                  lambda: _httpx_body(response))
                 if nonce is None or not isinstance(request.stream, httpx.ByteStream):
                     return
+                _log_nonce_retry(url, response.status_code, "resource")
                 request.headers.update(source.request_headers(request.method, url))
                 yield request
 
@@ -271,6 +283,9 @@ class ClientAttestation:
         """The attester's `/.well-known/client-attester` document (fetched once, then cached)."""
         if self._discovery is None:
             self._discovery = self._get_json("GET", self.base_url + WELL_KNOWN_PATH, step="discover")
+            _log.emit(_logger, logging.DEBUG, "discovery.fetched", host=_log.host(self.base_url))
+        else:
+            _log.emit(_logger, logging.DEBUG, "discovery.cached", host=_log.host(self.base_url))
         return self._discovery
 
     # ── tracing (opt-in; see `trace` and `trace_redact` in __init__) ────────────────────────────
@@ -312,6 +327,7 @@ class ClientAttestation:
 
         evidence_source = self._evidence or auto_detect_evidence()
         svid = evidence_source.fetch(audience)
+        _log.emit(_logger, logging.DEBUG, "evidence.obtained", source=type(evidence_source).__name__)
 
         instance_key = SigningKeyPair.generate(self._algorithm)
         challenge = self._fetch_challenge(doc)
@@ -322,6 +338,8 @@ class ClientAttestation:
         token_endpoint = doc.get("token_endpoint") or (self.base_url + "/as/token.oauth2")
         _require_https(token_endpoint, "token_endpoint", self._allow_insecure)
         client_id = _jwt_sub(attestation)
+        _log.emit(_logger, logging.DEBUG, "attestation.minted", host=_log.host(doc["attestation_endpoint"]),
+                  client_id=client_id, alg=self._algorithm)
         # See `challenge_at_token` on __init__: some attesters consume the challenge the moment the
         # mint's instance proof uses it, and reject a token request that presents the same value a
         # second time. Against one of those, only the mint gets the challenge.
@@ -350,6 +368,10 @@ class ClientAttestation:
 
         response = self._call_token_endpoint(token_endpoint, attestation, proof, proof_header,
                                              operator=self._operator, retry_proof=retry_proof)
+        expires_in = response.get("expires_in")
+        _log.emit(_logger, logging.INFO, "token.obtained", host=_log.host(token_endpoint), client_id=client_id,
+                  token_type=_token_type(response), expires_in=_int_or_none(expires_in),
+                  pop_method=self._pop_method)
         return response, instance_key
 
     def _fetch_challenge(self, doc: dict):
@@ -365,12 +387,14 @@ class ClientAttestation:
         except ClientAttestationError as error:
             if not self._require_challenge:
                 # Opted out (require_challenge=False): mint without one, as older releases did.
+                _log.emit(_logger, logging.WARNING, "challenge.skipped", host=_log.host(endpoint))
                 return None
             # The attester advertises a challenge, so it is part of the anti-replay contract; minting
             # without one would silently weaken it. Fail closed.
             raise ClientAttestationError(f"could not get an attestation challenge from {endpoint}: {error}",
                                          status=error.status, body=error.body) from error
         self._annotate("value", value)
+        _log.emit(_logger, logging.DEBUG, "challenge.fetched", host=_log.host(endpoint))
         return value
 
     def _mint(self, doc: dict, instance_key: SigningKeyPair, svid: str, challenge,
@@ -420,15 +444,16 @@ class ClientAttestation:
             proof_header: proof,
         }
         self._record("token", "POST", endpoint, headers, form=params)
-        response = _http.request("POST", endpoint, headers=headers, body=form, timeout=self._timeout)
+        response = self._send("token", "POST", endpoint, headers, form)
         if retry_proof is not None:
             # RFC 9449 section 8: the AS may demand its own nonce. Retry once with a proof carrying it.
             nonce = self._observe_response(endpoint, response.status, response.headers, response.body)
             if nonce is not None:
+                _log_nonce_retry(endpoint, response.status, "token_endpoint")
                 headers[proof_header] = retry_proof(nonce)
                 self._record("token", "POST", endpoint, headers, form=params)
-                response = _http.request("POST", endpoint, headers=headers, body=form, timeout=self._timeout)
-        parsed = _http.json_ok(response, "token endpoint")
+                response = self._send("token", "POST", endpoint, headers, form)
+        parsed = self._json_ok("token", "POST", endpoint, response, "token endpoint")
         if "access_token" not in parsed:
             raise ClientAttestationError("token endpoint returned no access_token", body=json.dumps(parsed))
         self._annotate("jwt", parsed["access_token"])
@@ -441,8 +466,25 @@ class ClientAttestation:
             headers["Content-Type"] = "application/json"
         if step:
             self._record(step, method, url, headers, json_body=json_body)
-        response = _http.request(method, url, headers=headers, body=data, timeout=self._timeout)
-        return _http.json_ok(response, f"{method} {url}", allow_empty=True)
+        response = self._send(step, method, url, headers, data)
+        return self._json_ok(step, method, url, response, f"{method} {url}", allow_empty=True)
+
+    def _send(self, step, method: str, url: str, headers: dict, body) -> _http.HttpResponse:
+        """One call through the shared transport, logging `http.failed` when it raises."""
+        try:
+            return _http.request(method, url, headers=headers, body=body, timeout=self._timeout)
+        except TransportError as error:
+            _log_http_failed(step, method, url, error)
+            raise
+
+    @staticmethod
+    def _json_ok(step, method: str, url: str, response: _http.HttpResponse, what: str, *,
+                 allow_empty: bool = False) -> dict:
+        try:
+            return _http.json_ok(response, what, allow_empty=allow_empty)
+        except TransportError as error:
+            _log_http_failed(step, method, url, error)
+            raise
 
 
 def _normalize_base_url(pf_host: str) -> str:
@@ -507,20 +549,20 @@ def _httpx_body(response):
         return None
 
 
-def _redacted(value) -> str:
-    raw = value if isinstance(value, str) else json.dumps(value)
-    return f"<redacted:{len(raw.encode('utf-8'))} bytes>"
+def _log_http_failed(step, method: str, url: str, error: TransportError) -> None:
+    _log.emit(_logger, logging.WARNING, "http.failed", step=step, method=method, host=_log.host(url),
+              path=_log.path(url), status=error.status, reason=_log.failure_reason(error))
 
 
-def _redact_json(value):
-    """A copy of a request body with credential members (and private JWK members) redacted."""
-    if isinstance(value, list):
-        return [_redact_json(item) for item in value]
-    if not isinstance(value, dict):
-        return value
-    is_jwk = "kty" in value
-    return {key: _redacted(item) if key in _SECRET_FIELDS or (is_jwk and key in _PRIVATE_JWK_MEMBERS)
-            else _redact_json(item) for key, item in value.items()}
+def _log_nonce_retry(url: str, status: int, at: str) -> None:
+    _log.emit(_logger, logging.INFO, "dpop.nonce_retry", host=_log.host(url), status=status, at=at)
+
+
+def _int_or_none(value):
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _jwt_sub(compact_jwt: str) -> str:

@@ -29,13 +29,17 @@ SDK owns the protocol and the state machine; the deployment owns its directories
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import logging
 import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Optional, Protocol
+
+from client_attestation_sdk import _log
 
 from . import ciba as _ciba
 from .challenge import Challenge, IDENTITY_PROOFING, RESOURCE_AUTHORISATION
@@ -406,6 +410,54 @@ class ChallengeResolver(Protocol):
     def poll(self, code: str) -> Optional[PollResult]: ...   # noqa: E704
 
 
+# ---- logging (docs/logging.md) -------------------------------------------------------------------
+# Outcomes only: never the ceremony code, the subject, the binding message or the instruction.
+_logger = _log.get("authz")
+_RESOLVER_NAMES = {"CibaResolver": "ciba", "WebConsentResolver": "web_consent", "ProofingResolver": "proofing"}
+
+
+def _resolver_name(resolver) -> str:
+    name = type(resolver).__name__
+    return _RESOLVER_NAMES.get(name, name)
+
+
+def _logged_resolve(fn):
+    @functools.wraps(fn)
+    def resolve(self, *args, **kwargs):
+        out = fn(self, *args, **kwargs)
+        if isinstance(out, Pending):
+            attrs = {"outcome": "pending", "channel": out.channel, "reused": out.reused}
+        elif isinstance(out, Resolved):
+            attrs = {"outcome": "resolved"}
+        else:
+            attrs = {"outcome": "unavailable", "fallback": getattr(out, "fallback", None)}
+        _log.emit(_logger, logging.INFO, "authz.resolve", resolver=_resolver_name(self),
+                  kind=getattr(out, "kind", None), **attrs)
+        return out
+    return resolve
+
+
+def _logged_poll(fn):
+    @functools.wraps(fn)
+    def poll(self, *args, **kwargs):
+        out = fn(self, *args, **kwargs)
+        if out is not None:
+            _log.emit(_logger, logging.DEBUG, "authz.poll", resolver=_resolver_name(self), kind=out.kind,
+                      status=out.status)
+        return out
+    return poll
+
+
+def _logged_resume(fn):
+    @functools.wraps(fn)
+    def verify_resume(self, *args, **kwargs):
+        ok, detail = fn(self, *args, **kwargs)
+        _log.emit(_logger, logging.INFO, "authz.resume_verified", resolver=_resolver_name(self), ok=ok,
+                  reason=None if ok else detail)
+        return ok, detail
+    return verify_resume
+
+
 # ---- the CIBA resolver ---------------------------------------------------------------------------
 class CibaResolver:
     """Resolve a resource-authorisation (or identity-proofing) challenge with a decoupled push.
@@ -474,6 +526,7 @@ class CibaResolver:
                        reference=c.reference)
 
     # ---- resolve ------------------------------------------------------------------------------
+    @_logged_resolve
     def resolve(self, challenge: Challenge, *, subject: str, instruction: Dict[str, Any],
                 initiator: str, binding_message: Optional[str] = None,
                 scope: str = "openid") -> "Pending | Resolved | Unavailable":
@@ -578,6 +631,7 @@ class CibaResolver:
         return n
 
     # ---- poll ---------------------------------------------------------------------------------
+    @_logged_poll
     def poll(self, code: str) -> Optional[PollResult]:
         cer = self._load(code)
         if cer is None:
@@ -631,6 +685,7 @@ class CibaResolver:
         self.hooks.log(f"ceremony {cer.code} -> {status} (assurance={cer.assurance})")
 
     # ---- verify a resumed call against the approved instruction ------------------------------
+    @_logged_resume
     def verify_resume(self, code: str, *, subject: str, instruction: Dict[str, Any]) -> "tuple[bool, str]":
         """On a re-sent call carrying ``code``, confirm the ceremony is APPROVED and that the
         instruction NOW presented hashes to what was approved. Closes the argument-tampering seam:
@@ -683,6 +738,7 @@ class WebConsentResolver:
         self.clock = clock
         self._lock = threading.Lock()
 
+    @_logged_resolve
     def resolve(self, challenge: Challenge, *, subject: str, instruction: Dict[str, Any],
                 initiator: str, binding_message: Optional[str] = None) -> "Pending | Resolved | Unavailable":
         kind = challenge.type
@@ -718,6 +774,7 @@ class WebConsentResolver:
                        expires_in=self.ttl, txn_hash=txn_hash, consent_url=cer.consent_url,
                        detail=dict(instruction), reference=cer.reference)
 
+    @_logged_poll
     def poll(self, code: str) -> Optional[PollResult]:
         cer = self.store.get(code)
         if cer is None and self.hooks.rehydrate:
@@ -833,6 +890,7 @@ class ProofingResolver:
         return n
 
     # ---- resolve --------------------------------------------------------------------------
+    @_logged_resolve
     def resolve(self, challenge: Challenge, *, subject: str, instruction: Dict[str, Any],
                 initiator: str, binding_message: Optional[str] = None,
                 scope: str = "openid") -> "Pending | Resolved | Unavailable":
@@ -961,6 +1019,7 @@ class ProofingResolver:
                        reference=live.reference)
 
     # ---- poll -----------------------------------------------------------------------------
+    @_logged_poll
     def poll(self, code: str) -> Optional[PollResult]:
         cer = self._load(code)
         if cer is None:
@@ -1003,6 +1062,7 @@ class ProofingResolver:
                 self.hooks.log(f"proofing on_outcome({status}) failed for {cer.code}: {exc}")
         self.hooks.log(f"proofing {cer.code} -> {status}")
 
+    @_logged_resume
     def verify_resume(self, code: str, *, subject: str, instruction: Dict[str, Any]) -> "tuple[bool, str]":
         """On a re-sent operation carrying ``code``, confirm the presentation was verified and that
         it was for THIS operation — a proofing of one account must not wave through another.

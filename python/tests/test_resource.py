@@ -1,7 +1,7 @@
 import json
 import os
 
-from token_validator import (
+from client_attestation_sdk.token_validator import (
     AccessTokenValidator,
     ProtectedResource,
     ValidatorConfig,

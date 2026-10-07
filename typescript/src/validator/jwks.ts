@@ -8,7 +8,9 @@
  */
 import { importJWK, type CryptoKey, type JSONWebKeySet, type JWK } from "jose";
 
+import { TransportError } from "../errors.js";
 import { request } from "../http.js";
+import { emit, failureReason, hostOf, NOOP_LOGGER, type Logger } from "../logging.js";
 
 /** An imported verification key, as returned by jose's `importJWK`. */
 export type VerificationKey = CryptoKey | Uint8Array;
@@ -25,7 +27,7 @@ const defaultGet: HttpGet = async (url) => {
   // the shared transport refuses redirects and caps the body at MAX_JWKS_BYTES while reading it
   const resp = await request(url, { method: "GET", timeoutMs: FETCH_TIMEOUT_MS, maxBytes: MAX_JWKS_BYTES });
   if (!resp.ok) {
-    throw new Error(`GET ${url} failed: ${resp.status}`);
+    throw new TransportError(`GET ${url} failed: ${resp.status}`, "status", { status: resp.status });
   }
   return resp.body;
 };
@@ -56,6 +58,8 @@ export interface JwksProviderOptions {
   maxAgeSeconds?: number;
   /** Milliseconds clock, injectable for tests. Defaults to `Date.now`. */
   clock?: () => number;
+  /** Where to send `jwks.*` log events. Unset, nothing is logged. */
+  logger?: Logger;
 }
 
 export class JwksProvider {
@@ -65,6 +69,7 @@ export class JwksProvider {
   readonly #minRefreshMs: number;
   readonly #maxAgeMs: number;
   readonly #clock: () => number;
+  readonly #logger: Logger;
   /** kid -> key, plus the JWK's declared `alg` (a JWK that declares one is only used for that alg). */
   #keys = new Map<string | undefined, Entry>();
   #loaded: Promise<void> | null = null;
@@ -81,6 +86,7 @@ export class JwksProvider {
     this.#minRefreshMs = (opts.minRefreshSeconds ?? DEFAULT_MIN_REFRESH_SECONDS) * 1000;
     this.#maxAgeMs = (opts.maxAgeSeconds ?? DEFAULT_MAX_AGE_SECONDS) * 1000;
     this.#clock = opts.clock ?? Date.now;
+    this.#logger = opts.logger ?? NOOP_LOGGER;
     if (opts.jwks != null) {
       this.#loaded = JwksProvider.#parse(opts.jwks).then((keys) => {
         this.#keys = keys;
@@ -137,6 +143,7 @@ export class JwksProvider {
     }
     const now = this.#clock();
     if (this.#lastAttempt !== null && now - this.#lastAttempt < this.#minRefreshMs) {
+      emit(this.#logger, "debug", "jwks.refetch_throttled", { host: hostOf(this.#jwksUri as string) });
       return Promise.resolve();
     }
     this.#lastAttempt = now;
@@ -144,12 +151,18 @@ export class JwksProvider {
       try {
         const body = await this.#httpGet(this.#jwksUri as string);
         if (body.length > MAX_JWKS_BYTES) {
-          throw new Error(`JWKS is larger than ${MAX_JWKS_BYTES} bytes`);
+          throw new TransportError(`JWKS is larger than ${MAX_JWKS_BYTES} bytes`, "too_large");
         }
         this.#keys = await JwksProvider.#parse(JSON.parse(body) as JSONWebKeySet);
         this.#loadedAt = this.#clock();
         this.lastError = null;
+        emit(this.#logger, "debug", "jwks.fetched", { host: hostOf(this.#jwksUri as string), keys: this.#keys.size });
       } catch (exc) {
+        emit(this.#logger, "warn", "jwks.fetch_failed", {
+          host: hostOf(this.#jwksUri as string),
+          reason: failureReason(exc),
+          status: exc instanceof TransportError ? exc.status : undefined,
+        });
         // keep serving the keys already held
         this.lastError = `JWKS fetch failed: ${exc instanceof Error ? exc.message : String(exc)}`;
       } finally {
