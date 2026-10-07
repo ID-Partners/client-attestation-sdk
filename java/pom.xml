@@ -6,13 +6,14 @@
 
     <groupId>global.idpartners</groupId>
     <artifactId>client-attestation-sdk</artifactId>
-    <version>0.3.0</version>
+    <version>1.0.0</version>
     <packaging>jar</packaging>
 
     <name>client-attestation-sdk</name>
     <description>Client-side builder SDK for OAuth Attestation-Based Client Authentication
         (draft-ietf-oauth-attestation-based-client-auth): mints the Client Attestation JWT (attester side)
-        and the PoP / DPoP proofs plus request headers (client side). Built on jose4j.</description>
+        and the PoP / DPoP proofs plus request headers (client side), and validates access tokens at a
+        resource server. Built on jose4j.</description>
     <url>https://github.com/ID-Partners/client-attestation-sdk</url>
 
     <organization>
@@ -59,8 +60,35 @@
 
     <build>
         <plugins>
-            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.16.0</version></plugin>
-            <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.6.0</version></plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.16.0</version>
+                <executions>
+                    <execution>
+                        <!-- tests compile into the module, and use JDK modules it doesn't need itself -->
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <compilerArgs>
+                                <arg>--add-modules</arg>
+                                <arg>jdk.httpserver,java.logging</arg>
+                                <arg>--add-reads</arg>
+                                <arg>global.idpartners.clientattestation=jdk.httpserver,java.logging</arg>
+                            </compilerArgs>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.6.0</version>
+                <configuration>
+                    <!-- tests run on the class path: they need jdk.httpserver and reach package-private
+                         members across the module's packages; module-info is checked at compile time -->
+                    <useModulePath>false</useModulePath>
+                </configuration>
+            </plugin>
             <!-- -sources and -javadoc jars, required for Maven Central -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -101,8 +129,8 @@
                                 <rule>
                                     <element>BUNDLE</element>
                                     <limits>
-                                        <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.91</minimum></limit>
-                                        <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.88</minimum></limit>
+                                        <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.95</minimum></limit>
+                                        <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.91</minimum></limit>
                                     </limits>
                                 </rule>
                             </rules>

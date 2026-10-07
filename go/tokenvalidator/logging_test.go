@@ -91,20 +91,26 @@ func TestLoggingValidatorNeverLogsTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var shared []vectorCase
 	for _, c := range v.Cases {
-		val.Validate(c.Token, nil)
+		if c.shared() {
+			shared = append(shared, c)
+			val.Validate(c.Token, nil)
+		}
 	}
 	// An unknown kid inside the cooldown is throttled, not fetched.
 	val.Validate(tokenNamed(v, "valid"), nil) // cached key: no fetch, no event
 	val.jwks.refresh("unknown-kid")
-	val.ValidateActive(tokenNamed(v, "valid"), nil)
+	if _, err := val.ValidateActive(tokenNamed(v, "valid"), nil); err != nil {
+		t.Fatal(err)
+	}
 
 	evs := logEvents(t, buf)
 	verdicts := eventsNamed(evs, "token.validated")
-	if len(verdicts) != len(v.Cases)+2 {
-		t.Fatalf("got %d verdicts, want %d:\n%s", len(verdicts), len(v.Cases)+2, buf.String())
+	if len(verdicts) != len(shared)+2 {
+		t.Fatalf("got %d verdicts, want %d:\n%s", len(verdicts), len(shared)+2, buf.String())
 	}
-	for i, c := range v.Cases {
+	for i, c := range shared {
 		want := c.Expect
 		e := verdicts[i]
 		wantLevel := "INFO"
@@ -131,7 +137,7 @@ func TestLoggingValidatorNeverLogsTokens(t *testing.T) {
 func TestLoggingJWKSFetchFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		get    httpGetFunc
+		get    HTTPGetFunc
 		reason string
 		status float64
 	}{
@@ -169,8 +175,8 @@ func TestLoggingIntrospectionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := val.ValidateActive(tokenNamed(v, "valid"), nil); r.Valid {
-		t.Fatal("expected a failure")
+	if _, err := val.ValidateActive(tokenNamed(v, "valid"), nil); err == nil {
+		t.Fatal("expected an error")
 	}
 	evs := logEvents(t, buf)
 	e := eventsNamed(evs, "http.failed")
@@ -178,7 +184,8 @@ func TestLoggingIntrospectionFailure(t *testing.T) {
 		e[0]["host"] != "as.example" || e[0]["path"] != "/introspect" || e[0]["method"] != "POST" {
 		t.Fatalf("http.failed = %v", e)
 	}
-	if verdict := eventsNamed(evs, "token.validated"); len(verdict) != 1 || verdict[0]["result"] != ErrInvalidToken {
+	// a failed call is an error, not a verdict, so no token.validated is logged (as in every port)
+	if verdict := eventsNamed(evs, "token.validated"); len(verdict) != 0 {
 		t.Fatalf("verdict = %v", verdict)
 	}
 	assertNoSecrets(t, buf)

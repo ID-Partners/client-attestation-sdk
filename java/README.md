@@ -11,6 +11,9 @@ It mints the artifacts a client (and its attester) present at the token endpoint
   by the client instance key to prove possession;
 - the request **headers** to send.
 
+On the other side of the API call, `tokenvalidator` validates the access tokens a resource server receives
+(see [Resource server](#resource-server-validate-an-access-token)).
+
 Built on [jose4j](https://bitbucket.org/b_c/jose4j). The AS-side counterpart that *verifies*
 these artifacts is [`client-attestation`](https://github.com/dphhyland/client-attestation) — this SDK is
 round-trip tested against it.
@@ -21,7 +24,7 @@ round-trip tested against it.
 <dependency>
   <groupId>global.idpartners</groupId>
   <artifactId>client-attestation-sdk</artifactId>
-  <version>0.3.0</version>
+  <version>1.0.0</version>
 </dependency>
 ```
 
@@ -134,11 +137,87 @@ fragment from `htu`, and takes `.accessToken(t)` to add `ath`.
 
 - If the attester advertises a `challenge_endpoint` and the challenge can't be fetched, `token()` throws
   `ClientAttestationException` rather than minting without one. Opt out with `.requireChallenge(false)`.
-- The PingFederate host and every endpoint taken from discovery must be `https`, unless the host is
+- The attester URL and every endpoint taken from discovery must be `https`, unless the host is
   loopback (`localhost`, `127.0.0.1`, `::1`). `.allowInsecure(true)` lifts this for test rigs.
+
+### Other attesters
+
+`ClientAttestation` speaks PingFederate's discovery and mint protocol by default. `.profile(...)` plugs in
+your own `AttesterProfile`, and `.metadata(AttesterMetadata.of(audience, attestationEndpoint,
+tokenEndpoint))` gives the endpoints directly with no discovery (start from `ClientAttestation.builder()`
+with no URL). `AttestationIssuanceClient` takes a profile as its last constructor argument. See
+[`docs/attester-profiles.md`](../docs/attester-profiles.md).
 - If `CLIENT_ATTESTATION_TOKEN_FILE` or `SPIFFE_ENDPOINT_SOCKET` is set but points at a missing path,
   evidence auto-detection throws `EvidenceNotFoundException` naming the variable instead of trying the next
   source.
+
+## Resource server: validate an access token
+
+`global.idpartners.clientattestation.tokenvalidator` is the resource-server side, at parity with the Python,
+TypeScript and Go validators. It checks the JWT signature against the issuer's JWKS, then `typ`, `iss`,
+`exp` / `nbf` / `iat` (with leeway), audience and scope, and returns a stable error code on the first
+failure. The order and the codes are shared across all four ports, and `./verify-validation.sh` checks
+every port returns the same verdict on the shared vectors.
+
+```java
+AccessTokenValidator validator = AccessTokenValidator.builder(ValidatorConfig.builder()
+                .issuer("https://issuer.example.com")
+                .audiences("https://api.example.com")
+                .jwksUri("https://issuer.example.com/jwks")     // or .jwks(Map) / .jwks(String) for a static set
+                .requiredScopes("read")
+                .build())
+        .logger(System.getLogger(ClientAttestation.LOGGER_NAME))   // optional; silent by default
+        .build();
+
+ValidationResult result = validator.validate(accessToken);   // or validate(token, List.of("write"))
+if (result.valid()) {
+    handle(result.subject(), result.scopes(), result.claims());
+} else {
+    reject(result.error());                                  // e.g. "expired", "invalid_audience"
+}
+```
+
+- **Codes** are the constants in `ErrorCodes`: `invalid_token`, `unsupported_algorithm`, `key_not_found`,
+  `invalid_signature`, `invalid_token_type`, `invalid_issuer`, `missing_expiry`, `expired`,
+  `not_yet_valid`, `issued_in_future`, `invalid_audience`, `insufficient_scope`, and `inactive` from
+  introspection.
+- **Defaults**: algorithms ES/RS/PS at 256/384/512, 60 seconds of leeway, `typ` must be `at+jwt` when the
+  token carries one (`.disableTokenTypeCheck()` for an issuer that stamps something else). An explicitly
+  empty algorithm or type list accepts nothing, `leewaySeconds(0)` means no leeway, and `none` / `HS*` are
+  refused even when listed. The precise rules, shared by every port, are in
+  [validation/SEMANTICS.md](../validation/SEMANTICS.md).
+- **JWKS caching**: a `jwksUri` is fetched on first use and cached for an hour. An unknown `kid` triggers a
+  refetch, but never more than once every 30 seconds, and concurrent misses share one fetch, so made-up
+  `kid` values can't turn every request into a call to the issuer. A failed refresh keeps the keys already
+  held. Fetches go through the SDK's shared transport: 10 second timeout, no redirects, 512 KiB cap.
+- **Introspection** (RFC 7662): add `.introspection(new IntrospectionConfig(endpoint, clientId, secret))`
+  and call `validateActive(token)`. `client_secret_basic` by default; pass
+  `IntrospectionConfig.CLIENT_SECRET_POST` as a fourth argument for form credentials. Only `"active": true`
+  counts as active. A failed call (no endpoint, transport failure, non-2xx, a body over 1 MiB or not a
+  strict JSON object) throws rather than returning a verdict.
+- **Discovery** (RFC 8414): `Discovery.discover(metadataUrl)` returns the AS metadata document, with
+  `issuer`, `jwks_uri` and `introspection_endpoint` to feed into the config.
+
+### MCP / A2A protected resource
+
+`ProtectedResource` adds the HTTP conventions on top: RFC 9728 metadata, RFC 6750 bearer extraction and
+`WWW-Authenticate` challenges, and a guard that binds the token to this resource (RFC 8707). The
+constructor refuses a validator that doesn't accept the resource as an audience.
+
+```java
+ProtectedResource resource = new ProtectedResource("https://mcp.example.com/mcp",
+        List.of("https://as.example.com"), validator);
+
+// serve resource.metadataJson() at resource.metadataPath()  ->  /.well-known/oauth-protected-resource/mcp
+AuthDecision decision = resource.authenticate(request.getHeader("Authorization"));
+if (!decision.authorized()) {
+    response.setHeader("WWW-Authenticate", decision.wwwAuthenticate());   // 401, or 403 for scope
+    response.sendError(decision.status());
+}
+```
+
+Challenge values have every control character stripped, so nothing can split the header, and no failure
+description echoes the token's unverified `alg`, `kid` or claims.
 
 ## Keys
 
@@ -153,8 +232,8 @@ SigningKeyPair imported = SigningKeyPair.fromJwk(existingJose4jJwk, "ES256");
 ## Build
 
 ```bash
-mvn clean verify                 # from a clean clone; coverage report in target/site/jacoco/
-mvn clean verify -Pinterop       # adds the round-trip tests; needs client-attestation 0.1.0 in ~/.m2
+./mvnw clean verify               # from a clean clone; coverage report in target/site/jacoco/
+./mvnw clean verify -Pinterop     # adds the round-trip tests; needs client-attestation 0.1.0 in ~/.m2
 ```
 
 The `interop` profile adds `src/interop-test/java`. `RoundTripTest` there builds each artifact and verifies

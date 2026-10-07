@@ -1,0 +1,211 @@
+{
+  "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, with required_scopes and audience from tokens.json. `raises`: the call must fail with the port's error. Semantics: SEMANTICS.md.",
+  "cases": [
+    {
+      "name": "active",
+      "expect": "valid",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "active_no_aud",
+      "expect": "valid",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "active_aud_array",
+      "expect": "valid",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": [
+          "https://other.example.com",
+          "https://api.example.com"
+        ],
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "inactive",
+      "expect": "inactive",
+      "response": {
+        "active": false
+      }
+    },
+    {
+      "name": "active_missing",
+      "expect": "inactive",
+      "response": {
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "active_string_true",
+      "expect": "inactive",
+      "response": {
+        "active": "true",
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "active_number_one",
+      "expect": "inactive",
+      "response": {
+        "active": 1,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "active_null",
+      "expect": "inactive",
+      "response": {
+        "active": null,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "active_object",
+      "expect": "inactive",
+      "response": {
+        "active": {
+          "value": true
+        },
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "missing_scope",
+      "expect": "insufficient_scope",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "scope_not_string",
+      "expect": "invalid_token",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": [
+          "read"
+        ],
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "scp_array",
+      "expect": "valid",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "aud": "https://api.example.com",
+        "client_id": "rp",
+        "scp": [
+          "read"
+        ]
+      }
+    },
+    {
+      "name": "scp_string",
+      "expect": "valid",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "aud": "https://api.example.com",
+        "client_id": "rp",
+        "scp": "read write"
+      }
+    },
+    {
+      "name": "scp_non_string_entry",
+      "expect": "invalid_token",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "aud": "https://api.example.com",
+        "client_id": "rp",
+        "scp": [
+          "read",
+          7
+        ]
+      }
+    },
+    {
+      "name": "wrong_audience",
+      "expect": "invalid_audience",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://other.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "aud_non_string_entry",
+      "expect": "invalid_token",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": [
+          "https://api.example.com",
+          7
+        ],
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "sub_number",
+      "expect": "invalid_token",
+      "response": {
+        "active": true,
+        "sub": 7,
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp"
+      }
+    },
+    {
+      "name": "transport_error",
+      "expect": "raises",
+      "transport_error": true
+    },
+    {
+      "name": "no_endpoint",
+      "expect": "raises",
+      "no_endpoint": true
+    }
+  ]
+}

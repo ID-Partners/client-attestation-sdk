@@ -37,7 +37,11 @@ function guard(value: unknown): unknown {
   return value;
 }
 
-/** Emit one event: undefined attributes dropped, JWT-looking values redacted. Never throws. */
+/**
+ * Emit one event: undefined attributes dropped, JWT-looking values redacted. Never throws.
+ *
+ * @internal
+ */
 export function emit(logger: Logger, level: LogLevel, event: string, attrs: LogAttributes = {}): void {
   if (logger === NOOP_LOGGER) return;
   const clean: LogAttributes = {};
@@ -51,7 +55,11 @@ export function emit(logger: Logger, level: LogLevel, event: string, attrs: LogA
   }
 }
 
-/** `host[:port]` and the path of a URL, never its query string or fragment. */
+/**
+ * `host[:port]` and the path of a URL, never its query string or fragment.
+ *
+ * @internal
+ */
 export function urlParts(url: string): { host?: string; path?: string } {
   try {
     const parsed = new URL(url);
@@ -61,12 +69,20 @@ export function urlParts(url: string): { host?: string; path?: string } {
   }
 }
 
-/** `host[:port]` of a URL. */
+/**
+ * `host[:port]` of a URL.
+ *
+ * @internal
+ */
 export function hostOf(url: string): string | undefined {
   return urlParts(url).host;
 }
 
-/** The `reason` attribute for a failed outbound call. */
+/**
+ * The `reason` attribute for a failed outbound call.
+ *
+ * @internal
+ */
 export function failureReason(err: unknown): string {
   if (err instanceof TransportError) return err.kind === "json" ? "malformed" : err.kind;
   if (err instanceof SyntaxError) return "malformed";

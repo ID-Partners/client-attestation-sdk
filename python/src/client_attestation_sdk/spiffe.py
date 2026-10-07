@@ -15,6 +15,9 @@ same model as SPIRE. The resulting SPIFFE ID + attributes become the ``workload`
 Client Attestation (``ClientAttestationBuilder.workload(...)``), so the Authorization Server discloses
 **SPIFFE-attested** workload attributes rather than static federation metadata. Only the transport
 (in-process here, a Unix-domain Workload API socket in real SPIRE) differs.
+
+**Experimental** (see docs/api.md): this module exists only in Python. It is a stand-in for a SPIRE
+agent, for tests and demos, not a SPIFFE implementation to run in production.
 """
 from __future__ import annotations
 
@@ -23,14 +26,14 @@ from dataclasses import dataclass, field
 
 import jwt
 
-from .keys import SigningKeyPair, require_text, sign_compact
+from .keys import SigningKeyPair, _require_text, _sign_compact
 
 JWT_SVID_TYP = "JWT"  # SPIFFE JWT-SVID: `typ`, if present, MUST be "JWT" or "JOSE"
 
 
 def parse_spiffe_id(spiffe_id: str) -> tuple[str, str]:
     """Split ``spiffe://<trust-domain>/<path>`` into ``(trust_domain, path)``. Path may be empty."""
-    require_text(spiffe_id, "spiffe_id")
+    _require_text(spiffe_id, "spiffe_id")
     if not spiffe_id.startswith("spiffe://"):
         raise ValueError(f"not a SPIFFE ID (must start with spiffe://): {spiffe_id}")
     rest = spiffe_id[len("spiffe://"):]
@@ -77,7 +80,7 @@ class SpiffeAgent:
     and issues a JWT-SVID for its SPIFFE ID, alongside its attested attributes."""
 
     def __init__(self, trust_domain: str, signing_key: SigningKeyPair, entries: "list[RegistrationEntry] | None" = None):
-        self.trust_domain = require_text(trust_domain, "trust_domain")
+        self.trust_domain = _require_text(trust_domain, "trust_domain")
         self._key = signing_key
         self._entries: list[RegistrationEntry] = list(entries or [])
 
@@ -94,14 +97,14 @@ class SpiffeAgent:
     def fetch_jwt_svid(self, selectors: dict, audience: str, ttl: int = 300) -> JwtSvid:
         """Attest the workload presenting ``selectors`` and mint a JWT-SVID for ``audience``. Raises if no
         registration entry matches (the workload is not attested)."""
-        require_text(audience, "audience")
+        _require_text(audience, "audience")
         entry = next((e for e in self._entries if e.matches(selectors or {})), None)
         if entry is None:
             raise PermissionError(f"no SPIFFE registration entry matches selectors {selectors!r}")
         iat = int(time.time())
         exp = iat + ttl
         claims = {"sub": entry.spiffe_id, "aud": [audience], "iat": iat, "exp": exp}
-        token = sign_compact(claims, self._key, JWT_SVID_TYP, embed_jwk=False)
+        token = _sign_compact(claims, self._key, JWT_SVID_TYP, embed_jwk=False)
         return JwtSvid(entry.spiffe_id, token, dict(entry.attributes), audience, iat, exp)
 
     def trust_bundle(self) -> dict:

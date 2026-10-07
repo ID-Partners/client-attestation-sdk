@@ -3,8 +3,8 @@
  */
 import type { JSONWebKeySet } from "jose";
 
-/** Default accepted JWS algorithms: EC / RSA / RSA-PSS at 256/384/512. */
-export const DEFAULT_ALGORITHMS: readonly string[] = [
+/** Default accepted JWS algorithms: EC / RSA / RSA-PSS at 256/384/512. Frozen, so it can't be widened. */
+export const DEFAULT_ALGORITHMS: readonly string[] = Object.freeze([
   "ES256",
   "ES384",
   "ES512",
@@ -14,10 +14,10 @@ export const DEFAULT_ALGORITHMS: readonly string[] = [
   "PS256",
   "PS384",
   "PS512",
-];
+]);
 
 /** RFC 9068 section 2.1: a JWT access token's `typ` is `at+jwt` (the `application/` prefix is optional). */
-export const DEFAULT_TOKEN_TYPES: readonly string[] = ["at+jwt"];
+export const DEFAULT_TOKEN_TYPES: readonly string[] = Object.freeze(["at+jwt"]);
 
 /** How the resource server authenticates to the AS when introspecting. */
 export type IntrospectionAuthMethod = "client_secret_basic" | "client_secret_post";
@@ -42,6 +42,10 @@ export interface IntrospectionConfig {
  * else. `acceptedTokenTypes` is checked against the JWT `typ` header when the token carries one, so an ID
  * token can't stand in for an access token. Pass `null` to turn that check off for an issuer that stamps
  * something other than `at+jwt`.
+ *
+ * An explicitly empty `acceptedAlgorithms` or `acceptedTokenTypes` accepts nothing, and `leewaySeconds: 0`
+ * allows no clock skew: only an omitted field takes the default. `none` and the `HS*` algorithms are
+ * refused even when listed (see validation/SEMANTICS.md).
  */
 export interface ValidatorConfig {
   issuer: string;
@@ -73,15 +77,33 @@ export interface ResolvedConfig {
 }
 
 /**
+ * `none` (in any case) and the HMAC algorithms are refused whatever `acceptedAlgorithms` says: an unsigned
+ * token proves nothing, and an HMAC "signature" checked against an issuer's public key is forgeable by
+ * anyone who has that key.
+ *
+ * @internal
+ */
+export function isForbiddenAlgorithm(alg: string): boolean {
+  const lowered = alg.toLowerCase();
+  return lowered === "none" || lowered.startsWith("hs");
+}
+
+/**
  * Compare JOSE `typ` values the way RFC 7515 section 4.1.9 says to: case-insensitively, with an optional
  * `application/` prefix.
+ *
+ * @internal
  */
 export function normaliseType(value: string): string {
   const lower = value.toLowerCase();
   return lower.startsWith("application/") ? lower.slice("application/".length) : lower;
 }
 
-/** Normalize a caller-supplied config, applying defaults (mirrors Python's `ValidatorConfig`). */
+/**
+ * Normalize a caller-supplied config, applying defaults (mirrors Python's `ValidatorConfig`).
+ *
+ * @internal
+ */
 export function resolveConfig(config: ValidatorConfig): ResolvedConfig {
   if (!config.issuer) {
     throw new Error("issuer is required");

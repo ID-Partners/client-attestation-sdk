@@ -10,11 +10,12 @@
  *   - the GCP metadata server (GCE, GKE, Cloud Run, Vertex AI Agent Engine).
  *
  * {@link #autoDetect()} tries these in order and returns the first that applies, so a caller can write
- * {@code new ClientAttestation(pfHost)} and have it work without naming the source. Override by passing an
+ * {@code new ClientAttestation(attesterUrl)} and have it work without naming the source. Override by passing an
  * explicit {@link SvidSource} to {@link ClientAttestation}.
  */
 package global.idpartners.clientattestation;
 
+import global.idpartners.clientattestation.internal.HttpTransport;
 import java.net.URI;
 import java.net.http.HttpRequest;
 import java.nio.file.Files;

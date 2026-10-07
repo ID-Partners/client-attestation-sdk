@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpExchange;
+import global.idpartners.clientattestation.internal.SdkLog;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -271,16 +272,16 @@ class SdkLoggingTest {
     @Test
     void theDefaultIsSilent() {
         for (System.Logger.Level level : System.Logger.Level.values()) {
-            assertFalse(SdkLogging.NOOP.isLoggable(level));
+            assertFalse(SdkLog.NOOP.isLoggable(level));
         }
-        SdkLogging.NOOP.log(System.Logger.Level.ERROR, (ResourceBundle) null, "dropped", (Throwable) null);
-        SdkLogging.NOOP.log(System.Logger.Level.ERROR, (ResourceBundle) null, "dropped {0}", "x");
-        assertEquals(SdkLogging.LOGGER_NAME, SdkLogging.NOOP.getName());
-        assertEquals("global.idpartners.clientattestation", SdkLogging.LOGGER_NAME);
+        SdkLog.NOOP.log(System.Logger.Level.ERROR, (ResourceBundle) null, "dropped", (Throwable) null);
+        SdkLog.NOOP.log(System.Logger.Level.ERROR, (ResourceBundle) null, "dropped {0}", "x");
+        assertEquals(ClientAttestation.LOGGER_NAME, SdkLog.NOOP.getName());
+        assertEquals("global.idpartners.clientattestation", ClientAttestation.LOGGER_NAME);
         // a client with no logger configured runs the whole flow (and logs nowhere)
         assertEquals(ACCESS_TOKEN, ClientAttestation.builder(this.server.url(""))
                 .evidence(new SvidSource.Static(SVID)).build().token());
-        new SdkLogging(null).warn("http.failed", "host", "h");
+        new SdkLog(null).warn("http.failed", "host", "h");
         assertTrue(this.logger.records.isEmpty());
     }
 
@@ -288,7 +289,7 @@ class SdkLoggingTest {
     void nothingIsFormattedBelowTheConfiguredLevel() {
         RecordingLogger infoOnly = new RecordingLogger();
         infoOnly.min = System.Logger.Level.INFO;
-        SdkLogging log = new SdkLogging(infoOnly);
+        SdkLog log = new SdkLog(infoOnly);
         log.debug("token.cache_hit", "expires_in", 10);
         log.info("token.obtained", "host", "h");
         assertEquals(List.of("token.obtained"), infoOnly.events());
@@ -297,16 +298,16 @@ class SdkLoggingTest {
     @Test
     void formatDropsNullsQuotesAndRedactsJwtLookingValues() {
         assertEquals("e a=1 c=\"x y\" d=\"\" q=\"say \\\"hi\\\"\\n\"",
-                SdkLogging.format("e", "a", 1, "b", null, "c", "x y", "d", "", "q", "say \"hi\"\n"));
-        assertEquals("e v=\"<redacted:" + ACCESS_TOKEN.length() + " bytes>\"", SdkLogging.format("e", "v", ACCESS_TOKEN));
-        assertEquals("e host=pf.example.com", SdkLogging.format("e", "host", "pf.example.com"));
-        assertEquals("pf.example.com", SdkLogging.host("https://pf.example.com/x?y=1"));
-        assertEquals("pf.example.com:8443", SdkLogging.host("https://pf.example.com:8443/x"));
-        assertNull(SdkLogging.host("not a url"));
-        assertNull(SdkLogging.host("mailto:x@example.com"));
-        assertEquals("/as/token.oauth2", SdkLogging.path("https://pf.example.com/as/token.oauth2?a=b#c"));
-        assertEquals("/", SdkLogging.path("https://pf.example.com"));
-        assertNull(SdkLogging.path("not a url"));
+                SdkLog.format("e", "a", 1, "b", null, "c", "x y", "d", "", "q", "say \"hi\"\n"));
+        assertEquals("e v=\"<redacted:" + ACCESS_TOKEN.length() + " bytes>\"", SdkLog.format("e", "v", ACCESS_TOKEN));
+        assertEquals("e host=pf.example.com", SdkLog.format("e", "host", "pf.example.com"));
+        assertEquals("pf.example.com", SdkLog.host("https://pf.example.com/x?y=1"));
+        assertEquals("pf.example.com:8443", SdkLog.host("https://pf.example.com:8443/x"));
+        assertNull(SdkLog.host("not a url"));
+        assertNull(SdkLog.host("mailto:x@example.com"));
+        assertEquals("/as/token.oauth2", SdkLog.path("https://pf.example.com/as/token.oauth2?a=b#c"));
+        assertEquals("/", SdkLog.path("https://pf.example.com"));
+        assertNull(SdkLog.path("not a url"));
     }
 
     /** Records every message at every level (or from {@code min} up). */
@@ -319,7 +320,7 @@ class SdkLoggingTest {
 
         @Override
         public String getName() {
-            return SdkLogging.LOGGER_NAME;
+            return ClientAttestation.LOGGER_NAME;
         }
 
         @Override

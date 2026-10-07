@@ -16,6 +16,10 @@ conversation:
 
 Vocabulary is fixed in :mod:`.challenge` (challenge types) and :mod:`.resolver` (statuses,
 channels, assurance rungs the resolver may claim).
+
+This package is **Experimental** (see docs/api.md): it exists only in Python, and its names may change in
+any minor release. The default CIBA transport (``ciba.urllib_http``) and the ceremony code generators
+(``resolver.new_code``, ``resolver.new_handle``) are not exported here; they are internal.
 """
 from . import challenge as _challenge
 from . import ciba as _ciba
@@ -27,13 +31,13 @@ from .challenge import (
 from .ciba import (
     APPROVED, CIBA_GRANT, DENIED, EXPIRED, PENDING,
     CibaClient, CibaError, CibaRequest, ClientAuth, PrivateKeyJwtAuth,
-    private_key_jwt_assertion, urllib_http,
+    private_key_jwt_assertion,
 )
 from .resolver import (
     ASSURANCE_DEVICE_APPROVED, ASSURANCE_WEB_CONSENT, CHANNEL_DEVICE, CHANNEL_LOCAL, CHANNEL_WEB,
     TERMINAL, Ceremony, CeremonyStore, ChallengeResolver, CibaResolver, Hooks, MemoryStore,
     Pending, PollResult, ProofingResolver, Resolved, Unavailable, WebConsentResolver,
-    SUBJECT_KEY, new_code, new_handle, transaction_hash,
+    SUBJECT_KEY, transaction_hash,
 )
 
 __all__ = [
@@ -42,14 +46,14 @@ __all__ = [
     "AUTHN", "RESOURCE_AUTHORISATION", "CONSENT", "IDENTITY_PROOFING", "INTENT",
     # ciba
     "CibaClient", "CibaError", "CibaRequest", "ClientAuth", "PrivateKeyJwtAuth",
-    "private_key_jwt_assertion", "urllib_http", "CIBA_GRANT",
+    "private_key_jwt_assertion", "CIBA_GRANT",
     "PENDING", "APPROVED", "DENIED", "EXPIRED",
     # resolver
     "ChallengeResolver", "CibaResolver", "WebConsentResolver", "ProofingResolver", "Hooks",
     "Ceremony", "CeremonyStore", "MemoryStore",
     "Pending", "Resolved", "Unavailable", "PollResult",
-    "transaction_hash", "new_code", "new_handle", "SUBJECT_KEY", "TERMINAL",
+    "transaction_hash", "SUBJECT_KEY", "TERMINAL",
     "CHANNEL_DEVICE", "CHANNEL_WEB", "CHANNEL_LOCAL",
     "ASSURANCE_DEVICE_APPROVED", "ASSURANCE_WEB_CONSENT",
 ]
-__version__ = "0.3.0"
+__version__ = "1.0.0"

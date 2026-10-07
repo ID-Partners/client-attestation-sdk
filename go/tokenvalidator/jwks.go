@@ -25,8 +25,9 @@ const (
 	DefaultJWKSMaxAge     = time.Hour
 )
 
-// httpGetFunc fetches the body at url. Injectable so tests can avoid real HTTP.
-type httpGetFunc func(url string) ([]byte, error)
+// HTTPGetFunc fetches the body at url, for WithHTTPGet (JWKS fetches). The default uses net/http with
+// the SDK's timeout, no redirects and a response size cap.
+type HTTPGetFunc func(url string) ([]byte, error)
 
 // jwksProvider resolves issuer signing keys — from a static JWKS or a jwksURI
 // (fetched and cached, refreshed on an unknown kid and when the cached set
@@ -39,7 +40,7 @@ type httpGetFunc func(url string) ([]byte, error)
 type jwksProvider struct {
 	static     bool
 	jwksURI    string
-	get        httpGetFunc
+	get        HTTPGetFunc
 	minRefresh time.Duration
 	maxAge     time.Duration
 	now        func() time.Time
@@ -57,7 +58,7 @@ type jwksProvider struct {
 // newJWKSProvider builds a provider from either static raw JWKS JSON or a
 // jwksURI. The httpGet func is used for URI fetches; when nil a default
 // net/http client with a timeout is used.
-func newJWKSProvider(raw json.RawMessage, jwksURI string, httpGet httpGetFunc) (*jwksProvider, error) {
+func newJWKSProvider(raw json.RawMessage, jwksURI string, httpGet HTTPGetFunc) (*jwksProvider, error) {
 	get := httpGet
 	if get == nil {
 		get = defaultHTTPGet

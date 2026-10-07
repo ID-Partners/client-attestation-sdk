@@ -314,7 +314,9 @@ describe("validator logging", () => {
   it("logs verdicts, the JWKS fetch and a throttled refetch, and nothing secret", async () => {
     const rec = recorder();
     const validator = validatorWith(rec.logger);
-    for (const c of vectors.cases) await validator.validate(c.token);
+    // only the cases that run under the shared config and the real clock
+    const shared = vectors.cases.filter((c: { config?: unknown; now?: unknown }) => !c.config && c.now === undefined);
+    for (const c of shared) await validator.validate(c.token);
     const alg = JSON.parse(Buffer.from(tokenNamed("valid").split(".")[0], "base64url").toString("utf8")).alg;
     await validator.validate(`${b64({ alg, kid: "unknown-kid" })}.${b64({})}.c2ln`);
 
@@ -325,7 +327,7 @@ describe("validator logging", () => {
     });
     const verdicts = rec.entries.filter((e) => e.event === "token.validated");
     expect(verdicts.map((e) => e.attrs.result)).toEqual([
-      ...vectors.cases.map((c: { expect: string }) => c.expect),
+      ...shared.map((c: { expect: string }) => c.expect),
       "key_not_found",
     ]);
     expect(verdicts.every((e) => e.attrs.mode === "jwt")).toBe(true);

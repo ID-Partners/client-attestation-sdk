@@ -22,6 +22,12 @@ Deno Deploy) with no Node compatibility layer needed. Crypto, encoding and HTTP 
 nothing imports a Node built-in at load time, so the builders, the one-call `ClientAttestation` flow, the
 issuance client and the token validator all work on the edge.
 
+CI tests this in a real Workers runtime: `npm run test:edge` bundles the package as an edge bundler would
+and runs it in [`workerd`](https://github.com/cloudflare/workerd), Cloudflare's open-source Workers runtime
+(1.20261007.1, compatibility date 2026-10-01, Node compatibility switched off). It generates keys, builds an
+attestation, a PoP and a DPoP proof, and runs the token validator against the shared validation vectors.
+Vercel Edge and Deno Deploy are not tested directly.
+
 Evidence gathering is the part that needs Node. Each of these loads the built-in it needs on first use; the
 two sources throw a `ClientAttestationError` naming themselves from `fetch` on a runtime without it:
 
@@ -113,8 +119,16 @@ and the challenge response is returned instead. The token request itself retries
 - `challengeAtToken: false` keeps the attester challenge in the mint's instance proof but leaves it out
   of the token-endpoint PoP `challenge` claim / DPoP `nonce` - for attesters that consume a challenge at
   mint and reject it when the token request presents it again.
-- The PingFederate host and every endpoint the attester advertises must be `https`, except loopback
+- The attester URL and every endpoint the attester advertises must be `https`, except loopback
   (`localhost`, `127.0.0.1`, `::1`). Pass `allowInsecure: true` for, say, an in-cluster plain-http PF.
+
+### Other attesters
+
+`ClientAttestation` speaks PingFederate's discovery and mint protocol by default. For another attester,
+pass the `profile` option (your own `AttesterProfile`), or the `metadata` option to give its endpoints
+directly and skip discovery: `new ClientAttestation({ metadata: { evidenceAudience, attestationEndpoint,
+tokenEndpoint } })`. `AttestationIssuanceClient.create` takes `{ profile }` too. See
+[`docs/attester-profiles.md`](../docs/attester-profiles.md).
 
 The validator's `ProtectedResource` strips control characters from every quoted `WWW-Authenticate` value,
 and validation failures never echo the token's own `alg`, `kid`, `iss` or `aud` back in
@@ -124,5 +138,6 @@ and validation failures never echo the token's own `alg`, `kid`, `iss` or `aud` 
 
 ```bash
 npm test        # vitest — self-verifies each artifact with jose
+npm run test:edge   # the same SDK in workerd, Cloudflare's Workers runtime, with no Node compatibility
 npm run emit    # writes ../vectors/out/typescript.json for the cross-language Java verifier
 ```

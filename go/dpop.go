@@ -27,11 +27,11 @@ const maxNonceChallengeBody = 64 * 1024
 // dpopNonceChallenge matches a WWW-Authenticate value carrying a DPoP challenge with error="use_dpop_nonce".
 var dpopNonceChallenge = regexp.MustCompile(`(?i)(^|[\s,])DPoP\b.*\berror\s*=\s*"?use_dpop_nonce\b`)
 
-// NormalizeHTU returns the "htu" form of a request URL per RFC 9449 §4.2: the URL without its query and
+// normalizeHTU returns the "htu" form of a request URL per RFC 9449 §4.2: the URL without its query and
 // fragment, with the scheme and host lower-cased and a default port (443 for https, 80 for http)
 // dropped. A bare origin gets no trailing "/". A value that does not parse as an absolute URL is only
 // stripped of anything from the first '?' or '#'.
-func NormalizeHTU(target string) string {
+func normalizeHTU(target string) string {
 	u, err := url.Parse(target)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		if i := strings.IndexAny(target, "?#"); i >= 0 {

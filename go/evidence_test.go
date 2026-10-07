@@ -19,13 +19,13 @@ func isolateEvidence(t *testing.T) {
 	t.Setenv(EnvSVID, "")
 	t.Setenv(EnvTokenFile, "")
 	t.Setenv(EnvSpiffeSocket, "")
-	origTokenFile, origSocket, origProbe, origProbeURL := DefaultTokenFile, DefaultSpiffeSocket, gcpMetadataProbe, gcpMetadataProbeURL
+	origTokenFile, origSocket, origProbe, origProbeURL := defaultTokenFile, defaultSpiffeSocket, gcpMetadataProbe, gcpMetadataProbeURL
 	t.Cleanup(func() {
-		DefaultTokenFile, DefaultSpiffeSocket, gcpMetadataProbe, gcpMetadataProbeURL = origTokenFile, origSocket, origProbe, origProbeURL
+		defaultTokenFile, defaultSpiffeSocket, gcpMetadataProbe, gcpMetadataProbeURL = origTokenFile, origSocket, origProbe, origProbeURL
 	})
 	missing := filepath.Join(t.TempDir(), "missing")
-	DefaultTokenFile = missing + "-token"
-	DefaultSpiffeSocket = missing + "-sock"
+	defaultTokenFile = missing + "-token"
+	defaultSpiffeSocket = missing + "-sock"
 	gcpMetadataProbe = func() bool { return false }
 	gcpMetadataProbeURL = closedPortURL(t) + "/computeMetadata/v1/"
 }
@@ -79,7 +79,7 @@ func TestAutoDetectEachSourcePositive(t *testing.T) {
 	})
 	t.Run("default token file", func(t *testing.T) {
 		isolateEvidence(t)
-		DefaultTokenFile = writeTemp(t, "attester-token", "default-file-token")
+		defaultTokenFile = writeTemp(t, "attester-token", "default-file-token")
 		source, err := AutoDetectEvidence()
 		if err != nil {
 			t.Fatal(err)
@@ -102,12 +102,12 @@ func TestAutoDetectEachSourcePositive(t *testing.T) {
 	})
 	t.Run("default SPIRE socket", func(t *testing.T) {
 		isolateEvidence(t)
-		DefaultSpiffeSocket = writeTemp(t, "api.sock", "")
+		defaultSpiffeSocket = writeTemp(t, "api.sock", "")
 		source, err := AutoDetectEvidence()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s, ok := source.(SpireWorkloadAPISvidSource); !ok || s.SocketPath != DefaultSpiffeSocket {
+		if s, ok := source.(SpireWorkloadAPISvidSource); !ok || s.SocketPath != defaultSpiffeSocket {
 			t.Fatalf("source = %#v", source)
 		}
 	})
@@ -137,9 +137,9 @@ func TestAutoDetectPrecedenceChain(t *testing.T) {
 	isolateEvidence(t)
 	// Every source present at once; peel them off one at a time and check the next one wins.
 	envFile := writeTemp(t, "env-tok", "from-env-file")
-	DefaultTokenFile = writeTemp(t, "default-tok", "from-default-file")
+	defaultTokenFile = writeTemp(t, "default-tok", "from-default-file")
 	envSock := writeTemp(t, "env.sock", "")
-	DefaultSpiffeSocket = writeTemp(t, "default.sock", "")
+	defaultSpiffeSocket = writeTemp(t, "default.sock", "")
 	gcpMetadataProbe = gcpMetadataAvailable
 	gcpMetadataProbeURL = fakeMetadataServer(t).URL + "/"
 	t.Setenv(EnvSVID, "from-env")
@@ -174,12 +174,12 @@ func TestAutoDetectPrecedenceChain(t *testing.T) {
 	t.Setenv(EnvSVID, "")
 	check("file:" + envFile)
 	t.Setenv(EnvTokenFile, "")
-	check("file:" + DefaultTokenFile)
-	DefaultTokenFile += "-gone"
+	check("file:" + defaultTokenFile)
+	defaultTokenFile += "-gone"
 	check("spire:" + envSock)
 	t.Setenv(EnvSpiffeSocket, "")
-	check("spire:" + DefaultSpiffeSocket)
-	DefaultSpiffeSocket += "-gone"
+	check("spire:" + defaultSpiffeSocket)
+	defaultSpiffeSocket += "-gone"
 	check("gcp")
 }
 

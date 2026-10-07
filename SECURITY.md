@@ -13,12 +13,12 @@ you in the advisory unless you'd rather we didn't.
 
 ## Supported versions
 
-The SDK is pre-1.0. Fixes land on the latest minor release only.
+Security fixes land on the latest 1.x minor release, as a patch release.
 
 | Version | Supported |
 |---|---|
-| 0.2.x | Yes |
-| 0.1.x | No - it predates the one-call API and the fixes listed in the changelog |
+| 1.x | Yes |
+| 0.x | No - pre-1.0 releases get no fixes. Upgrade to 1.x; the changelog lists every break |
 
 ## What counts
 

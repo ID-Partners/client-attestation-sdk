@@ -14,11 +14,18 @@
 import { TransportError } from "./errors.js";
 import { utf8Decode, utf8Encode } from "./runtime.js";
 
+/** @internal */
 export const DEFAULT_MAX_BYTES = 1024 * 1024;
+/** @internal */
 export const DEFAULT_TIMEOUT_MS = 20_000;
-/** At most this many characters of a response body are carried in an error. */
+/**
+ * At most this many characters of a response body are carried in an error.
+ *
+ * @internal
+ */
 export const ERROR_BODY_CHARS = 512;
 
+/** @internal */
 export interface HttpRequestOptions {
   method?: string;
   headers?: Record<string, string>;
@@ -29,6 +36,7 @@ export interface HttpRequestOptions {
   maxBytes?: number;
 }
 
+/** @internal */
 export interface HttpResponse {
   method: string;
   url: string;
@@ -38,7 +46,11 @@ export interface HttpResponse {
   body: string;
 }
 
-/** The first {@link ERROR_BODY_CHARS} characters of a body, for an error message. */
+/**
+ * The first {@link ERROR_BODY_CHARS} characters of a body, for an error message.
+ *
+ * @internal
+ */
 export function snippet(body: string): string {
   return body.length > ERROR_BODY_CHARS ? body.slice(0, ERROR_BODY_CHARS) : body;
 }
@@ -56,6 +68,8 @@ function isAbort(err: unknown): boolean {
  * Make one HTTP request. Resolves with the status, headers and body text for any non-3xx response
  * (non-2xx included); rejects with a {@link TransportError} for a network failure, timeout, redirect or
  * oversized body.
+ *
+ * @internal
  */
 export async function request(url: string, opts: HttpRequestOptions = {}): Promise<HttpResponse> {
   const method = opts.method ?? "GET";
@@ -155,6 +169,8 @@ async function readCapped(res: Response, maxBytes: number, tooLarge: () => Trans
  * Parse `res.body` as a JSON object. Throws a {@link TransportError} for a non-2xx status (carrying the
  * status and at most 512 characters of the body) and for a body that is not a JSON object. An empty body
  * reads as `{}` when `allowEmpty` is set.
+ *
+ * @internal
  */
 export function jsonOk<T = Record<string, unknown>>(res: HttpResponse, opts: { allowEmpty?: boolean } = {}): T {
   if (!res.ok) {
@@ -167,7 +183,11 @@ export function jsonOk<T = Record<string, unknown>>(res: HttpResponse, opts: { a
   return parseJsonObject<T>(res, opts);
 }
 
-/** Parse `res.body` as a JSON object regardless of status; a {@link TransportError} if it is not one. */
+/**
+ * Parse `res.body` as a JSON object regardless of status; a {@link TransportError} if it is not one.
+ *
+ * @internal
+ */
 export function parseJsonObject<T = Record<string, unknown>>(
   res: HttpResponse,
   opts: { allowEmpty?: boolean } = {},

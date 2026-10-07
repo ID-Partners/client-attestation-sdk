@@ -6,7 +6,7 @@ export default defineConfig({
       provider: "v8",
       include: ["src/**"],
       // today's measured coverage; raise these, never lower them
-      thresholds: { lines: 97, statements: 97, functions: 99, branches: 95 },
+      thresholds: { lines: 99, statements: 98, functions: 99, branches: 95 },
     },
   },
 });

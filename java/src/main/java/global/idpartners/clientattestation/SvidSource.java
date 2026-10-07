@@ -4,13 +4,14 @@
  */
 package global.idpartners.clientattestation;
 
+import global.idpartners.clientattestation.internal.HttpTransport;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -50,6 +51,9 @@ public interface SvidSource {
      * <p>For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
      * authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
      * file or cloud source.
+      *
+      * <p><b>Experimental</b> (see docs/api.md): a development and test source with no caller
+      * authentication.
      */
     final class Http implements SvidSource {
         static final Duration TIMEOUT = Duration.ofSeconds(20);
@@ -149,6 +153,9 @@ public interface SvidSource {
      * <p>The subprocess is bounded: if {@code spire-agent} has not exited within the timeout (default 30s)
      * it is killed and {@link IllegalStateException} is thrown. Its output (stderr merged into stdout) is
      * drained on a separate thread, capped at 1 MiB, so a chatty or hung agent cannot block the wait.
+      *
+      * <p><b>Experimental</b> (see docs/api.md): it shells out to the spire-agent CLI, and its constructor
+      * will change when it moves to the Workload API socket.
      */
     final class SpireWorkloadApi implements SvidSource {
         static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);

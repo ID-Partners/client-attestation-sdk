@@ -441,7 +441,7 @@ func TestRequestHeadersPropagatesTokenErrors(t *testing.T) {
 	}
 }
 
-func TestNormalizeHTU(t *testing.T) {
+func TestNormalizeHTUForm(t *testing.T) {
 	cases := map[string]string{
 		"https://Example.COM/a/b?x=1#f": "https://example.com/a/b",
 		"HTTP://h:8080/p":               "http://h:8080/p",
@@ -456,8 +456,8 @@ func TestNormalizeHTU(t *testing.T) {
 		"https://[::1]:8443/p?q":        "https://[::1]:8443/p",
 	}
 	for in, want := range cases {
-		if got := NormalizeHTU(in); got != want {
-			t.Errorf("NormalizeHTU(%q) = %q, want %q", in, got, want)
+		if got := normalizeHTU(in); got != want {
+			t.Errorf("normalizeHTU(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

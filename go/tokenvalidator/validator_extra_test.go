@@ -270,7 +270,7 @@ func TestMalformedClaimsPayload(t *testing.T) {
 	}
 	token := signPayload(t, key, []byte("not-json"))
 	r := val.Validate(token, nil)
-	if r.Valid || r.Error != ErrInvalidToken || !strings.Contains(r.ErrorDescription, "malformed claims") {
+	if r.Valid || r.Error != ErrInvalidToken || !strings.Contains(r.ErrorDescription, "payload is not JSON") {
 		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
 	}
 }
@@ -306,8 +306,8 @@ func TestIntrospectWithoutConfiguration(t *testing.T) {
 	if _, err := val.Introspect("tok"); err == nil {
 		t.Error("expected an error with no introspection endpoint")
 	}
-	if r := val.ValidateActive("tok", nil); r.Valid || r.Error != ErrInvalidToken {
-		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
+	if _, err := val.ValidateActive("tok", nil); err == nil {
+		t.Error("ValidateActive with no introspection endpoint: expected an error, not a verdict")
 	}
 }
 
@@ -318,7 +318,7 @@ func TestIntrospectionClientSecretPost(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"active":true,"scp":["read",5],"aud":["https://rs.test",7]}`)
+		io.WriteString(w, `{"active":true,"scp":["read"],"aud":["https://rs.test"]}`)
 	}))
 	defer srv.Close()
 
@@ -332,8 +332,8 @@ func TestIntrospectionClientSecretPost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := val.ValidateActive("opaque", []string{"read"})
-	if !r.Valid {
+	r, err := val.ValidateActive("opaque", []string{"read"})
+	if err != nil || !r.Valid {
 		t.Fatalf("expected valid, got %s: %s", r.Error, r.ErrorDescription)
 	}
 	if gotAuth != "" {
@@ -343,10 +343,10 @@ func TestIntrospectionClientSecretPost(t *testing.T) {
 		t.Errorf("body = %q", gotBody)
 	}
 	if len(r.Scopes) != 1 || r.Scopes[0] != "read" {
-		t.Errorf("scopes = %v (non-string scp entries must be dropped)", r.Scopes)
+		t.Errorf("scopes = %v", r.Scopes)
 	}
 	if len(r.Audience) != 1 || r.Audience[0] != "https://rs.test" {
-		t.Errorf("audience = %v (non-string aud entries must be dropped)", r.Audience)
+		t.Errorf("audience = %v", r.Audience)
 	}
 }
 
@@ -360,8 +360,8 @@ func TestValidateActiveInsufficientScopeViaConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := val.ValidateActive("opaque", nil)
-	if r.Valid || r.Error != ErrInsufficientScope {
+	r, err := val.ValidateActive("opaque", nil)
+	if err != nil || r.Valid || r.Error != ErrInsufficientScope {
 		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
 	}
 }
@@ -376,8 +376,8 @@ func TestValidateActiveWrongAudience(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := val.ValidateActive("opaque", nil)
-	if r.Valid || r.Error != ErrInvalidAudience {
+	r, err := val.ValidateActive("opaque", nil)
+	if err != nil || r.Valid || r.Error != ErrInvalidAudience {
 		t.Errorf("got valid=%v error=%s", r.Valid, r.Error)
 	}
 }
@@ -419,26 +419,17 @@ func TestDefaultHTTPPostErrors(t *testing.T) {
 }
 
 func TestClaimHelperTypeBranches(t *testing.T) {
-	if v, ok := toInt64(json.Number("42")); !ok || v != 42 {
-		t.Errorf("toInt64(json.Number) = %v, %v", v, ok)
+	if got, err := scopesOf(map[string]any{}); err != nil || len(got) != 0 {
+		t.Errorf("scopesOf(missing) = %v, %v", got, err)
 	}
-	if v, ok := toInt64(int64(7)); !ok || v != 7 {
-		t.Errorf("toInt64(int64) = %v, %v", v, ok)
-	}
-	if v, ok := toInt64(3); !ok || v != 3 {
-		t.Errorf("toInt64(int) = %v, %v", v, ok)
-	}
-	if _, ok := toInt64("x"); ok {
-		t.Error("toInt64(string) must not convert")
-	}
-	if got := scopesFromClaims(map[string]any{}); got != nil {
-		t.Errorf("scopesFromClaims(missing) = %v", got)
-	}
-	if got := audienceList(42); got != nil {
-		t.Errorf("audienceList(default) = %v", got)
+	if _, err := audienceOf(map[string]any{"aud": 42}); err == nil {
+		t.Error("audienceOf(number) must fail")
 	}
 	if got := stringClaim(map[string]any{"sub": 5}, "sub"); got != "" {
 		t.Errorf("stringClaim(non-string) = %q", got)
+	}
+	if got := intClaim(map[string]any{"exp": "soon"}, "exp"); got != 0 {
+		t.Errorf("intClaim(non-number) = %d", got)
 	}
 }
 

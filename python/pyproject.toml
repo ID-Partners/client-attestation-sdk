@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "client-attestation-sdk"
-version = "0.3.0"
+version = "1.0.0"
 description = "Client-side builder SDK for OAuth Attestation-Based Client Authentication"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "ID Partners Pty Ltd" }]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -52,4 +52,4 @@ source = ["client_attestation_sdk"]
 
 [tool.coverage.report]
 # today's measured coverage; raise it, never lower it
-fail_under = 94
+fail_under = 95

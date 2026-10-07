@@ -1,7 +1,7 @@
 /*
  * One call to get an access token with client attestation.
  *
- * Point it at a PingFederate host and call {@link #token()}. It runs the whole flow:
+ * Point it at an attester (PingFederate by default) and call {@link #token()}. It runs the whole flow:
  *
  *   discover -> get platform identity (evidence) -> get a challenge -> mint the attestation ->
  *   call the token endpoint with the attestation headers -> cache the access token
@@ -11,6 +11,8 @@
  */
 package global.idpartners.clientattestation;
 
+import global.idpartners.clientattestation.internal.HttpTransport;
+import global.idpartners.clientattestation.internal.SdkLog;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -19,22 +21,22 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.LinkedHashMap;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 import org.jose4j.json.JsonUtil;
 
 /**
- * Gets and caches an access token from a PingFederate host using client attestation — the whole flow in
- * one call, no client secret and no {@code client_id} sent.
+ * Gets and caches an access token using client attestation — the whole flow in one call, no client secret
+ * and no {@code client_id} sent. The attester-specific steps (discovery and the mint request) belong to an
+ * {@link AttesterProfile}, by default {@link PingFederateProfile}; see docs/attester-profiles.md.
  *
  * <pre>{@code
  * ClientAttestation ca = new ClientAttestation("pf.example.com");
@@ -49,7 +51,7 @@ import org.jose4j.json.JsonUtil;
  * }</pre>
  *
  * <p>Fails closed: when the attester advertises a {@code challenge_endpoint} and the challenge cannot be
- * fetched, the flow fails (opt out with {@link Builder#requireChallenge(boolean)}); and the host and every
+ * fetched, the flow fails (opt out with {@link Builder#requireChallenge(boolean)}); and the attester URL and every
  * endpoint taken from discovery must be https unless the host is loopback or
  * {@link Builder#allowInsecure(boolean)} is set.
  */
@@ -58,12 +60,18 @@ public final class ClientAttestation {
     /** draft-ietf-oauth-attestation-based-client-auth revision this SDK implements. */
     public static final String DRAFT_REVISION = "10";
 
+    /**
+     * The SDK's logger name, for {@code System.getLogger(ClientAttestation.LOGGER_NAME)}: pass the result to
+     * {@link Builder#logger(System.Logger)} or {@code AccessTokenValidator.Builder#logger}.
+     */
+    public static final String LOGGER_NAME = "global.idpartners.clientattestation";
+
     static final String ATTESTATION_HEADER = "OAuth-Client-Attestation";
     static final String POP_HEADER = "OAuth-Client-Attestation-PoP";
     static final String DPOP_HEADER = "DPoP";
     static final String DPOP_NONCE_HEADER = "DPoP-Nonce";
-    static final String INSTANCE_PROOF_TYP = "oauth-attestation-instance-proof+jwt";
-    static final String WELL_KNOWN_PATH = "/.well-known/client-attester";
+    static final String INSTANCE_PROOF_TYP = PingFederateProfile.INSTANCE_PROOF_TYP;
+    static final String WELL_KNOWN_PATH = PingFederateProfile.WELL_KNOWN_PATH;
     /** Default PoP method: a dedicated {@code OAuth-Client-Attestation-PoP} JWT. */
     static final String DEFAULT_POP_METHOD = "attestation_pop_jwt";
     /** PoP method that sends a single DPoP proof (RFC 9449) instead of a separate PoP JWT. */
@@ -71,11 +79,15 @@ public final class ClientAttestation {
     /** Refresh this many seconds before the token actually expires, so a token is never used at the edge. */
     static final int DEFAULT_EXPIRY_SKEW_SECONDS = 30;
 
+    /** What the https check calls the URL a profile's call goes to, by step. */
+    private static final Map<String, String> STEP_LABELS = Map.of(
+            "discover", "attester_url", "mint", "attestation_endpoint", "challenge", "challenge_endpoint");
     private static final Set<String> LOOPBACK_HOSTS = Set.of("localhost", "127.0.0.1", "::1", "[::1]");
     private static final Pattern DPOP_SCHEME = Pattern.compile("(?i)(?:^|[,\\s])DPoP(?:\\s|,|$)");
     private static final Pattern USE_DPOP_NONCE = Pattern.compile("(?i)error\\s*=\\s*\"?use_dpop_nonce\\b");
 
-    private final String baseUrl;
+    private final String baseUrl;                            // null => built from static metadata alone
+    private final AttesterProfile profile;
     private final SvidSource evidence;                       // null => auto-detect at flow time
     private final List<Map<String, Object>> authorizationDetails;
     private final Map<String, Object> operator;              // null/empty => not sent
@@ -87,28 +99,33 @@ public final class ClientAttestation {
     private final boolean requireChallenge;
     private final boolean allowInsecure;
     private final HttpClient http;
-    private final SdkLogging log;
+    private final SdkLog log;
 
     private final Object lock = new Object();
     private String cachedToken;
     private String cachedTokenType;
     private SigningKeyPair cachedKey;                        // the instance key bound to cachedToken
     private long expiresAt;                                  // epoch seconds; 0 => no cache
-    private Map<String, Object> discovery;
+    private AttesterMetadata metadata;                       // static, or discovered once
     /** Last {@code DPoP-Nonce} each resource origin returned. */
     private final Map<String, String> dpopNonces = new ConcurrentHashMap<>();
 
     /**
-     * @param pfHost the PingFederate host — {@code "pf.example.com"}, or a full base URL
-     *               {@code "https://pf.example.com"}. Plain hostnames default to https.
+     * A client for the attester at {@code attesterUrl}, with the default {@link PingFederateProfile}.
+     *
+     * @param attesterUrl the attester's host — {@code "pf.example.com"}, or a full base URL
+     *                    {@code "https://pf.example.com"}. Plain hostnames default to https.
      * @throws ClientAttestationException if the host is not https and not loopback
      */
-    public ClientAttestation(String pfHost) {
-        this(new Builder(pfHost));
+    public ClientAttestation(String attesterUrl) {
+        this(new Builder(attesterUrl));
     }
 
     private ClientAttestation(Builder b) {
-        this.baseUrl = normalizeBaseUrl(b.pfHost);
+        this.profile = b.profile != null ? b.profile : new PingFederateProfile();
+        this.metadata = b.metadata;
+        this.baseUrl = b.attesterUrl == null && (b.metadata != null || b.profile != null)
+                ? null : normalizeBaseUrl(b.attesterUrl);
         this.evidence = b.evidence;
         this.authorizationDetails = b.authorizationDetails;
         this.operator = b.operator;
@@ -119,13 +136,31 @@ public final class ClientAttestation {
         this.timeout = b.timeout;
         this.requireChallenge = b.requireChallenge;
         this.allowInsecure = b.allowInsecure;
-        this.log = new SdkLogging(b.logger);
-        requireSecure(this.baseUrl, "pf_host", this.allowInsecure);
+        this.log = new SdkLog(b.logger);
+        if (this.baseUrl != null) {
+            requireSecure(this.baseUrl, "attester_url", this.allowInsecure);
+        }
         this.http = HttpTransport.client(b.timeout);
     }
 
-    public static Builder builder(String pfHost) {
-        return new Builder(pfHost);
+    /**
+     * Options for a client of the attester at {@code attesterUrl}.
+     *
+     * @param attesterUrl the attester's host or base URL
+     * @return the builder
+     */
+    public static Builder builder(String attesterUrl) {
+        return new Builder(attesterUrl);
+    }
+
+    /**
+     * Options for a client with no attester URL yet: set one with {@link Builder#attesterUrl(String)}, or give
+     * static {@link Builder#metadata(AttesterMetadata)} or a custom {@link Builder#profile(AttesterProfile)}.
+     *
+     * @return the builder
+     */
+    public static Builder builder() {
+        return new Builder();
     }
 
     // ── public API ──────────────────────────────────────────────────────────────────────────────────
@@ -221,23 +256,51 @@ public final class ClientAttestation {
         if (!isNonceChallenge(response.statusCode(), response.headers(), bodyText(response.body()))) {
             return response;
         }
-        this.log.info("dpop.nonce_retry", "host", SdkLogging.host(uri.toString()), "status", response.statusCode(),
+        this.log.info("dpop.nonce_retry", "host", SdkLog.host(uri.toString()), "status", response.statusCode(),
                 "at", "resource");
         return client.send(authorize(base.copy(), method, uri).build(), handler);
     }
 
-    /** The attester's {@code /.well-known/client-attester} document (fetched once, then cached). */
+    /**
+     * The attester's discovery document (for the PingFederate profile, {@code /.well-known/client-attester}),
+     * fetched once and then cached. With static metadata, the fields that were given.
+     *
+     * @return the document
+     * @throws Exception if discovery fails
+     */
     public Map<String, Object> discovery() throws Exception {
+        return attesterMetadata().asDocument();
+    }
+
+    /**
+     * The attester's endpoints: the static metadata, or what the profile discovered (once, then cached).
+     *
+     * @return the metadata
+     * @throws Exception if discovery fails
+     */
+    public AttesterMetadata attesterMetadata() throws Exception {
         synchronized (this.lock) {
-            String url = this.baseUrl + WELL_KNOWN_PATH;
-            if (this.discovery == null) {
-                this.discovery = getJson("discover", "GET", url, null);
-                this.log.debug("discovery.fetched", "host", SdkLogging.host(url));
+            String host = this.baseUrl != null ? SdkLog.host(this.baseUrl) : null;
+            if (this.metadata == null) {
+                AttesterMetadata discovered = this.profile.discover(transport(), this.baseUrl);
+                if (discovered == null) {
+                    throw new ClientAttestationException("attester profile returned no metadata");
+                }
+                this.metadata = discovered;
+                this.log.debug("discovery.fetched", "host", host);
             } else {
-                this.log.debug("discovery.cached", "host", SdkLogging.host(url));
+                this.log.debug("discovery.cached", "host", host);
             }
-            return this.discovery;
+            return this.metadata;
         }
+    }
+
+    /** The transport handed to the profile: this client's https rule, timeout and logging. */
+    private AttesterTransport transport() {
+        return (step, method, url, body) -> {
+            requireSecure(url, STEP_LABELS.getOrDefault(step, step + " URL"), this.allowInsecure);
+            return getJson(step, method, url, body);
+        };
     }
 
     // ── the token cache ─────────────────────────────────────────────────────────────────────────────
@@ -284,7 +347,7 @@ public final class ClientAttestation {
             this.expiresAt = expiresIn instanceof Number
                     ? System.currentTimeMillis() / 1000L + ((Number) expiresIn).longValue() - this.skewSeconds
                     : 0L;
-            this.log.info("token.obtained", "host", SdkLogging.host(minted.tokenEndpoint()),
+            this.log.info("token.obtained", "host", SdkLog.host(minted.tokenEndpoint()),
                     "client_id", minted.clientId(), "token_type", this.cachedTokenType,
                     "expires_in", expiresIn instanceof Number ? ((Number) expiresIn).longValue() : null,
                     "pop_method", this.popMethod);
@@ -295,9 +358,9 @@ public final class ClientAttestation {
     // ── the flow ────────────────────────────────────────────────────────────────────────────────────
 
     private Minted runFlow() throws Exception {
-        Map<String, Object> doc = discovery();
-        String audience = optString(doc, "evidence_audience", null);
-        if (audience == null) {
+        AttesterMetadata meta = attesterMetadata();
+        String audience = meta.evidenceAudience();
+        if (audience == null || audience.isBlank()) {
             throw new ClientAttestationException("attester discovery document has no evidence_audience");
         }
 
@@ -306,19 +369,29 @@ public final class ClientAttestation {
         this.log.debug("evidence.obtained", "source", evidenceSource.getClass().getSimpleName());
 
         SigningKeyPair instanceKey = SigningKeyPair.generate(this.algorithm);
-        String challenge = fetchChallenge(doc);
-        String attestation = mint(doc, instanceKey, svid, challenge);
+        String challenge = fetchChallenge(meta.challengeEndpoint());
+        MintResult minted = this.profile.mint(transport(), meta, new MintRequest(instanceKey, svid, challenge, null,
+                this.authorizationDetails, this.operator));
+        if (minted == null || minted.attestation() == null || minted.attestation().isBlank()) {
+            throw new ClientAttestationException("attester response contained no attestation");
+        }
+        String attestation = minted.attestation();
 
-        // token_endpoint is advertised by current attesters; fall back to the standard PF path so an older
-        // discovery document still works from the host alone.
-        String tokenEndpoint = optString(doc, "token_endpoint", this.baseUrl + "/as/token.oauth2");
+        // The profile resolves the token endpoint (PingFederate: the advertised one, else the standard path on
+        // the attester host).
+        String tokenEndpoint = meta.tokenEndpoint();
+        if (tokenEndpoint == null || tokenEndpoint.isBlank()) {
+            throw new ClientAttestationException("attester metadata has no token_endpoint");
+        }
         requireSecure(tokenEndpoint, "token_endpoint", this.allowInsecure);
         String clientId = jwtSub(attestation);
-        this.log.debug("attestation.minted", "host", SdkLogging.host(optString(doc, "attestation_endpoint", "")),
+        this.log.debug("attestation.minted", "host", SdkLog.host(
+                meta.attestationEndpoint() != null ? meta.attestationEndpoint() : ""),
                 "client_id", clientId, "alg", this.algorithm);
         // The PoP audience must be PF's configured issuer, which the attester advertises as pop_audience.
         // Falling back to the token endpoint URL only works when the dialed URL matches PF's issuer.
-        String popAudience = optString(doc, "pop_audience", tokenEndpoint);
+        String popAudience = meta.popAudience() != null && !meta.popAudience().isBlank()
+                ? meta.popAudience() : tokenEndpoint;
         // See Builder#challengeAtToken: some attesters consume the challenge the moment the mint's instance
         // proof uses it, and reject a token request that presents the same value a second time. Against one
         // of those, only the mint gets the challenge.
@@ -340,9 +413,8 @@ public final class ClientAttestation {
         return new Minted(response, instanceKey, tokenEndpoint, clientId);
     }
 
-    private String fetchChallenge(Map<String, Object> doc) {
-        String endpoint = optString(doc, "challenge_endpoint", null);
-        if (endpoint == null) {
+    private String fetchChallenge(String endpoint) {
+        if (endpoint == null || endpoint.isBlank()) {
             return null;      // the attester does not issue challenges
         }
         requireSecure(endpoint, "challenge_endpoint", this.allowInsecure);
@@ -353,11 +425,11 @@ public final class ClientAttestation {
                 throw new ClientAttestationException("challenge endpoint returned no attestation_challenge", 200,
                         JsonUtil.toJson(body));
             }
-            this.log.debug("challenge.fetched", "host", SdkLogging.host(endpoint));
+            this.log.debug("challenge.fetched", "host", SdkLog.host(endpoint));
             return challenge;
         } catch (Exception e) {
             if (!this.requireChallenge) {
-                this.log.warn("challenge.skipped", "host", SdkLogging.host(endpoint));
+                this.log.warn("challenge.skipped", "host", SdkLog.host(endpoint));
                 return null;  // opted out: proceed without a challenge, as before
             }
             int status = e instanceof ClientAttestationException ? ((ClientAttestationException) e).status() : 0;
@@ -366,48 +438,6 @@ public final class ClientAttestation {
                     + " but the challenge could not be fetched (" + e.getMessage()
                     + "); set requireChallenge(false) to proceed without one", status, body, e);
         }
-    }
-
-    private String mint(Map<String, Object> doc, SigningKeyPair instanceKey, String svid, String challenge)
-            throws Exception {
-        long now = System.currentTimeMillis() / 1000L;
-        Map<String, Object> proofClaims = new LinkedHashMap<>();
-        proofClaims.put("aud", doc.get("evidence_audience"));
-        proofClaims.put("jti", UUID.randomUUID().toString());
-        proofClaims.put("iat", now);
-        if (challenge != null && !challenge.isBlank()) {
-            proofClaims.put("challenge", challenge);
-        }
-        String proof = Jws.sign(JsonUtil.toJson(proofClaims), instanceKey, INSTANCE_PROOF_TYP, false);
-
-        // Evidence-first: no client_id. The attester maps the identity to a client.
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("instance_key", instanceKey.publicJwk());
-        body.put("svid", svid);
-        body.put("proof", proof);
-        if (this.authorizationDetails != null && !this.authorizationDetails.isEmpty()) {
-            body.put("authorization_details", this.authorizationDetails);
-        }
-        if (this.operator != null && !this.operator.isEmpty()) {
-            // The client's OPERATOR (who answers for this workload), asked for at mint time so the ATTESTER is
-            // what states it, rather than the client asserting it about itself at the token endpoint. An
-            // attester that does not know this key ignores it; one that does can refuse to name an operator
-            // it cannot corroborate.
-            body.put("operator", this.operator);
-        }
-
-        String attestationEndpoint = optString(doc, "attestation_endpoint", null);
-        if (attestationEndpoint == null) {
-            throw new ClientAttestationException("attester discovery document has no attestation_endpoint");
-        }
-        requireSecure(attestationEndpoint, "attestation_endpoint", this.allowInsecure);
-        Map<String, Object> response = getJson("mint", "POST", attestationEndpoint, body);
-        Object attestation = response.get("attestation");
-        if (attestation == null) {
-            throw new ClientAttestationException("attester response contained no attestation",
-                    0, JsonUtil.toJson(response));
-        }
-        return String.valueOf(attestation);
     }
 
     /**
@@ -422,7 +452,7 @@ public final class ClientAttestation {
                 proofHeaderName, proofForNonce.apply(nonce), form));
         if (dpop && isNonceChallenge(resp.status(), resp.headers(), resp.body())) {
             String serverNonce = resp.headers().firstValue(DPOP_NONCE_HEADER).orElseThrow();
-            this.log.info("dpop.nonce_retry", "host", SdkLogging.host(endpoint), "status", resp.status(),
+            this.log.info("dpop.nonce_retry", "host", SdkLog.host(endpoint), "status", resp.status(),
                     "at", "token_endpoint");
             resp = send("token", "POST", endpoint, tokenRequest(endpoint, attestation, proofHeaderName, proofForNonce.apply(serverNonce),
                     form));
@@ -546,8 +576,8 @@ public final class ClientAttestation {
     }
 
     private void httpFailed(String step, String method, String url, int status, String reason) {
-        this.log.warn("http.failed", "step", step, "method", method, "host", SdkLogging.host(url),
-                "path", SdkLogging.path(url), "status", status > 0 ? status : null, "reason", reason);
+        this.log.warn("http.failed", "step", step, "method", method, "host", SdkLog.host(url),
+                "path", SdkLog.path(url), "status", status > 0 ? status : null, "reason", reason);
     }
 
     /** The {@code reason} attribute for a transport failure (see docs/logging.md). */
@@ -641,13 +671,13 @@ public final class ClientAttestation {
 
     // ── helpers ─────────────────────────────────────────────────────────────────────────────────────
 
-    static String normalizeBaseUrl(String pfHost) {
-        if (pfHost == null) {
-            throw new IllegalArgumentException("pfHost is required");
+    static String normalizeBaseUrl(String attesterUrl) {
+        if (attesterUrl == null) {
+            throw new IllegalArgumentException("attesterUrl is required");
         }
-        String host = pfHost.strip().replaceAll("/+$", "");
+        String host = attesterUrl.strip().replaceAll("/+$", "");
         if (host.isEmpty()) {
-            throw new IllegalArgumentException("pfHost is required");
+            throw new IllegalArgumentException("attesterUrl is required");
         }
         if (!host.contains("://")) {
             host = "https://" + host;
@@ -720,7 +750,9 @@ public final class ClientAttestation {
 
     /** Options for {@link ClientAttestation}. */
     public static final class Builder {
-        private final String pfHost;
+        private String attesterUrl;
+        private AttesterProfile profile;
+        private AttesterMetadata metadata;
         private SvidSource evidence;
         private List<Map<String, Object>> authorizationDetails;
         private Map<String, Object> operator;
@@ -733,8 +765,53 @@ public final class ClientAttestation {
         private boolean allowInsecure;
         private System.Logger logger;
 
-        public Builder(String pfHost) {
-            this.pfHost = pfHost;
+        /**
+         * Options for a client of the attester at {@code attesterUrl}.
+         *
+         * @param attesterUrl the attester's host or base URL
+         */
+        public Builder(String attesterUrl) {
+            this.attesterUrl = attesterUrl;
+        }
+
+        /** Options with no attester URL yet. */
+        public Builder() {
+        }
+
+        /**
+         * The attester's host or base URL. Optional when {@link #metadata(AttesterMetadata)} or a custom
+         * {@link #profile(AttesterProfile)} is given.
+         *
+         * @param attesterUrl the attester's host or base URL
+         * @return this builder
+         */
+        public Builder attesterUrl(String attesterUrl) {
+            this.attesterUrl = attesterUrl;
+            return this;
+        }
+
+        /**
+         * The attester profile that discovers the attester and mints the attestation. Default
+         * {@link PingFederateProfile}, the behaviour of every earlier release.
+         *
+         * @param profile the profile
+         * @return this builder
+         */
+        public Builder profile(AttesterProfile profile) {
+            this.profile = profile;
+            return this;
+        }
+
+        /**
+         * Static attester metadata, for an attester that publishes no discovery document: no discovery request
+         * is made, and the profile still mints.
+         *
+         * @param metadata the evidence audience and endpoints
+         * @return this builder
+         */
+        public Builder metadata(AttesterMetadata metadata) {
+            this.metadata = metadata;
+            return this;
         }
 
         /** Override how the workload's platform identity (evidence) is obtained. Default: auto-detect. */
@@ -823,7 +900,7 @@ public final class ClientAttestation {
 
         /**
          * Where the SDK logs what it does (discovery, minting, the token endpoint, DPoP nonce retries, HTTP
-         * failures). Default: nothing is logged. Pass {@code System.getLogger(SdkLogging.LOGGER_NAME)} to
+         * failures). Default: nothing is logged. Pass {@code System.getLogger(ClientAttestation.LOGGER_NAME)} to
          * route through {@code java.util.logging} or whatever {@link System.LoggerFinder} is installed.
          * Tokens, attestations, proofs, SVIDs and key material are never logged. Events and attributes are
          * listed in docs/logging.md.

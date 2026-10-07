@@ -1,6 +1,6 @@
 """One call to get an access token with client attestation.
 
-Point it at a PingFederate host and call `.token()`. It runs the whole flow:
+Point it at an attester (PingFederate by default) and call `.token()`. It runs the whole flow:
 
     discover -> get platform identity (evidence) -> get a challenge -> mint the attestation ->
     call the token endpoint with the attestation headers -> cache the access token
@@ -29,27 +29,30 @@ import shlex
 import threading
 import time
 import urllib.parse
-import uuid
 
 from . import _http, _log
+from .attester import AttesterMetadata, AttesterProfile, MintRequest, PingFederateProfile
 from ._redact import PRIVATE_JWK_MEMBERS as _PRIVATE_JWK_MEMBERS  # noqa: F401 - kept importable
 from ._redact import SECRET_FIELDS as _SECRET_FIELDS  # noqa: F401 - kept importable
 from ._redact import redact_json as _redact_json, redacted as _redacted
-from .builders import DpopProofBuilder, PopBuilder, url_origin as _origin
+from .builders import DpopProofBuilder, PopBuilder, _url_origin as _origin
 from .errors import ClientAttestationError, TransportError  # noqa: F401 - re-exported
 from .evidence import auto_detect_evidence
-from .keys import SigningKeyPair, sign_compact
+from .keys import SigningKeyPair
 from .svid_source import SvidSource
 
 ATTESTATION_HEADER = "OAuth-Client-Attestation"
 POP_HEADER = "OAuth-Client-Attestation-PoP"
 DPOP_HEADER = "DPoP"
-INSTANCE_PROOF_TYP = "oauth-attestation-instance-proof+jwt"
-WELL_KNOWN_PATH = "/.well-known/client-attester"
+# The PingFederate profile's conventions, kept importable from here (see attester.PingFederateProfile).
+INSTANCE_PROOF_TYP = PingFederateProfile.INSTANCE_PROOF_TYP
+WELL_KNOWN_PATH = PingFederateProfile.WELL_KNOWN_PATH
 # Refresh this many seconds before the token actually expires, so a token is never used at the edge.
 DEFAULT_EXPIRY_SKEW_SECONDS = 30
 DPOP_NONCE_HEADER = "DPoP-Nonce"
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# What the https check calls the URL a profile's call goes to, by step.
+_STEP_LABELS = {"discover": "attester_url", "mint": "attestation_endpoint", "challenge": "challenge_endpoint"}
 
 # Trace redaction (see `trace_redact`): header names whose values are credentials. The JSON/form members
 # and private JWK members live in `_redact`, shared with the loggers.
@@ -60,11 +63,18 @@ _logger = _log.get("token_source")
 
 
 class ClientAttestation:
-    """Gets and caches an access token from a PingFederate host using client attestation.
+    """Gets and caches an access token using client attestation.
 
     Args:
-        pf_host: the PingFederate host — `"pf.example.com"`, or a full base URL
-            `"https://pf.example.com"`. Plain hostnames default to https.
+        attester_url: the attester's host — `"pf.example.com"`, or a full base URL
+            `"https://pf.example.com"`. Plain hostnames default to https. Optional when `metadata` is
+            given (no discovery is needed) or a custom `profile` does not need it.
+        profile: the :class:`~client_attestation_sdk.attester.AttesterProfile` that discovers the
+            attester and mints the attestation. Default :class:`PingFederateProfile`, the behaviour of
+            every earlier release. See docs/attester-profiles.md.
+        metadata: static :class:`~client_attestation_sdk.attester.AttesterMetadata` (evidence audience,
+            attestation and token endpoints, optionally challenge endpoint and PoP audience). When set,
+            no discovery request is made; the profile still mints.
         evidence: how to get the workload's platform identity. Leave as None to auto-detect the
             runtime (env token, projected token file, SPIRE socket, or GCP metadata). Pass an
             `SvidSource` to override.
@@ -102,20 +112,27 @@ class ClientAttestation:
             challenge cannot be fetched (network, HTTP status, bad JSON, no `attestation_challenge`),
             fail with `ClientAttestationError` (default `True`). `False` keeps the old behaviour of
             minting without a challenge. No advertised endpoint means no challenge and no error.
-        allow_insecure: allow plain-http `pf_host` and discovery endpoints for non-loopback hosts
+        allow_insecure: allow plain-http `attester_url` and discovery endpoints for non-loopback hosts
             (default `False`). Loopback (`localhost`, `127.0.0.1`, `::1`) is always allowed.
     """
 
-    def __init__(self, pf_host: str, *, evidence: SvidSource = None, authorization_details: list = None,
+    def __init__(self, attester_url: str = None, *, evidence: SvidSource = None,
+                 authorization_details: list = None,
                  operator: dict = None,
                  algorithm: str = "ES256", expiry_skew_seconds: int = DEFAULT_EXPIRY_SKEW_SECONDS,
                  timeout: float = 20.0, pop_method: str = "attestation_pop_jwt",
                  challenge_at_token: bool = True,
                  trace: list = None, trace_redact: bool = True,
-                 require_challenge: bool = True, allow_insecure: bool = False):
-        self.base_url = _normalize_base_url(pf_host)
+                 require_challenge: bool = True, allow_insecure: bool = False,
+                 profile: AttesterProfile = None, metadata: AttesterMetadata = None):
+        self._profile = profile if profile is not None else PingFederateProfile()
         self._allow_insecure = allow_insecure
-        _require_https(self.base_url, "pf_host", allow_insecure)
+        if attester_url is None and (metadata is not None or profile is not None):
+            self.base_url = None
+        else:
+            self.base_url = _normalize_base_url(attester_url)
+            _require_https(self.base_url, "attester_url", allow_insecure)
+        self._metadata = metadata
         self._evidence = evidence
         self._authorization_details = authorization_details
         self._operator = operator
@@ -133,7 +150,6 @@ class ClientAttestation:
         self._token_type = "Bearer"
         self._token_key = None   # the instance key the cached token is bound to (cnf); same lock
         self._expires_at = 0.0
-        self._discovery = None
         self._nonce_lock = threading.Lock()
         self._dpop_nonces = {}   # origin -> last DPoP-Nonce that origin returned
 
@@ -280,13 +296,32 @@ class ClientAttestation:
         return nonce if _is_nonce_challenge(status, headers, body) else None
 
     def discovery(self) -> dict:
-        """The attester's `/.well-known/client-attester` document (fetched once, then cached)."""
-        if self._discovery is None:
-            self._discovery = self._get_json("GET", self.base_url + WELL_KNOWN_PATH, step="discover")
-            _log.emit(_logger, logging.DEBUG, "discovery.fetched", host=_log.host(self.base_url))
+        """The attester's discovery document (for the PingFederate profile,
+        `/.well-known/client-attester`), fetched once and then cached. With static `metadata`, the fields
+        that were given."""
+        return self.attester_metadata().as_document()
+
+    def attester_metadata(self) -> AttesterMetadata:
+        """The attester's endpoints: the static `metadata`, or what the profile discovered (once, then
+        cached)."""
+        host = _log.host(self.base_url) if self.base_url else None
+        if self._metadata is None:
+            self._metadata = self._profile.discover(self._transport(), self.base_url)
+            _log.emit(_logger, logging.DEBUG, "discovery.fetched", host=host)
         else:
-            _log.emit(_logger, logging.DEBUG, "discovery.cached", host=_log.host(self.base_url))
-        return self._discovery
+            _log.emit(_logger, logging.DEBUG, "discovery.cached", host=host)
+        return self._metadata
+
+    def _transport(self):
+        """The transport handed to the profile: this client's https rule, timeout, logging and trace."""
+        source = self
+
+        class _Transport:
+            def request_json(self, step: str, method: str, url: str, body: dict = None) -> dict:
+                _require_https(url, _STEP_LABELS.get(step, f"{step} URL"), source._allow_insecure)
+                return source._get_json(method, url, json_body=body, step=step)
+
+        return _Transport()
 
     # ── tracing (opt-in; see `trace` and `trace_redact` in __init__) ────────────────────────────
     def _record(self, step: str, method: str, url: str, headers: dict, *,
@@ -320,8 +355,8 @@ class ClientAttestation:
     # ── the flow ──────────────────────────────────────────────────────────────────────────────────
     def _run_flow(self, *, asserted_context: dict = None):
         """Run the flow once; returns `(token_response, instance_key)`."""
-        doc = self.discovery()
-        audience = doc.get("evidence_audience")
+        meta = self.attester_metadata()
+        audience = meta.evidence_audience
         if not audience:
             raise ClientAttestationError("attester discovery document has no evidence_audience")
 
@@ -330,15 +365,23 @@ class ClientAttestation:
         _log.emit(_logger, logging.DEBUG, "evidence.obtained", source=type(evidence_source).__name__)
 
         instance_key = SigningKeyPair.generate(self._algorithm)
-        challenge = self._fetch_challenge(doc)
-        attestation = self._mint(doc, instance_key, svid, challenge, asserted_context=asserted_context)
+        challenge = self._fetch_challenge(meta.challenge_endpoint)
+        minted = self._profile.mint(self._transport(), meta, MintRequest(
+            instance_key=instance_key, evidence=svid, challenge=challenge,
+            authorization_details=self._authorization_details or None, operator=self._operator or None,
+            asserted_context=asserted_context or None))
+        attestation = minted.attestation
+        self._annotate("jwt", attestation)
 
-        # token_endpoint is advertised by current attesters; fall back to the standard PF path so an
-        # older discovery document still works from the host alone.
-        token_endpoint = doc.get("token_endpoint") or (self.base_url + "/as/token.oauth2")
+        # The profile resolves the token endpoint (PingFederate: the advertised one, else the standard
+        # path on the attester host).
+        token_endpoint = meta.token_endpoint
+        if not token_endpoint:
+            raise ClientAttestationError("attester metadata has no token_endpoint")
         _require_https(token_endpoint, "token_endpoint", self._allow_insecure)
         client_id = _jwt_sub(attestation)
-        _log.emit(_logger, logging.DEBUG, "attestation.minted", host=_log.host(doc["attestation_endpoint"]),
+        _log.emit(_logger, logging.DEBUG, "attestation.minted",
+                  host=_log.host(meta.attestation_endpoint) if meta.attestation_endpoint else None,
                   client_id=client_id, alg=self._algorithm)
         # See `challenge_at_token` on __init__: some attesters consume the challenge the moment the
         # mint's instance proof uses it, and reject a token request that presents the same value a
@@ -360,7 +403,7 @@ class ClientAttestation:
             # The PoP audience must be PF's configured issuer, which the attester advertises as
             # pop_audience. Falling back to the token endpoint URL only works when the dialed URL
             # matches PF's issuer (no proxy in between) — so prefer the advertised value.
-            pop_audience = doc.get("pop_audience") or token_endpoint
+            pop_audience = meta.pop_audience or token_endpoint
             proof = (PopBuilder(instance_key).client_id(client_id).audience(pop_audience)
                      .challenge(token_challenge).build())
             proof_header = POP_HEADER
@@ -374,8 +417,7 @@ class ClientAttestation:
                   pop_method=self._pop_method)
         return response, instance_key
 
-    def _fetch_challenge(self, doc: dict):
-        endpoint = doc.get("challenge_endpoint")
+    def _fetch_challenge(self, endpoint):
         if not endpoint:
             return None
         _require_https(endpoint, "challenge_endpoint", self._allow_insecure)
@@ -396,35 +438,6 @@ class ClientAttestation:
         self._annotate("value", value)
         _log.emit(_logger, logging.DEBUG, "challenge.fetched", host=_log.host(endpoint))
         return value
-
-    def _mint(self, doc: dict, instance_key: SigningKeyPair, svid: str, challenge,
-              *, asserted_context: dict = None) -> str:
-        now = int(time.time())
-        proof_claims = {"aud": doc["evidence_audience"], "jti": str(uuid.uuid4()), "iat": now}
-        if challenge:
-            proof_claims["challenge"] = challenge
-        proof = sign_compact(proof_claims, instance_key, INSTANCE_PROOF_TYP, embed_jwk=False)
-
-        # Evidence-first: no client_id. The attester maps the identity to a client.
-        body = {"instance_key": instance_key.public_jwk(), "svid": svid, "proof": proof}
-        if self._authorization_details:
-            body["authorization_details"] = self._authorization_details
-        if asserted_context:
-            body["asserted_context"] = asserted_context
-        if self._operator:
-            # The client's OPERATOR — who answers for this workload — asked for at mint time so the
-            # ATTESTER is what states it, rather than the client asserting it about itself at the
-            # token endpoint. An attester that does not know this key ignores it; one that does can
-            # refuse to name an operator it cannot corroborate.
-            body["operator"] = self._operator
-        endpoint = _http.require(doc, "attestation_endpoint", "attester discovery document")
-        _require_https(endpoint, "attestation_endpoint", self._allow_insecure)
-        response = self._get_json("POST", endpoint, json_body=body, step="mint")
-        attestation = response.get("attestation")
-        if not attestation:
-            raise ClientAttestationError("attester response contained no attestation", body=json.dumps(response))
-        self._annotate("jwt", attestation)
-        return attestation
 
     def _call_token_endpoint(self, endpoint: str, attestation: str, proof: str, proof_header: str,
                              *, operator: dict = None, retry_proof=None) -> dict:
@@ -487,10 +500,10 @@ class ClientAttestation:
             raise
 
 
-def _normalize_base_url(pf_host: str) -> str:
-    host = pf_host.strip().rstrip("/")
+def _normalize_base_url(attester_url: str) -> str:
+    host = (attester_url or "").strip().rstrip("/")
     if not host:
-        raise ValueError("pf_host is required")
+        raise ValueError("attester_url is required")
     if "://" not in host:
         host = "https://" + host
     return host

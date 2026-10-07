@@ -73,7 +73,7 @@ def test_failure_messages_do_not_echo_token_data(case):
     else:
         v = _validator(accepted_algorithms=["ES256", "none"])
         token = jwt.encode({"iss": MARK}, None, algorithm="none", headers={"kid": KEY.key_id})
-        expect = errors.INVALID_TOKEN
+        expect = errors.UNSUPPORTED_ALGORITHM
     result = v.validate(token)
     assert not result.valid and result.error == expect
     assert "EVIL" not in result.error_description and "Injected" not in result.error_description
@@ -85,7 +85,7 @@ def test_undecodable_signed_token_gets_a_generic_message():
     token = jwt.PyJWS().encode(b"EVIL not json", KEY.private_key, algorithm="ES256",
                                headers={"kid": KEY.key_id})
     result = _validator().validate(token)
-    assert result.error == errors.INVALID_SIGNATURE
+    assert result.error == errors.INVALID_TOKEN
     assert "EVIL" not in result.error_description
 
 

@@ -56,6 +56,9 @@ var algHash = map[string]string{"ES256": "sha2-256", "ES384": "sha2-384", "ES512
 // is signed inside the vault (POST /v1/transit/sign/<key> with marshaling_algorithm=jws, which returns the
 // fixed-width r||s) and the private key never leaves it. NewOpenBaoTransitSigner reads the key metadata to
 // pin the latest version, derive the public JWK and compute its RFC 7638 kid. Fail-closed.
+//
+// Experimental (see docs/api.md): a client for a third-party API that authenticates with a static token
+// only; its constructor will change when other auth methods are added.
 type OpenBaoTransitSigner struct {
 	base       string
 	token      string

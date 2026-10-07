@@ -11,7 +11,7 @@ comes from, depends on the runtime:
 - AWS `sts:GetWebIdentityToken` (Lambda/ECS/EC2/Bedrock AgentCore).
 
 `auto_detect_evidence()` tries these in order and returns the first that applies, so a developer can
-write `ClientAttestation(pf_host)` and have it work without naming the source. Override by passing an
+write `ClientAttestation(attester_url)` and have it work without naming the source. Override by passing an
 explicit `SvidSource` to `ClientAttestation`.
 """
 from __future__ import annotations
@@ -88,6 +88,8 @@ class AzureImdsSvidSource:
 
     On AKS with Workload Identity Federation, prefer the projected-token path (`FileTokenSvidSource`)
     instead; this source is for compute whose identity is a managed identity rather than a Kubernetes SA.
+
+    **Experimental** (see docs/api.md): Python only, and not yet run against a real attester.
     """
 
     def __init__(self, timeout: float = 5.0, client_id: str = None):
@@ -114,6 +116,8 @@ class AwsWebIdentitySvidSource:
 
     On EKS, prefer the projected-token path (`FileTokenSvidSource`) instead; this source is for
     Lambda/ECS/EC2/AgentCore workloads whose identity is an IAM role rather than a Kubernetes SA.
+
+    **Experimental** (see docs/api.md): Python only, and not yet run against a real attester.
     """
 
     def __init__(self, region: str = None):

@@ -21,12 +21,12 @@ class ValidationResult:
         return self.valid
 
     @classmethod
-    def success(cls, claims, scopes, audience):
+    def _success(cls, claims, scopes, audience):
         return cls(True, subject=claims.get("sub"), scopes=scopes, audience=audience,
                    claims=claims, expires_at=claims.get("exp"))
 
     @classmethod
-    def failure(cls, error, description=None):
+    def _failure(cls, error, description=None):
         return cls(False, error=error, error_description=description)
 
     def __repr__(self):

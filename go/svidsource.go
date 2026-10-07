@@ -26,6 +26,8 @@ func (s StaticSvidSource) Fetch(string) (string, error) { return s.SVID, nil }
 // For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
 // authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
 // file or cloud source.
+//
+// Experimental (see docs/api.md): a development and test source with no caller authentication.
 type HTTPSvidSource struct {
 	URL    string
 	Client *http.Client
@@ -54,6 +56,9 @@ func (s HTTPSvidSource) Fetch(audience string) (string, error) {
 // SpireWorkloadAPISvidSource is the default source: it fetches a JWT-SVID from a real SPIRE agent's
 // Workload API via the spire-agent CLI. Swap for a native go-spiffe workloadapi client by implementing
 // SvidSource if you prefer no subprocess.
+//
+// Experimental (see docs/api.md): it shells out to the spire-agent CLI, and its constructor will change
+// when it moves to the Workload API socket.
 type SpireWorkloadAPISvidSource struct {
 	SocketPath    string // default /tmp/spire-agent/public/api.sock
 	SpireAgentBin string // default "spire-agent"

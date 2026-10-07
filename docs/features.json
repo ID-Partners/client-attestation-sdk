@@ -20,6 +20,8 @@
          "ports": ["go", "java", "python", "typescript"]},
         {"label": "Logging hooks", "sub": "Off by default, one event vocabulary, never a credential (docs/logging.md)",
          "ports": ["go", "java", "python", "typescript"]},
+        {"label": "Attester profiles", "sub": "PingFederate by default, static endpoints, or your own (docs/attester-profiles.md)",
+         "ports": ["go", "java", "python", "typescript"]},
         {"label": "Trace every call as curl", "sub": "Credentials redacted unless you turn it off",
          "ports": ["python"]},
         {"label": "Asserted context at mint", "sub": "An unverified discriminator for an attester-side resolver",
@@ -52,9 +54,9 @@
       "name": "Resource server",
       "rows": [
         {"label": "Token validator", "sub": "Signature, typ, issuer, expiry, audience, scope, introspection",
-         "ports": ["go", "python", "typescript"]},
-        {"label": "MCP and A2A protected-resource helper", "ports": ["go", "python", "typescript"]},
-        {"label": "Authorization-server metadata discovery", "ports": ["python"]}
+         "ports": ["go", "java", "python", "typescript"]},
+        {"label": "MCP and A2A protected-resource helper", "ports": ["go", "java", "python", "typescript"]},
+        {"label": "Authorization-server metadata discovery", "ports": ["java", "python"]}
       ]
     },
     {

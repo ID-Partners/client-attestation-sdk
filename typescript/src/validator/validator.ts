@@ -6,11 +6,13 @@
  * then scope — returning the first failure's stable error code. That order is part of the cross-language contract so every port reports the same verdict.
  * `validateActive` instead uses RFC 7662 introspection.
  */
-import { compactVerify, decodeProtectedHeader } from "jose";
+import { compactVerify } from "jose";
 
 import { base64Encode, utf8Encode } from "../runtime.js";
 import * as errors from "./errors.js";
+import * as strict from "./strict.js";
 import {
+  isForbiddenAlgorithm,
   normaliseType,
   resolveConfig,
   type IntrospectionConfig,
@@ -18,7 +20,7 @@ import {
   type ValidatorConfig,
 } from "./config.js";
 import { TransportError } from "../errors.js";
-import { jsonOk, request } from "../http.js";
+import { request } from "../http.js";
 import { emit, failureReason, NOOP_LOGGER, urlParts, type Logger } from "../logging.js";
 import { JwksProvider, type HttpGet } from "./jwks.js";
 import { failure, success, type ValidationResult } from "./result.js";
@@ -44,15 +46,37 @@ export interface ValidatorOptions {
    * nothing is logged. Tokens and client secrets are never logged.
    */
   logger?: Logger;
+  /** Epoch-millisecond clock that `exp` / `nbf` / `iat` are checked against. Defaults to `Date.now`. */
+  clock?: () => number;
 }
 
+/**
+ * An introspection response larger than this is refused.
+ *
+ * @internal
+ */
+export const MAX_INTROSPECTION_BYTES = 1024 * 1024;
+
 const defaultPost: HttpPost = async (url, body, headers) => {
-  // the shared transport never follows a redirect: it would carry the resource server's credentials
-  const resp = await request(url, { method: "POST", body, headers, timeoutMs: 10_000 });
+  // the shared transport never follows a redirect (it would carry the resource server's credentials) and
+  // refuses a body over the cap
+  const resp = await request(url, {
+    method: "POST",
+    body,
+    headers,
+    timeoutMs: 10_000,
+    maxBytes: MAX_INTROSPECTION_BYTES,
+  });
   if (!resp.ok) {
     throw new TransportError(`introspection failed: ${resp.status}`, "status", { status: resp.status });
   }
-  return jsonOk<Claims>(resp);
+  try {
+    return strict.parseObject(utf8Encode(resp.body), "introspection response");
+  } catch (err) {
+    throw new TransportError(`introspection endpoint returned ${errMessage(err)}`, "json", {
+      status: resp.status,
+    });
+  }
 };
 
 /** Validates access tokens for a resource server. */
@@ -61,6 +85,7 @@ export class AccessTokenValidator {
   readonly #jwks: JwksProvider;
   readonly #httpPost: HttpPost;
   readonly #logger: Logger;
+  readonly #clock: () => number;
 
   constructor(config: ValidatorConfig, opts: ValidatorOptions = {}) {
     this.config = resolveConfig(config);
@@ -72,6 +97,7 @@ export class AccessTokenValidator {
     });
     this.#httpPost = opts.httpPost ?? defaultPost;
     this.#logger = opts.logger ?? NOOP_LOGGER;
+    this.#clock = opts.clock ?? Date.now;
   }
 
   /**
@@ -91,37 +117,42 @@ export class AccessTokenValidator {
   async #validate(token: string, requiredScopes?: string[]): Promise<ValidationResult> {
     const required = requiredScopes ?? this.config.requiredScopes;
 
-    let header: { alg?: string; kid?: string; typ?: string };
+    let parts: strict.CompactParts;
     try {
-      header = decodeProtectedHeader(token);
-    } catch (exc) {
-      return failure(errors.INVALID_TOKEN, `malformed token: ${errMessage(exc)}`);
+      parts = strict.splitCompact(token);
+    } catch {
+      // never echo token data to the caller: the description lands in WWW-Authenticate
+      return failure(errors.INVALID_TOKEN, "malformed token");
     }
+    const { header } = parts;
 
     const alg = header.alg;
-    if (alg == null || !this.config.acceptedAlgorithms.includes(alg)) {
+    if (typeof alg !== "string" || isForbiddenAlgorithm(alg) || !this.config.acceptedAlgorithms.includes(alg)) {
       // never echo the unverified header alg back to the caller (it lands in WWW-Authenticate)
       return failure(errors.UNSUPPORTED_ALGORITHM, "algorithm not accepted");
     }
 
-    const key = await this.#jwks.resolve(header.kid, alg);
+    const kid = header.kid;
+    const key = kid == null || typeof kid === "string" ? await this.#jwks.resolve(kid ?? undefined, alg) : null;
     if (key == null) {
       return failure(errors.KEY_NOT_FOUND, this.#jwks.lastError ?? "no signing key for this kid");
     }
 
+    try {
+      await compactVerify(token, key, { algorithms: [alg] });
+    } catch {
+      return failure(errors.INVALID_SIGNATURE, "signature verification failed");
+    }
     let claims: Claims;
     try {
-      const { payload } = await compactVerify(token, key, { algorithms: [alg] });
-      claims = JSON.parse(new TextDecoder().decode(payload)) as Claims;
+      claims = strict.parseObject(parts.payload);
     } catch (exc) {
-      return failure(errors.INVALID_SIGNATURE, errMessage(exc));
-    }
-    if (claims === null || typeof claims !== "object" || Array.isArray(claims)) {
-      return failure(errors.INVALID_TOKEN, "payload is not a JSON object");
+      return failure(errors.INVALID_TOKEN, errMessage(exc));
     }
 
     const types = this.config.acceptedTokenTypes;
-    if (header.typ != null && types !== null && !types.includes(normaliseType(String(header.typ)))) {
+    const typ = header.typ;
+    if (typ != null && types !== null && (typeof typ !== "string" || !types.includes(normaliseType(typ)))) {
       return failure(errors.INVALID_TOKEN_TYPE, "token is not a JWT access token");
     }
 
@@ -129,15 +160,15 @@ export class AccessTokenValidator {
       return failure(errors.INVALID_ISSUER, "unexpected issuer");
     }
 
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(this.#clock() / 1000);
     const leeway = this.config.leewaySeconds;
     let exp: number | undefined;
     let nbf: number | undefined;
     let iat: number | undefined;
     try {
-      exp = numericDate(claims, "exp");
-      nbf = numericDate(claims, "nbf");
-      iat = numericDate(claims, "iat");
+      exp = strict.numericDate(claims, "exp");
+      nbf = strict.numericDate(claims, "nbf");
+      iat = strict.numericDate(claims, "iat");
     } catch (exc) {
       return failure(errors.INVALID_TOKEN, errMessage(exc));
     }
@@ -154,18 +185,21 @@ export class AccessTokenValidator {
       return failure(errors.ISSUED_IN_FUTURE, "token was issued in the future");
     }
 
-    const audience = asList(claims.aud);
-    if (!this.config.audiences.some((a) => audience.includes(a))) {
-      return failure(errors.INVALID_AUDIENCE, "token audience is not accepted");
+    try {
+      const audience = strict.audience(claims);
+      if (!this.config.audiences.some((a) => audience.includes(a))) {
+        return failure(errors.INVALID_AUDIENCE, "token audience is not accepted");
+      }
+      const granted = strict.scopes(claims);
+      const missing = required.filter((s) => !granted.includes(s));
+      if (missing.length > 0) {
+        return failure(errors.INSUFFICIENT_SCOPE, `missing scopes: ${missing.join(" ")}`);
+      }
+      strict.subject(claims);
+      return success(claims, granted, audience);
+    } catch (exc) {
+      return failure(errors.INVALID_TOKEN, errMessage(exc));
     }
-
-    const granted = scopesOf(claims);
-    const missing = required.filter((s) => !granted.includes(s));
-    if (missing.length > 0) {
-      return failure(errors.INSUFFICIENT_SCOPE, `missing scopes: ${missing.join(" ")}`);
-    }
-
-    return success(claims, granted, audience);
   }
 
   /**
@@ -192,7 +226,11 @@ export class AccessTokenValidator {
       form.set("client_secret", cfg.clientSecret);
     }
     try {
-      return await this.#httpPost(cfg.endpoint, form.toString(), headers);
+      const data: unknown = await this.#httpPost(cfg.endpoint, form.toString(), headers);
+      if (data === null || typeof data !== "object" || Array.isArray(data)) {
+        throw new TransportError("introspection endpoint returned JSON that is not an object", "json");
+      }
+      return data as Claims;
     } catch (err) {
       emit(this.#logger, "warn", "http.failed", {
         step: "introspection",
@@ -214,58 +252,27 @@ export class AccessTokenValidator {
 
   async #validateActive(token: string, requiredScopes?: string[]): Promise<ValidationResult> {
     const data = await this.introspect(token);
-    if (!data.active) {
+    // RFC 7662 section 2.2: active is a boolean, so only JSON true counts
+    if (data.active !== true) {
       return failure(errors.INACTIVE, "token is not active");
     }
     const required = requiredScopes ?? this.config.requiredScopes;
-    const granted = scopesOf(data);
-    const missing = required.filter((s) => !granted.includes(s));
-    if (missing.length > 0) {
-      return failure(errors.INSUFFICIENT_SCOPE, `missing scopes: ${missing.join(" ")}`);
+    try {
+      const granted = strict.scopes(data);
+      const missing = required.filter((s) => !granted.includes(s));
+      if (missing.length > 0) {
+        return failure(errors.INSUFFICIENT_SCOPE, `missing scopes: ${missing.join(" ")}`);
+      }
+      const audience = strict.audience(data);
+      if (audience.length > 0 && !this.config.audiences.some((a) => audience.includes(a))) {
+        return failure(errors.INVALID_AUDIENCE, "token audience is not accepted");
+      }
+      strict.subject(data);
+      return success(data, granted, audience);
+    } catch (exc) {
+      return failure(errors.INVALID_TOKEN, errMessage(exc));
     }
-    const audience = asList(data.aud);
-    if (
-      this.config.audiences.length > 0 &&
-      audience.length > 0 &&
-      !this.config.audiences.some((a) => audience.includes(a))
-    ) {
-      return failure(errors.INVALID_AUDIENCE, "token audience is not accepted");
-    }
-    return success(data, granted, audience);
   }
-}
-
-/** A NumericDate claim as an integer, `undefined` when absent. Anything but a finite number is malformed. */
-function numericDate(claims: Claims, name: string): number | undefined {
-  const value = claims[name];
-  if (value == null) {
-    return undefined;
-  }
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`${name} is not a NumericDate`);
-  }
-  return Math.trunc(value);
-}
-
-/** Normalize an `aud` claim (string | string[] | absent) to a list of strings. */
-function asList(value: unknown): string[] {
-  if (value == null) {
-    return [];
-  }
-  return Array.isArray(value) ? value.map(String) : [String(value)];
-}
-
-/** Granted scopes from `scope` (space-delimited string) or `scp` (array). */
-function scopesOf(claims: Claims): string[] {
-  const scope = claims.scope;
-  if (typeof scope === "string") {
-    return scope.split(/\s+/).filter((s) => s.length > 0);
-  }
-  const scp = claims.scp;
-  if (Array.isArray(scp)) {
-    return scp.map(String);
-  }
-  return [];
 }
 
 function base64(value: string): string {

@@ -57,18 +57,21 @@ def test_unknown_kid():
 
 
 def test_non_json_payload_is_rejected():
-    # a genuine signature over a payload that is not a JSON object
+    # a genuine signature over a payload that is not a JSON object: the token is malformed, not forged
     token = jwt.PyJWS().encode(b"not json", KEY.private_key, algorithm="ES256",
                                headers={"kid": KEY.key_id})
     result = AccessTokenValidator(_config()).validate(token)
-    assert not result.valid and result.error == errors.INVALID_SIGNATURE
+    assert not result.valid and result.error == errors.INVALID_TOKEN
 
 
 def test_alg_none_is_rejected_even_when_accepted():
-    # a misconfigured validator accepting "none" still fails: PyJWT refuses a key with alg=none
+    # a misconfigured validator accepting "none" (or an HMAC alg) still refuses it, before any key lookup
     token = jwt.encode({"iss": ISSUER}, None, algorithm="none", headers={"kid": KEY.key_id})
     result = AccessTokenValidator(_config(accepted_algorithms=["ES256", "none"])).validate(token)
-    assert not result.valid and result.error == errors.INVALID_TOKEN
+    assert not result.valid and result.error == errors.UNSUPPORTED_ALGORITHM
+    token = jwt.encode({"iss": ISSUER}, "k" * 32, algorithm="HS384", headers={"kid": KEY.key_id})
+    result = AccessTokenValidator(_config(accepted_algorithms=["ES256", "HS384"])).validate(token)
+    assert not result.valid and result.error == errors.UNSUPPORTED_ALGORITHM
 
 
 def test_scp_list_claim_grants_scopes():
@@ -162,7 +165,7 @@ def test_result_truthiness_and_repr():
     ok = AccessTokenValidator(_config()).validate(_token())
     assert ok.valid and bool(ok)
     assert "agent-1" in repr(ok)
-    failed = ValidationResult.failure(errors.EXPIRED, "token has expired")
+    failed = ValidationResult._failure(errors.EXPIRED, "token has expired")
     assert not bool(failed)
     assert errors.EXPIRED in repr(failed) and "invalid" in repr(failed)
 

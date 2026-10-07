@@ -6,10 +6,10 @@ import {
   AccessTokenValidator,
   DEFAULT_ALGORITHMS,
   errors,
-  resolveConfig,
   type ValidatorConfig,
 } from "../src/validator/index.js";
 import { failure, success } from "../src/validator/result.js";
+import { resolveConfig } from "../src/validator/config.js";
 
 const ISSUER = "https://issuer.example.com";
 const AUDIENCE = "https://api.example.com";
@@ -183,14 +183,14 @@ describe("introspection edge cases", () => {
     expect(result.error).toBe(errors.INVALID_AUDIENCE);
   });
 
-  it("validateActive leaves the subject null for a non-string sub", async () => {
+  it("validateActive refuses a non-string sub rather than drop it", async () => {
     const validator = newValidator(
       { introspection: INTROSPECTION },
       { httpPost: async () => ({ active: true, sub: 123 }) },
     );
     const result = await validator.validateActive("opaque-token");
-    expect(result.valid).toBe(true);
-    expect(result.subject).toBeNull();
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("invalid_token");
   });
 
   it("default POST transport posts the form and parses JSON", async () => {

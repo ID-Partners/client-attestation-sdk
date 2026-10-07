@@ -17,6 +17,7 @@ export interface ValidationResult {
   expiresAt: number | null;
 }
 
+/** @internal */
 export function success(
   claims: Record<string, unknown>,
   scopes: string[],
@@ -36,6 +37,7 @@ export function success(
   };
 }
 
+/** @internal */
 export function failure(error: ValidationError, description?: string): ValidationResult {
   return {
     valid: false,

@@ -25,6 +25,8 @@ export interface JwsSigner {
 }
 
 /** Assemble a compact JWS whose signature is produced by an external signer (header carries `kid`; external
+ *
+ * @internal
  * signers hold issuing keys, referenced by id, never an embedded jwk). */
 export async function signExternal(
   claims: Record<string, unknown>,
@@ -46,6 +48,8 @@ const ALG_HASH: Record<string, string> = { ES256: "sha2-256", ES384: "sha2-384",
  * inside the vault (`POST /v1/transit/sign/<key>` with `marshaling_algorithm=jws`, which returns the
  * fixed-width `r||s`) and the private key never leaves it. `create` reads the key metadata to pin the
  * latest version, derive the public JWK and compute its RFC 7638 `kid`. Fail-closed (vault errors throw).
+ *
+ * @experimental See docs/api.md: a client for a third-party API that authenticates with a static token only; its constructor will change when other auth methods are added.
  */
 export class OpenBaoTransitSigner implements JwsSigner {
   readonly algorithm: string;

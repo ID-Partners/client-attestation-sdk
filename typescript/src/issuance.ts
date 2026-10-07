@@ -6,13 +6,14 @@
  * (PingFederate) validates it and **mints** a Client Attestation bound to the workload's own instance
  * key — bootstrapping a client credential from infra identity, no pre-shared secret.
  */
+import { type AttesterProfile, type AttesterTransport, MintRequest, PingFederateProfile } from "./attester.js";
 import { DpopProofBuilder, PopBuilder } from "./builders.js";
 import { jsonOk, request } from "./http.js";
-import { SigningKeyPair, signCompact } from "./signing-key-pair.js";
+import { SigningKeyPair } from "./signing-key-pair.js";
 import type { SvidSource } from "./svid-source.js";
 
-/** The instance-key proof typ presented at the issuance endpoint (server InstanceKeyProofValidator.TYP). */
-export const INSTANCE_PROOF_TYP = "oauth-attestation-instance-proof+jwt";
+/** The instance-key proof typ the PingFederate profile presents (server InstanceKeyProofValidator.TYP). */
+export { INSTANCE_PROOF_TYP } from "./attester.js";
 
 /** Per-call timeout for the issuance endpoint. */
 const ISSUANCE_TIMEOUT_MS = 20_000;
@@ -55,7 +56,15 @@ export class IssuedAttestation {
   }
 }
 
-/** Bootstraps a Client Attestation for a workload from its SPIFFE JWT-SVID. */
+/**
+ * Bootstraps a Client Attestation for a workload from its SPIFFE JWT-SVID.
+ *
+ * `opts.profile` sets the mint protocol (default {@link PingFederateProfile}; see
+ * docs/attester-profiles.md). The endpoint is given directly, so the profile's discovery is not used.
+  *
+  * @experimental See docs/api.md: it calls a PingFederate demo issuance servlet (/federation/attestation)
+  * whose protocol is not standardised.
+ */
 export class AttestationIssuanceClient {
   private constructor(
     readonly endpoint: string,
@@ -63,6 +72,7 @@ export class AttestationIssuanceClient {
     readonly attesterIssuer: string,
     private readonly source: SvidSource,
     readonly instanceKey: SigningKeyPair,
+    readonly profile: AttesterProfile,
   ) {}
 
   /** Generate a fresh ES256 instance key and return a ready client. */
@@ -71,10 +81,11 @@ export class AttestationIssuanceClient {
     clientId: string,
     attesterIssuer: string,
     source: SvidSource,
-    opts?: { instanceKey?: SigningKeyPair },
+    opts?: { instanceKey?: SigningKeyPair; profile?: AttesterProfile },
   ): Promise<AttestationIssuanceClient> {
     const key = opts?.instanceKey ?? (await SigningKeyPair.generate("ES256"));
-    return new AttestationIssuanceClient(endpoint.replace(/\/$/, ""), clientId, attesterIssuer, source, key);
+    const profile = opts?.profile ?? new PingFederateProfile();
+    return new AttestationIssuanceClient(endpoint.replace(/\/$/, ""), clientId, attesterIssuer, source, key, profile);
   }
 
   /** Fetch the SVID, prove possession of the instance key, and exchange them for a minted attestation. */
@@ -83,31 +94,31 @@ export class AttestationIssuanceClient {
     challenge?: string,
   ): Promise<IssuedAttestation> {
     const svid = await this.source.fetch(this.attesterIssuer);
+    const minted = await this.profile.mint(
+      issuanceTransport,
+      { evidenceAudience: this.attesterIssuer, attestationEndpoint: this.endpoint },
+      new MintRequest({
+        instanceKey: this.instanceKey,
+        evidence: svid,
+        challenge: challenge || undefined,
+        clientId: this.clientId,
+        authorizationDetails,
+      }),
+    );
+    return new IssuedAttestation(minted.attestation, minted.expiresIn, this.instanceKey);
+  }
+}
 
-    const proofClaims: Record<string, unknown> = {
-      aud: this.attesterIssuer,
-      jti: crypto.randomUUID(),
-      iat: Math.floor(Date.now() / 1000),
-    };
-    if (challenge) proofClaims.challenge = challenge;
-    const proof = await signCompact(proofClaims, this.instanceKey, INSTANCE_PROOF_TYP, false);
-
-    const body: Record<string, unknown> = {
-      client_id: this.clientId,
-      instance_key: this.instanceKey.publicJwk(),
-      svid,
-      proof,
-    };
-    if (authorizationDetails) body.authorization_details = authorizationDetails;
-
-    const res = await request(this.endpoint, {
-      method: "POST",
+/** The issuance endpoint's transport: a non-2xx answer is an {@link IssuanceError}. */
+const issuanceTransport: AttesterTransport = {
+  async requestJson(_step, method, url, body) {
+    const res = await request(url, {
+      method,
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
+      body: body === undefined ? undefined : JSON.stringify(body),
       timeoutMs: ISSUANCE_TIMEOUT_MS,
     });
     if (!res.ok) throw new IssuanceError(res.status, res.body);
-    const json = jsonOk<{ attestation: string; expires_in?: number }>(res);
-    return new IssuedAttestation(json.attestation, json.expires_in, this.instanceKey);
-  }
-}
+    return jsonOk<Record<string, unknown>>(res);
+  },
+};

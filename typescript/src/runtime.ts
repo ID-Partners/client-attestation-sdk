@@ -9,17 +9,29 @@ import { ClientAttestationError } from "./errors.js";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-/** UTF-8 bytes of a string. */
+/**
+ * UTF-8 bytes of a string.
+ *
+ * @internal
+ */
 export function utf8Encode(text: string): Uint8Array {
   return textEncoder.encode(text);
 }
 
-/** A string from UTF-8 bytes; malformed sequences become U+FFFD, as `Buffer#toString` does. */
+/**
+ * A string from UTF-8 bytes; malformed sequences become U+FFFD, as `Buffer#toString` does.
+ *
+ * @internal
+ */
 export function utf8Decode(bytes: Uint8Array): string {
   return textDecoder.decode(bytes);
 }
 
-/** Standard (padded) base64 of some bytes. */
+/**
+ * Standard (padded) base64 of some bytes.
+ *
+ * @internal
+ */
 export function base64Encode(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i += 0x8000) {
@@ -30,6 +42,8 @@ export function base64Encode(bytes: Uint8Array): string {
 
 /**
  * An environment variable, or `undefined` on a runtime with no `process.env` (most edge runtimes).
+ *
+ * @internal
  */
 export function envVar(name: string): string | undefined {
   const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
@@ -42,6 +56,8 @@ export function envVar(name: string): string | undefined {
  *
  * The specifier is built at run time so bundlers for edge targets leave it alone instead of failing to
  * resolve it.
+ *
+ * @internal
  */
 export async function importNodeBuiltin<T>(name: string, feature: string): Promise<T> {
   const specifier = "node:" + name;

@@ -89,7 +89,11 @@ export class SigningKeyPair {
   }
 }
 
-/** The JWS algorithms {@link SigningKeyPair} can generate and sign with. */
+/**
+ * The JWS algorithms {@link SigningKeyPair} can generate and sign with.
+ *
+ * @internal
+ */
 export const SUPPORTED_ALGORITHMS: readonly string[] = [
   "ES256", "ES384", "ES512",
   "RS256", "RS384", "RS512",
@@ -112,7 +116,11 @@ function publicMembers(jwk: JWK): JWK {
     : { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y };
 }
 
-/** RFC 7638 JWK thumbprint (SHA-256, base64url) over the required members only. */
+/**
+ * RFC 7638 JWK thumbprint (SHA-256, base64url) over the required members only.
+ *
+ * @internal
+ */
 export async function thumbprint(publicJwk: JWK): Promise<string> {
   return calculateJwkThumbprint(publicJwk, "sha256");
 }
@@ -122,6 +130,8 @@ export async function thumbprint(publicJwk: JWK): Promise<string> {
  *
  * When `embedJwk` is set the public key travels in a `jwk` header (as DPoP requires); otherwise
  * the key's thumbprint `kid` is set.
+ *
+ * @internal
  */
 export async function signCompact(
   claims: Record<string, unknown>,
@@ -140,6 +150,7 @@ export async function signCompact(
   return new SignJWT(claims).setProtectedHeader(header as never).sign(key.privateKey);
 }
 
+/** @internal */
 export function requireText(value: string | null | undefined, field: string): string {
   if (value == null || String(value).trim() === "") {
     throw new Error(`${field} is required`);

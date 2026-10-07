@@ -1,9 +1,9 @@
 package tokenvalidator
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,14 +13,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jws"
 
 	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
-// httpPostFunc performs a form POST and returns the parsed JSON object. Injectable so tests can avoid real
-// HTTP; defaults to defaultHTTPPost.
-type httpPostFunc func(endpoint, body string, headers map[string]string) (map[string]any, error)
+// HTTPPostFunc performs a form POST and returns the parsed JSON object, for WithHTTPPost (introspection).
+// The default uses net/http with the SDK's timeout, no redirects and a response size cap.
+type HTTPPostFunc func(endpoint, body string, headers map[string]string) (map[string]any, error)
 
 // AccessTokenValidator validates access tokens for a resource server.
 //
@@ -32,19 +34,24 @@ type httpPostFunc func(endpoint, body string, headers map[string]string) (map[st
 type AccessTokenValidator struct {
 	config   *Config
 	jwks     *jwksProvider
-	httpGet  httpGetFunc
-	httpPost httpPostFunc
+	httpGet  HTTPGetFunc
+	httpPost HTTPPostFunc
 	logger   *slog.Logger
+	now      func() time.Time
 }
 
 // Option customizes a validator (e.g. injecting HTTP transports for tests).
 type Option func(*AccessTokenValidator)
 
 // WithHTTPGet injects the transport used to fetch a jwks_uri.
-func WithHTTPGet(f httpGetFunc) Option { return func(v *AccessTokenValidator) { v.httpGet = f } }
+func WithHTTPGet(f HTTPGetFunc) Option { return func(v *AccessTokenValidator) { v.httpGet = f } }
 
 // WithHTTPPost injects the transport used for introspection.
-func WithHTTPPost(f httpPostFunc) Option { return func(v *AccessTokenValidator) { v.httpPost = f } }
+func WithHTTPPost(f HTTPPostFunc) Option { return func(v *AccessTokenValidator) { v.httpPost = f } }
+
+// WithClock sets the clock exp, nbf and iat are checked against (default time.Now), to validate as of a
+// fixed instant.
+func WithClock(now func() time.Time) Option { return func(v *AccessTokenValidator) { v.now = now } }
 
 // New builds a validator from config. It refuses a config without an issuer or an audience.
 func New(config *Config, opts ...Option) (*AccessTokenValidator, error) {
@@ -54,7 +61,10 @@ func New(config *Config, opts ...Option) (*AccessTokenValidator, error) {
 	if len(config.Audiences) == 0 {
 		return nil, errors.New("tokenvalidator: at least one audience is required")
 	}
-	v := &AccessTokenValidator{config: config, httpPost: defaultHTTPPost}
+	if err := config.check(); err != nil {
+		return nil, err
+	}
+	v := &AccessTokenValidator{config: config, httpPost: defaultHTTPPost, now: time.Now}
 	for _, o := range opts {
 		o(v)
 	}
@@ -79,19 +89,27 @@ func (v *AccessTokenValidator) validate(token string, requiredScopes []string) R
 		required = v.config.RequiredScopes
 	}
 
-	msg, err := jws.Parse([]byte(token))
-	if err != nil || len(msg.Signatures()) == 0 {
+	parts, err := splitCompact(token)
+	if err != nil {
+		// never echo token data to the caller: the description lands in WWW-Authenticate
 		return failure(ErrInvalidToken, "malformed token")
 	}
-	header := msg.Signatures()[0].ProtectedHeaders()
-	alg := header.Algorithm()
-	kid := header.KeyID()
+	header := parts.header
 
-	if !contains(v.config.acceptedAlgorithms(), alg.String()) {
+	alg, _ := header["alg"].(string)
+	if alg == "" || isForbiddenAlgorithm(alg) || !contains(v.config.acceptedAlgorithms(), alg) {
 		return failure(ErrUnsupportedAlgorithm, "algorithm not accepted")
 	}
 
-	key, err := v.jwks.resolve(kid, alg.String())
+	var key jwk.Key
+	switch kid := header["kid"].(type) {
+	case nil:
+		key, err = v.jwks.resolve("", alg)
+	case string:
+		if kid != "" { // an empty kid names no key; only an absent one means "the sole key"
+			key, err = v.jwks.resolve(kid, alg)
+		}
+	}
 	if err != nil {
 		return failure(ErrKeyNotFound, err.Error())
 	}
@@ -99,24 +117,23 @@ func (v *AccessTokenValidator) validate(token string, requiredScopes []string) R
 		return failure(ErrKeyNotFound, "no signing key matches the token")
 	}
 
-	payload, err := jws.Verify([]byte(token), jws.WithKey(alg, key))
-	if err != nil {
+	if !verifySignature(alg, key, parts) {
 		return failure(ErrInvalidSignature, "signature verification failed")
 	}
-	var claims map[string]any
-	if err := json.Unmarshal(payload, &claims); err != nil || claims == nil {
-		return failure(ErrInvalidToken, "malformed claims")
+	claims, err := parseObject(parts.payload, "payload")
+	if err != nil {
+		return failure(ErrInvalidToken, err.Error())
 	}
 
-	if typ := header.Type(); typ != "" && !v.config.acceptsTokenType(typ) {
+	if typ, present := header["typ"]; present && typ != nil && !v.acceptsType(typ) {
 		return failure(ErrInvalidTokenType, "token is not a JWT access token")
 	}
 
-	if stringClaim(claims, "iss") != v.config.Issuer {
+	if iss, _ := claims["iss"].(string); iss != v.config.Issuer {
 		return failure(ErrInvalidIssuer, "unexpected issuer")
 	}
 
-	now := time.Now().Unix()
+	now := v.now().Unix()
 	leeway := int64(v.config.leeway())
 	exp, hasExp, err := numericDate(claims, "exp")
 	if err != nil {
@@ -143,17 +160,45 @@ func (v *AccessTokenValidator) validate(token string, requiredScopes []string) R
 		return failure(ErrIssuedInFuture, "token was issued in the future")
 	}
 
-	audience := audienceList(claims["aud"])
+	audience, err := audienceOf(claims)
+	if err != nil {
+		return failure(ErrInvalidToken, err.Error())
+	}
 	if !anyIn(v.config.Audiences, audience) {
 		return failure(ErrInvalidAudience, "token audience is not accepted")
 	}
 
-	granted := scopesFromClaims(claims)
+	granted, err := scopesOf(claims)
+	if err != nil {
+		return failure(ErrInvalidToken, err.Error())
+	}
 	if missing := missingScopes(required, granted); len(missing) > 0 {
 		return failure(ErrInsufficientScope, "missing scopes: "+strings.Join(missing, " "))
 	}
+	if err := checkSubject(claims); err != nil {
+		return failure(ErrInvalidToken, err.Error())
+	}
 
 	return success(claims, granted, audience)
+}
+
+// acceptsType reports whether a present, non-null typ header is acceptable: a non-string never is (unless the
+// check is off).
+func (v *AccessTokenValidator) acceptsType(typ any) bool {
+	s, ok := typ.(string)
+	if !ok {
+		return v.config.DisableTokenTypeCheck
+	}
+	return v.config.acceptsTokenType(s)
+}
+
+// verifySignature checks the JWS signature over the signing input with key, for alg only.
+func verifySignature(alg string, key jwk.Key, parts *compactParts) bool {
+	verifier, err := jws.NewVerifier(jwa.SignatureAlgorithm(alg))
+	if err != nil {
+		return false
+	}
+	return verifier.Verify(parts.signingInput, parts.signature, key) == nil
 }
 
 // Introspect performs an RFC 7662 introspection request and returns the parsed response.
@@ -181,6 +226,9 @@ func (v *AccessTokenValidator) Introspect(token string) (map[string]any, error) 
 		post = defaultHTTPPost
 	}
 	data, err := post(cfg.Endpoint, form.Encode(), headers)
+	if err == nil && data == nil {
+		err = errors.New("introspection: the response is not a JSON object")
+	}
 	if err != nil {
 		reason, status := failureReason(err)
 		sdklog.Log(context.Background(), v.logger, slog.LevelWarn, "http.failed",
@@ -191,16 +239,20 @@ func (v *AccessTokenValidator) Introspect(token string) (map[string]any, error) 
 	return data, err
 }
 
-// ValidateActive introspects the token and enforces active plus scope/audience from the response.
-func (v *AccessTokenValidator) ValidateActive(token string, requiredScopes []string) Result {
-	return v.logVerdict(v.validateActive(token, requiredScopes), "introspection")
-}
-
-func (v *AccessTokenValidator) validateActive(token string, requiredScopes []string) Result {
+// ValidateActive introspects the token and enforces active, then scope, then the audience when the response
+// carries one. A failed introspection call (no endpoint configured, a transport failure, a non-2xx answer
+// or a body that is not a JSON object) is returned as an error, never as a verdict: it says nothing about
+// the token.
+func (v *AccessTokenValidator) ValidateActive(token string, requiredScopes []string) (Result, error) {
 	data, err := v.Introspect(token)
 	if err != nil {
-		return failure(ErrInvalidToken, err.Error())
+		return Result{}, err
 	}
+	return v.logVerdict(v.validateActive(data, requiredScopes), "introspection"), nil
+}
+
+func (v *AccessTokenValidator) validateActive(data map[string]any, requiredScopes []string) Result {
+	// RFC 7662 section 2.2: active is a boolean, so only JSON true counts
 	if active, _ := data["active"].(bool); !active {
 		return failure(ErrInactive, "token is not active")
 	}
@@ -208,18 +260,28 @@ func (v *AccessTokenValidator) validateActive(token string, requiredScopes []str
 	if required == nil {
 		required = v.config.RequiredScopes
 	}
-	granted := scopesFromClaims(data)
+	granted, err := scopesOf(data)
+	if err != nil {
+		return failure(ErrInvalidToken, err.Error())
+	}
 	if missing := missingScopes(required, granted); len(missing) > 0 {
 		return failure(ErrInsufficientScope, "missing scopes: "+strings.Join(missing, " "))
 	}
-	audience := audienceList(data["aud"])
-	if len(v.config.Audiences) > 0 && len(audience) > 0 && !anyIn(v.config.Audiences, audience) {
+	audience, err := audienceOf(data)
+	if err != nil {
+		return failure(ErrInvalidToken, err.Error())
+	}
+	if len(audience) > 0 && !anyIn(v.config.Audiences, audience) {
 		return failure(ErrInvalidAudience, "token audience is not accepted")
+	}
+	if err := checkSubject(data); err != nil {
+		return failure(ErrInvalidToken, err.Error())
 	}
 	return success(data, granted, audience)
 }
 
-const maxIntrospectionBytes = 64 * 1024
+// MaxIntrospectionBytes caps the size of an introspection response; a larger one is an error.
+const MaxIntrospectionBytes = 1024 * 1024
 
 // introspectionHTTPClient never follows a redirect: it would carry the resource server's credentials.
 var introspectionHTTPClient = &http.Client{
@@ -245,15 +307,15 @@ func defaultHTTPPost(endpoint, body string, headers map[string]string) (map[stri
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, &statusError{what: "introspection", status: resp.StatusCode}
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxIntrospectionBytes))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxIntrospectionBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
+	if len(raw) > MaxIntrospectionBytes {
+		return nil, fmt.Errorf("introspection: response is larger than %d bytes", MaxIntrospectionBytes)
 	}
-	return out, nil
+	// like every port's shared transport, invalid UTF-8 becomes U+FFFD; the JSON itself is parsed strictly
+	return parseObject(bytes.ToValidUTF8(raw, []byte("\uFFFD")), "introspection response")
 }
 
 // --- claim helpers (also used by result.go's success) ---
@@ -266,69 +328,11 @@ func stringClaim(claims map[string]any, key string) string {
 }
 
 func intClaim(claims map[string]any, key string) int64 {
-	i, _ := toInt64(claims[key])
-	return i
-}
-
-// numericDate reads a NumericDate claim. ok is false when the claim is absent; anything but a JSON number
-// is an error.
-func numericDate(claims map[string]any, key string) (value int64, ok bool, err error) {
-	raw, present := claims[key]
-	if !present || raw == nil {
-		return 0, false, nil
+	n, ok, err := numericDate(claims, key)
+	if !ok || err != nil {
+		return 0
 	}
-	n, isNumber := toInt64(raw)
-	if !isNumber {
-		return 0, false, fmt.Errorf("%s is not a NumericDate", key)
-	}
-	return n, true, nil
-}
-
-func toInt64(v any) (int64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return int64(n), true
-	case json.Number:
-		i, _ := n.Int64()
-		return i, true
-	case int64:
-		return n, true
-	case int:
-		return int64(n), true
-	}
-	return 0, false
-}
-
-func scopesFromClaims(claims map[string]any) []string {
-	if s, ok := claims["scope"].(string); ok {
-		return strings.Fields(s)
-	}
-	if arr, ok := claims["scp"].([]any); ok {
-		out := make([]string, 0, len(arr))
-		for _, x := range arr {
-			if s, ok := x.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	return nil
-}
-
-func audienceList(v any) []string {
-	switch a := v.(type) {
-	case string:
-		return []string{a}
-	case []any:
-		out := make([]string, 0, len(a))
-		for _, x := range a {
-			if s, ok := x.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	return nil
+	return n
 }
 
 func contains(list []string, s string) bool {

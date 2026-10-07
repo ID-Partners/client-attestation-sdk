@@ -11,8 +11,8 @@ import jwt
 from client_attestation_sdk import _http, _log
 from client_attestation_sdk.errors import TransportError
 
-from . import errors
-from .config import normalise_type
+from . import _strict, errors
+from .config import _is_forbidden_algorithm, _normalise_type
 from .jwks import JwksProvider
 from .result import ValidationResult
 
@@ -20,9 +20,19 @@ from .result import ValidationResult
 _logger = _log.get("validator")
 
 
+MAX_INTROSPECTION_BYTES = 1024 * 1024
+
+
 def _default_post(url, body, headers):
-    response = _http.request("POST", url, headers=headers, body=body.encode("utf-8"), timeout=10)
-    return _http.json_ok(response, "introspection endpoint")
+    # the shared transport refuses redirects (they would carry the credentials) and bodies over the cap
+    response = _http.request("POST", url, headers=headers, body=body.encode("utf-8"), timeout=10,
+                             max_bytes=MAX_INTROSPECTION_BYTES)
+    # like every port's shared transport, invalid UTF-8 becomes U+FFFD; the JSON itself is parsed strictly
+    text = _http.text_ok(response, "introspection endpoint")
+    try:
+        return _strict.parse_object(text.encode("utf-8"), "introspection response")
+    except _strict.Malformed as exc:
+        raise TransportError(f"introspection endpoint returned {exc}", status=response.status) from None
 
 
 class AccessTokenValidator:
@@ -35,8 +45,11 @@ class AccessTokenValidator:
     instead uses RFC 7662 introspection.
     """
 
-    def __init__(self, config, http_post=None, http_get=None):
+    def __init__(self, config, http_post=None, http_get=None, *, clock=None):
+        """``clock`` returns the current time in epoch seconds (default :func:`time.time`); inject one to
+        validate as of a fixed instant."""
         self.config = config
+        self._clock = clock or time.time
         self._jwks = JwksProvider(jwks=config.jwks, jwks_uri=config.jwks_uri, http_get=http_get)
         self._http_post = http_post or _default_post
 
@@ -47,67 +60,71 @@ class AccessTokenValidator:
         required = self.config.required_scopes if required_scopes is None else list(required_scopes)
 
         try:
-            header = jwt.get_unverified_header(token)
-        except Exception:
-            # The parser's message can quote the header bytes; never echo token data to the caller.
-            return ValidationResult.failure(errors.INVALID_TOKEN, "malformed token")
+            header, signing_input, payload, signature = _strict.split_compact(token)
+        except _strict.Malformed:
+            # never echo token data to the caller: the description lands in WWW-Authenticate
+            return ValidationResult._failure(errors.INVALID_TOKEN, "malformed token")
 
         alg = header.get("alg")
-        if alg not in self.config.accepted_algorithms:
-            return ValidationResult.failure(errors.UNSUPPORTED_ALGORITHM, "algorithm not accepted")
+        if not isinstance(alg, str) or _is_forbidden_algorithm(alg) or alg not in self.config.accepted_algorithms:
+            return ValidationResult._failure(errors.UNSUPPORTED_ALGORITHM, "algorithm not accepted")
 
-        key = self._jwks.resolve(header.get("kid"), alg)
+        kid = header.get("kid")
+        key = self._jwks.resolve(kid, alg) if kid is None or isinstance(kid, str) else None
         if key is None:
-            return ValidationResult.failure(errors.KEY_NOT_FOUND, self._jwks.last_error or "no signing key for this kid")
+            return ValidationResult._failure(errors.KEY_NOT_FOUND, self._jwks.last_error or "no signing key for this kid")
 
         try:
-            claims = jwt.decode(token, key, algorithms=[alg], options={
-                "verify_signature": True, "verify_exp": False, "verify_nbf": False,
-                "verify_iat": False, "verify_aud": False, "verify_iss": False,
-            })
-        except jwt.InvalidSignatureError:
-            return ValidationResult.failure(errors.INVALID_SIGNATURE, "signature verification failed")
-        except jwt.DecodeError:
-            # Generic messages only: PyJWT's text may quote token contents, which must not reach a header.
-            return ValidationResult.failure(errors.INVALID_SIGNATURE, "token could not be decoded")
-        except jwt.PyJWTError:
-            return ValidationResult.failure(errors.INVALID_TOKEN, "token is invalid")
+            verified = jwt.get_algorithm_by_name(alg).verify(signing_input, key, signature)
+        except Exception:
+            verified = False
+        if not verified:
+            return ValidationResult._failure(errors.INVALID_SIGNATURE, "signature verification failed")
+
+        try:
+            claims = _strict.parse_object(payload)
+        except _strict.Malformed as exc:
+            return ValidationResult._failure(errors.INVALID_TOKEN, str(exc))
 
         typ = header.get("typ")
         accepted_types = self.config.accepted_token_types
-        if typ is not None and accepted_types is not None and normalise_type(typ) not in accepted_types:
-            return ValidationResult.failure(errors.INVALID_TOKEN_TYPE, "token is not a JWT access token")
+        if typ is not None and accepted_types is not None and (
+                not isinstance(typ, str) or _normalise_type(typ) not in accepted_types):
+            return ValidationResult._failure(errors.INVALID_TOKEN_TYPE, "token is not a JWT access token")
 
         if claims.get("iss") != self.config.issuer:
-            return ValidationResult.failure(errors.INVALID_ISSUER, "unexpected issuer")
+            return ValidationResult._failure(errors.INVALID_ISSUER, "unexpected issuer")
 
-        now = int(time.time())
+        now = int(self._clock())
         leeway = self.config.leeway_seconds
         try:
-            exp = _numeric(claims, "exp")
-            nbf = _numeric(claims, "nbf")
-            iat = _numeric(claims, "iat")
-        except ValueError as exc:
-            return ValidationResult.failure(errors.INVALID_TOKEN, str(exc))
+            exp = _strict.numeric_date(claims, "exp")
+            nbf = _strict.numeric_date(claims, "nbf")
+            iat = _strict.numeric_date(claims, "iat")
+        except _strict.Malformed as exc:
+            return ValidationResult._failure(errors.INVALID_TOKEN, str(exc))
         if exp is None:
-            return ValidationResult.failure(errors.MISSING_EXPIRY, "token has no exp claim")
+            return ValidationResult._failure(errors.MISSING_EXPIRY, "token has no exp claim")
         if now > exp + leeway:
-            return ValidationResult.failure(errors.EXPIRED, "token has expired")
+            return ValidationResult._failure(errors.EXPIRED, "token has expired")
         if nbf is not None and now + leeway < nbf:
-            return ValidationResult.failure(errors.NOT_YET_VALID, "token is not yet valid")
+            return ValidationResult._failure(errors.NOT_YET_VALID, "token is not yet valid")
         if iat is not None and now + leeway < iat:
-            return ValidationResult.failure(errors.ISSUED_IN_FUTURE, "token was issued in the future")
+            return ValidationResult._failure(errors.ISSUED_IN_FUTURE, "token was issued in the future")
 
-        audience = _as_list(claims.get("aud"))
-        if not any(a in audience for a in self.config.audiences):
-            return ValidationResult.failure(errors.INVALID_AUDIENCE, "token audience is not accepted")
+        try:
+            audience = _strict.audience(claims)
+            if not any(a in audience for a in self.config.audiences):
+                return ValidationResult._failure(errors.INVALID_AUDIENCE, "token audience is not accepted")
+            granted = _strict.scopes(claims)
+            missing = [s for s in required if s not in granted]
+            if missing:
+                return ValidationResult._failure(errors.INSUFFICIENT_SCOPE, "missing scopes: " + " ".join(missing))
+            _strict.subject(claims)
+        except _strict.Malformed as exc:
+            return ValidationResult._failure(errors.INVALID_TOKEN, str(exc))
 
-        granted = _scopes(claims)
-        missing = [s for s in required if s not in granted]
-        if missing:
-            return ValidationResult.failure(errors.INSUFFICIENT_SCOPE, "missing scopes: " + " ".join(missing))
-
-        return ValidationResult.success(claims, granted, audience)
+        return ValidationResult._success(claims, granted, audience)
 
     def introspect(self, token, token_type_hint="access_token"):
         """RFC 7662: POST the token to the AS introspection endpoint and return the parsed response."""
@@ -123,7 +140,10 @@ class AccessTokenValidator:
             form["client_id"] = cfg.client_id
             form["client_secret"] = cfg.client_secret
         try:
-            return self._http_post(cfg.endpoint, urllib.parse.urlencode(form), headers)
+            data = self._http_post(cfg.endpoint, urllib.parse.urlencode(form), headers)
+            if not isinstance(data, dict):
+                raise TransportError("introspection endpoint returned JSON that is not an object")
+            return data
         except TransportError as error:
             _log.emit(_logger, logging.WARNING, "http.failed", step="introspection", method="POST",
                       host=_log.host(cfg.endpoint), path=_log.path(cfg.endpoint), status=error.status,
@@ -136,17 +156,22 @@ class AccessTokenValidator:
 
     def _validate_active(self, token, required_scopes):
         data = self.introspect(token)
-        if not data.get("active"):
-            return ValidationResult.failure(errors.INACTIVE, "token is not active")
+        # RFC 7662 section 2.2: active is a boolean, so only JSON true counts
+        if data.get("active") is not True:
+            return ValidationResult._failure(errors.INACTIVE, "token is not active")
         required = self.config.required_scopes if required_scopes is None else list(required_scopes)
-        granted = _scopes(data)
-        missing = [s for s in required if s not in granted]
-        if missing:
-            return ValidationResult.failure(errors.INSUFFICIENT_SCOPE, "missing scopes: " + " ".join(missing))
-        audience = _as_list(data.get("aud"))
-        if self.config.audiences and audience and not any(a in audience for a in self.config.audiences):
-            return ValidationResult.failure(errors.INVALID_AUDIENCE, "token audience is not accepted")
-        return ValidationResult.success(data, granted, audience)
+        try:
+            granted = _strict.scopes(data)
+            missing = [s for s in required if s not in granted]
+            if missing:
+                return ValidationResult._failure(errors.INSUFFICIENT_SCOPE, "missing scopes: " + " ".join(missing))
+            audience = _strict.audience(data)
+            if audience and not any(a in audience for a in self.config.audiences):
+                return ValidationResult._failure(errors.INVALID_AUDIENCE, "token audience is not accepted")
+            _strict.subject(data)
+        except _strict.Malformed as exc:
+            return ValidationResult._failure(errors.INVALID_TOKEN, str(exc))
+        return ValidationResult._success(data, granted, audience)
 
 
 def _verdict(result, mode):
@@ -154,29 +179,3 @@ def _verdict(result, mode):
     code = errors.VALID if result.valid else result.error
     _log.emit(_logger, logging.DEBUG if result.valid else logging.INFO, "token.validated", result=code, mode=mode)
     return result
-
-
-def _numeric(claims, name):
-    """A NumericDate claim as an int, ``None`` when absent. Booleans and non-numbers are malformed."""
-    value = claims.get(name)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} is not a NumericDate")
-    return int(value)
-
-
-def _as_list(value):
-    if value is None:
-        return []
-    return [value] if isinstance(value, str) else list(value)
-
-
-def _scopes(claims):
-    scope = claims.get("scope")
-    if isinstance(scope, str):
-        return scope.split()
-    scp = claims.get("scp")
-    if isinstance(scp, list):
-        return list(scp)
-    return []

@@ -4,21 +4,25 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { TransportError } from "../src/errors.js";
 import { AccessTokenValidator, errors } from "../src/validator/index.js";
 
 const VALIDATION = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "validation");
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const vectors: any = JSON.parse(readFileSync(join(VALIDATION, "tokens.json"), "utf8"));
 
-function newValidator(overrides: Record<string, unknown> = {}) {
-  return new AccessTokenValidator({
+function baseConfig() {
+  return {
     issuer: vectors.issuer,
     audiences: [vectors.audience],
     jwks: vectors.jwks,
     requiredScopes: vectors.required_scopes,
     acceptedAlgorithms: vectors.accepted_algorithms,
-    ...overrides,
-  });
+  };
+}
+
+function newValidator(overrides: Record<string, unknown> = {}) {
+  return new AccessTokenValidator({ ...baseConfig(), ...overrides });
 }
 
 function tokenNamed(name: string): string {
@@ -27,10 +31,46 @@ function tokenNamed(name: string): string {
 
 describe("token validator", () => {
   it("validates every shared vector to its expected verdict", async () => {
-    const validator = newValidator();
     for (const c of vectors.cases) {
+      const o = c.config ?? {};
+      const overrides: Record<string, unknown> = {};
+      if ("accepted_algorithms" in o) overrides.acceptedAlgorithms = o.accepted_algorithms;
+      if ("accepted_token_types" in o) overrides.acceptedTokenTypes = o.accepted_token_types;
+      if ("leeway_seconds" in o) overrides.leewaySeconds = o.leeway_seconds;
+      const validator = new AccessTokenValidator(
+        { ...baseConfig(), ...overrides },
+        c.now === undefined ? {} : { clock: () => c.now * 1000 },
+      );
       const result = await validator.validate(c.token);
       const got = result.valid ? "valid" : result.error;
+      expect(got, c.name).toBe(c.expect);
+    }
+  });
+
+  it("validates every shared introspection vector to its expected verdict", async () => {
+    const cases = JSON.parse(readFileSync(join(VALIDATION, "introspection.json"), "utf8")).cases;
+    for (const c of cases) {
+      const validator = new AccessTokenValidator(
+        {
+          ...baseConfig(),
+          introspection: c.no_endpoint
+            ? undefined
+            : { endpoint: "https://as.example.com/introspect", clientId: "rs", clientSecret: "s" },
+        },
+        {
+          httpPost: async () => {
+            if (c.transport_error) throw new TransportError("introspection failed: 503", "status", { status: 503 });
+            return c.response;
+          },
+        },
+      );
+      let got: string | null;
+      try {
+        const result = await validator.validateActive("opaque");
+        got = result.valid ? "valid" : result.error;
+      } catch {
+        got = "raises";
+      }
       expect(got, c.name).toBe(c.expect);
     }
   });

@@ -442,6 +442,8 @@
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
           <tr class="cap-row"><td>Logging hooks</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+          <tr class="cap-row"><td>Attester profiles</td>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
           <tr class="cap-row"><td>Trace every call as curl</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
           <tr class="cap-row"><td>Asserted context at mint</td>
@@ -467,11 +469,11 @@
           <tr class="cap-row"><td>SPIFFE issuance bootstrap</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
           <tr class="cap-row"><td>Token validator</td>
-            <td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
           <tr class="cap-row"><td>MCP and A2A protected-resource helper</td>
-            <td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
+            <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
           <tr class="cap-row"><td>Authorization-server metadata discovery</td>
-            <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
+            <td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
           <tr class="cap-row"><td>Challenge handling</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
 <!-- features:end -->
@@ -611,7 +613,7 @@
     </div>
     <p class="section-dek">Four ports, plus what keeps them honest with each other.</p>
     <pre class="tree"><span class="path">go/</span>           <span class="desc">builder package + tokenvalidator/                    (lestrrat-go/jwx)</span>
-<span class="path">java/</span>         <span class="desc">builder + one-call client, no validator              (jose4j)</span>
+<span class="path">java/</span>         <span class="desc">builder + one-call client + tokenvalidator           (jose4j)</span>
 <span class="path">python/</span>       <span class="desc">client_attestation_sdk (+ .token_validator, .authz_challenge)  (PyJWT + cryptography)</span>
 <span class="path">typescript/</span>   <span class="desc">src/ builder + src/validator/                        (panva jose; Node 20+ or edge)</span>
 <span class="path">vectors/</span>      <span class="desc">client-builder shared vectors + outputs</span>

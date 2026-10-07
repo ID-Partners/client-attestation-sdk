@@ -24,7 +24,11 @@ class ValidatorConfig:
     ``issuer`` and ``audiences`` are required: a validator that skips either accepts tokens minted for
     someone else. ``accepted_token_types`` is checked against the JWT ``typ`` header when the token carries
     one, so an ID token can't stand in for an access token. Pass ``None`` to turn that check off for an
-    issuer that stamps something other than ``at+jwt``."""
+    issuer that stamps something other than ``at+jwt``.
+
+    An explicitly empty ``accepted_algorithms`` or ``accepted_token_types`` accepts nothing, and
+    ``leeway_seconds=0`` allows no clock skew: only an omitted argument takes the default. ``none`` and the
+    ``HS*`` algorithms are refused even when listed (see validation/SEMANTICS.md)."""
 
     def __init__(self, issuer, audiences, *, jwks=None, jwks_uri=None, required_scopes=None,
                  accepted_algorithms=DEFAULT_ALGORITHMS, leeway_seconds=60, introspection=None,
@@ -36,7 +40,7 @@ class ValidatorConfig:
         if not self.audiences:
             raise ValueError("at least one audience is required")
         self.accepted_token_types = (
-            None if accepted_token_types is None else tuple(normalise_type(t) for t in accepted_token_types))
+            None if accepted_token_types is None else tuple(_normalise_type(t) for t in accepted_token_types))
         self.jwks = jwks
         self.jwks_uri = jwks_uri
         self.required_scopes = list(required_scopes or [])
@@ -45,7 +49,15 @@ class ValidatorConfig:
         self.introspection = introspection
 
 
-def normalise_type(value):
+def _is_forbidden_algorithm(alg):
+    """``none`` (in any case) and the HMAC algorithms are refused whatever ``accepted_algorithms`` says: an
+    unsigned token proves nothing, and an HMAC "signature" checked against an issuer's public key is forgeable
+    by anyone who has that key."""
+    lowered = alg.lower()
+    return lowered == "none" or lowered.startswith("hs")
+
+
+def _normalise_type(value):
     """Compare JOSE typ values the way RFC 7515 section 4.1.9 says to: case-insensitively, with an optional
     ``application/`` prefix."""
     value = str(value).lower()

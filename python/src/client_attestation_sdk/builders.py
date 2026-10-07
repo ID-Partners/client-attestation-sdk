@@ -7,8 +7,8 @@ import time
 import urllib.parse
 import uuid
 
-from .keys import SigningKeyPair, require_text, sign_compact
-from .signer import JwsSigner, sign_external
+from .keys import SigningKeyPair, _require_text, _sign_compact
+from .signer import JwsSigner, _sign_external
 
 ATTESTATION_TYP = "oauth-client-attestation+jwt"
 POP_TYP = "oauth-client-attestation-pop+jwt"
@@ -21,7 +21,7 @@ class ClientAttestationBuilder:
 
     def __init__(self, attester_key: "SigningKeyPair | JwsSigner", issuer: str):
         self._attester_key = attester_key
-        self._issuer = require_text(issuer, "issuer")
+        self._issuer = _require_text(issuer, "issuer")
         self._client_id = None
         self._cnf_jwk = None
         self._issued_at = None
@@ -79,13 +79,13 @@ class ClientAttestationBuilder:
         This is an ASSERTION by the attester, not proof the operator authorised anything. A
         relying AS should treat it as it treats the rest of the attestation: trusted exactly as
         far as the attester is."""
-        self._operator = {"sub": require_text(sub, "operator sub")}
+        self._operator = {"sub": _require_text(sub, "operator sub")}
         if issuer:
             self._operator["iss"] = issuer
         return self
 
     def build(self) -> str:
-        sub = require_text(self._client_id, "client_id")
+        sub = _require_text(self._client_id, "client_id")
         if self._cnf_jwk is None:
             raise ValueError("confirmation key (cnf.jwk) is required")
         iat = self._issued_at if self._issued_at is not None else int(time.time())
@@ -98,8 +98,8 @@ class ClientAttestationBuilder:
         if self._operator:
             claims["operator"] = self._operator
         if isinstance(self._attester_key, SigningKeyPair):
-            return sign_compact(claims, self._attester_key, ATTESTATION_TYP, embed_jwk=False)
-        return sign_external(claims, self._attester_key, ATTESTATION_TYP)
+            return _sign_compact(claims, self._attester_key, ATTESTATION_TYP, embed_jwk=False)
+        return _sign_external(claims, self._attester_key, ATTESTATION_TYP)
 
     def _resolve_expiry(self, iat: int) -> int:
         if self._expires_at is not None:
@@ -153,13 +153,13 @@ class PopBuilder:
             claims["iss"] = self._client_id
         if self._challenge:
             claims["challenge"] = self._challenge
-        return sign_compact(claims, self._instance_key, POP_TYP, embed_jwk=False)
+        return _sign_compact(claims, self._instance_key, POP_TYP, embed_jwk=False)
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
-def url_origin(url: str) -> str:
+def _url_origin(url: str) -> str:
     """``scheme://host[:port]`` with scheme and host lower-cased and the default port (80 for http,
     443 for https) dropped. No userinfo."""
     parts = urllib.parse.urlsplit(url)
@@ -173,13 +173,13 @@ def url_origin(url: str) -> str:
     return f"{scheme}://{host}"
 
 
-def normalize_htu(url: str) -> str:
-    """The RFC 9449 ``htu`` form of a request URL: :func:`url_origin` plus the path, with no query and
+def _normalize_htu(url: str) -> str:
+    """The RFC 9449 ``htu`` form of a request URL: :func:`_url_origin` plus the path, with no query and
     no fragment. A bare origin gets no trailing ``/`` (``https://as.example`` stays as it is)."""
-    return url_origin(url) + urllib.parse.urlsplit(url).path
+    return _url_origin(url) + urllib.parse.urlsplit(url).path
 
 
-def access_token_hash(access_token: str) -> str:
+def _access_token_hash(access_token: str) -> str:
     """RFC 9449 section 4.2 ``ath``: base64url (unpadded) of SHA-256 over the ASCII access token."""
     digest = hashlib.sha256(access_token.encode("ascii")).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -209,7 +209,7 @@ class DpopProofBuilder:
 
     def access_token(self, access_token: str) -> "DpopProofBuilder":
         """Bind the proof to an access token: sets ``ath`` = base64url(SHA-256(token))."""
-        self._ath = access_token_hash(access_token) if access_token else None
+        self._ath = _access_token_hash(access_token) if access_token else None
         return self
 
     def uri(self, htu: str) -> "DpopProofBuilder":
@@ -233,7 +233,7 @@ class DpopProofBuilder:
             raise ValueError("uri (htu) is required")
         claims = {
             "htm": self._htm,
-            "htu": normalize_htu(self._htu),
+            "htu": _normalize_htu(self._htu),
             "jti": self._jwt_id or str(uuid.uuid4()),
             "iat": self._issued_at if self._issued_at is not None else int(time.time()),
         }
@@ -241,4 +241,4 @@ class DpopProofBuilder:
             claims["nonce"] = self._nonce
         if self._ath:
             claims["ath"] = self._ath
-        return sign_compact(claims, self._instance_key, DPOP_TYP, embed_jwk=True)
+        return _sign_compact(claims, self._instance_key, DPOP_TYP, embed_jwk=True)

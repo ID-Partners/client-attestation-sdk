@@ -1,4 +1,12 @@
 """Client-side builder SDK for OAuth Attestation-Based Client Authentication."""
+from .attester import (
+    AttesterMetadata,
+    AttesterProfile,
+    AttesterTransport,
+    MintRequest,
+    MintResult,
+    PingFederateProfile,
+)
 from .builders import ClientAttestationBuilder, DpopProofBuilder, PopBuilder
 from .errors import TransportError
 from .credential import (
@@ -72,6 +80,12 @@ __all__ = [
     "SpiffeAgentSvidSource",
     "ClientAttestation",
     "ClientAttestationError",
+    "AttesterProfile",
+    "AttesterMetadata",
+    "AttesterTransport",
+    "MintRequest",
+    "MintResult",
+    "PingFederateProfile",
     "TransportError",
     "auto_detect_evidence",
     "EvidenceNotFound",
@@ -80,4 +94,4 @@ __all__ = [
     "AzureImdsSvidSource",
     "AwsWebIdentitySvidSource",
 ]
-__version__ = "0.3.0"
+__version__ = "1.0.0"

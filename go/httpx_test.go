@@ -191,7 +191,7 @@ func TestDecodeJSONOKMalformedJSONIsTyped(t *testing.T) {
 	_, err = ic.Bootstrap(nil, "")
 	asSDKError(t, err)
 	ca, _ := NewClientAttestation(srv.URL)
-	_, err = ca.Discovery(context.Background())
+	_, err = ca.AttesterMetadata(context.Background())
 	asSDKError(t, err)
 }
 
@@ -331,7 +331,7 @@ func TestTokenWaiterHonorsContextCancellation(t *testing.T) {
 	if time.Since(start) > time.Second {
 		t.Fatalf("cancelled waiter took %v", time.Since(start))
 	}
-	if _, err := ca.Discovery(ctx); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := ca.AttesterMetadata(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Discovery waiter got %v", err)
 	}
 

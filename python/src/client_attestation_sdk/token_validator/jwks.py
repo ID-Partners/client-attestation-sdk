@@ -91,11 +91,10 @@ class JwksProvider:
 
     def _lookup(self, kid):
         with self._lock:
-            if kid in self._keys:
-                return self._keys[kid]
-            if kid is None and len(self._keys) == 1:
-                return next(iter(self._keys.values()))
-            return None
+            if kid is None:
+                # a token without a kid is only matched to a set holding exactly one key
+                return next(iter(self._keys.values())) if len(self._keys) == 1 else None
+            return self._keys.get(kid)
 
     def _stale(self):
         with self._lock:

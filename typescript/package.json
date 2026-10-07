@@ -1,6 +1,6 @@
 {
   "name": "@idpartners/client-attestation-sdk",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "Client-side builder SDK for OAuth Attestation-Based Client Authentication",
   "type": "module",
   "main": "dist/index.js",
@@ -28,6 +28,7 @@
     "prepack": "npm run build",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
+    "test:edge": "node test/edge/run-workerd.mjs",
     "emit": "tsx emit.ts",
     "validate-emit": "tsx validate-emit.ts"
   },
@@ -51,6 +52,7 @@
     "esbuild": "^0.28.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "workerd": "1.20261007.1"
   }
 }

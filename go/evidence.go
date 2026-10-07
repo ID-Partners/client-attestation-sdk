@@ -22,11 +22,17 @@ const (
 )
 
 // DefaultTokenFile is the projected-token path used by the Kubernetes/GKE serviceAccountToken volume
-// convention. DefaultSpiffeSocket is the default SPIRE agent socket. These are variables (not consts)
-// so tests can point them elsewhere.
-var (
+// convention. DefaultSpiffeSocket is the default SPIRE agent socket.
+const (
 	DefaultTokenFile    = "/var/run/secrets/tokens/attester-token"
 	DefaultSpiffeSocket = "/tmp/spire-agent/public/api.sock"
+)
+
+// The paths AutoDetectEvidence probes. Variables so tests can point them elsewhere; unexported so nothing
+// outside the package can.
+var (
+	defaultTokenFile    = DefaultTokenFile
+	defaultSpiffeSocket = DefaultSpiffeSocket
 )
 
 // gcpMetadataIdentity is the GCP metadata server identity endpoint (returns a Google-signed ID token for
@@ -126,11 +132,11 @@ func AutoDetectEvidence() (SvidSource, error) {
 		}
 		return FileTokenSvidSource{Path: tokenFile}, nil
 	}
-	if isFile(DefaultTokenFile) {
-		return FileTokenSvidSource{Path: DefaultTokenFile}, nil
+	if isFile(defaultTokenFile) {
+		return FileTokenSvidSource{Path: defaultTokenFile}, nil
 	}
 
-	socketPath := DefaultSpiffeSocket
+	socketPath := defaultSpiffeSocket
 	if socket := os.Getenv(EnvSpiffeSocket); socket != "" {
 		socketPath = strings.TrimPrefix(socket, "unix://")
 		if !pathExists(socketPath) {

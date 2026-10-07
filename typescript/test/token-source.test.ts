@@ -22,9 +22,8 @@ import {
   FileTokenSvidSource,
   GoogleMetadataSvidSource,
   SpireWorkloadApiSvidSource,
-  jwtSub,
-  normalizeBaseUrl,
 } from "../src/index.js";
+import { jwtSub, normalizeBaseUrl } from "../src/token-source.js";
 
 function b64url(obj: unknown): string {
   return Buffer.from(JSON.stringify(obj)).toString("base64url");
@@ -57,6 +56,8 @@ describe("autoDetectEvidence", () => {
     defaultTokenFile: join(dir, "no-default-token"),
     defaultSpiffeSocket: join(dir, "no-default-socket"),
     gcpMetadataBase: refusedBase,
+    // the fake metadata server is local, but a loaded CI runner can take longer than the 300 ms default
+    gcpProbeTimeoutMs: 5000,
   });
 
   beforeEach(async () => {

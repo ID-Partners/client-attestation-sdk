@@ -19,8 +19,8 @@ import {
   OpenBaoTransitSigner,
   StaticSvidSource,
   TransportError,
-  jwtSub,
 } from "../src/index.js";
+import { jwtSub } from "../src/token-source.js";
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 

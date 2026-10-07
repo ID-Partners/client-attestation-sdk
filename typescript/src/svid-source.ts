@@ -28,6 +28,8 @@ export class StaticSvidSource implements SvidSource {
  * For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
  * authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
  * file or cloud source.
+  *
+  * @experimental See docs/api.md: a development and test source with no caller authentication.
  */
 export class HttpSvidSource implements SvidSource {
   constructor(private readonly url: string) {}
@@ -46,6 +48,9 @@ export class HttpSvidSource implements SvidSource {
  *
  * Needs Node.js (it spawns a process): `node:child_process` is loaded on the first `fetch`, which throws
  * a `ClientAttestationError` on a runtime without it.
+  *
+  * @experimental See docs/api.md: it shells out to the spire-agent CLI, and its constructor will change
+  * when it moves to the Workload API socket.
  */
 export class SpireWorkloadApiSvidSource implements SvidSource {
   constructor(

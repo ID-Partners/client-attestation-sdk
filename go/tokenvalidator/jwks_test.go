@@ -16,7 +16,7 @@ type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) now() time.Time { return c.t }
 
-func uriProvider(t *testing.T, get httpGetFunc) (*jwksProvider, *fakeClock) {
+func uriProvider(t *testing.T, get HTTPGetFunc) (*jwksProvider, *fakeClock) {
 	t.Helper()
 	p, err := newJWKSProvider(nil, "https://as.test/jwks", get)
 	if err != nil {

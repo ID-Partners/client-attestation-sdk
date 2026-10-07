@@ -289,7 +289,11 @@ export class DpopProofBuilder {
   }
 }
 
-/** RFC 9449 `ath`: base64url(SHA-256(ASCII access token)). */
+/**
+ * RFC 9449 `ath`: base64url(SHA-256(ASCII access token)).
+ *
+ * @internal
+ */
 export async function accessTokenHash(accessToken: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", utf8Encode(accessToken));
   return base64url.encode(new Uint8Array(digest));
@@ -298,6 +302,8 @@ export async function accessTokenHash(accessToken: string): Promise<string> {
 /**
  * The DPoP `htu` for a URL: scheme, host, port and path, with no query and no fragment. Scheme and host
  * are lower-cased and a default port dropped; a URL with no path keeps none (no slash is invented).
+ *
+ * @internal
  */
 export function normalizeHtu(url: string): string {
   const bare = url.split(/[?#]/, 1)[0];

@@ -36,6 +36,8 @@ class HttpSvidSource:
     For development and testing only. It trusts whatever the URL returns and the endpoint has no caller
     authentication, so anyone who can reach it can obtain the workload's SVID. In production use a SPIRE,
     file or cloud source.
+
+    **Experimental** (see docs/api.md): a development and test source with no caller authentication.
     """
 
     def __init__(self, url: str):
@@ -49,7 +51,11 @@ class HttpSvidSource:
 class SpireWorkloadApiSvidSource:
     """**Default source.** Fetch a JWT-SVID from a real SPIRE agent's Workload API via the ``spire-agent``
     CLI (``spire-agent api fetch jwt -audience <aud> -socketPath <sock>``). Swap for a native Workload API
-    client (py-spiffe) by implementing :class:`SvidSource` if you prefer no subprocess."""
+    client (py-spiffe) by implementing :class:`SvidSource` if you prefer no subprocess.
+
+    **Experimental** (see docs/api.md): it shells out to the spire-agent CLI, and its constructor will
+    change when it moves to the Workload API socket.
+    """
 
     def __init__(self, socket_path: str = "/tmp/spire-agent/public/api.sock", spire_agent: str = "spire-agent"):
         self._socket = socket_path
@@ -70,7 +76,10 @@ class SpireWorkloadApiSvidSource:
 
 class SpiffeAgentSvidSource:
     """Adapts the dependency-free in-process :class:`~client_attestation_sdk.spiffe.SpiffeAgent` (a SPIRE
-    agent stand-in) as a source, attesting the given selectors."""
+    agent stand-in) as a source, attesting the given selectors.
+
+    **Experimental** (see docs/api.md): Python only; a stand-in for tests and demos.
+    """
 
     def __init__(self, agent, selectors: dict):
         self._agent = agent

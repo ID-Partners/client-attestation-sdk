@@ -26,7 +26,7 @@ if [ ! -f "$VERIFIER" ]; then
   echo "Install it first: (cd ../client-attestation && mvn -o install)"
   exit 1
 fi
-mvn -q -B -f java/pom.xml -Pinterop dependency:build-classpath \
+java/mvnw -q -B -f java/pom.xml -Pinterop dependency:build-classpath \
   -Dmdep.includeScope=test -Dmdep.outputFile="$ROOT/interop/out/classpath.txt"
 CP="$(cat interop/out/classpath.txt)"
 

@@ -123,6 +123,8 @@ function httpError(error: ValidationError | null): [number, string] {
 /**
  * Make a value safe inside a quoted-string header parameter: drop CR, LF and every other control
  * character (0x00-0x1F, 0x7F) so nothing can split or forge a header, then escape backslash and quote.
+ *
+ * @internal
  */
 export function quote(value: string): string {
   // eslint-disable-next-line no-control-regex

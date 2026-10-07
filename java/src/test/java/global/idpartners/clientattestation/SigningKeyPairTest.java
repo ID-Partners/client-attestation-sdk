@@ -86,4 +86,16 @@ class SigningKeyPairTest {
                 () -> new PopBuilder(mismatched).audience("https://as.example.com").build());
         assertTrue(e.getMessage().contains("JWS signing failed"));
     }
+
+    @Test
+    void loadsAPrivateJwkFromAMap() throws Exception {
+        EllipticCurveJsonWebKey generated = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        Map<String, Object> params = generated.toParams(JsonWebKey.OutputControlLevel.INCLUDE_PRIVATE);
+        SigningKeyPair key = SigningKeyPair.fromJwk(params, "ES256");
+        assertEquals("ES256", key.algorithm());
+        assertEquals(SigningKeyPair.fromJwk((PublicJsonWebKey) generated, "ES256").keyId(), key.keyId());
+        assertThrows(IllegalArgumentException.class, () -> SigningKeyPair.fromJwk(Map.of("kty", "nope"), "ES256"));
+        Map<String, Object> publicOnly = generated.toParams(JsonWebKey.OutputControlLevel.PUBLIC_ONLY);
+        assertThrows(IllegalArgumentException.class, () -> SigningKeyPair.fromJwk(publicOnly, "ES256"));
+    }
 }

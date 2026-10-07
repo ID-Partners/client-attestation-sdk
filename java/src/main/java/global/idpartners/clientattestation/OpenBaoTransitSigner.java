@@ -1,5 +1,6 @@
 package global.idpartners.clientattestation;
 
+import global.idpartners.clientattestation.internal.HttpTransport;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -25,6 +26,9 @@ import org.jose4j.json.JsonUtil;
  *
  * <p>Dependency-free (JDK {@link HttpClient}). Instances are immutable after initialization and safe to
  * share. Vault errors surface as {@link IllegalStateException} with the HTTP status.
+ *
+ * <p><b>Experimental</b> (see docs/api.md): a client for a third-party API that authenticates with a
+ * static token only; its constructor will change when other auth methods are added.
  */
 public final class OpenBaoTransitSigner implements JwsSigner {
 

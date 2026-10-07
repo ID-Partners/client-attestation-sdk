@@ -12,14 +12,21 @@ import { TransportError } from "../errors.js";
 import { request } from "../http.js";
 import { emit, failureReason, hostOf, NOOP_LOGGER, type Logger } from "../logging.js";
 
-/** An imported verification key, as returned by jose's `importJWK`. */
+/**
+ * An imported verification key, as returned by jose's `importJWK`.
+ *
+ * @internal
+ */
 export type VerificationKey = CryptoKey | Uint8Array;
 
 /** Fetch a URL and return its body text. Injectable so tests can avoid real network I/O. */
 export type HttpGet = (url: string) => Promise<string>;
 
+/** @internal */
 export const MAX_JWKS_BYTES = 512 * 1024;
+/** @internal */
 export const DEFAULT_MIN_REFRESH_SECONDS = 30;
+/** @internal */
 export const DEFAULT_MAX_AGE_SECONDS = 3600;
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -48,6 +55,7 @@ function algorithmFor(jwk: JWK): string {
 
 type Entry = { key: VerificationKey; alg?: string };
 
+/** @internal */
 export interface JwksProviderOptions {
   jwks?: JSONWebKeySet;
   jwksUri?: string;
@@ -62,6 +70,7 @@ export interface JwksProviderOptions {
   logger?: Logger;
 }
 
+/** @internal */
 export class JwksProvider {
   readonly #static: boolean;
   readonly #jwksUri?: string;

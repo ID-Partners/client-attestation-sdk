@@ -56,7 +56,35 @@ public final class SigningKeyPair {
         }
     }
 
-    /** Wraps an existing jose4j JWK (which must contain the private key) for the given algorithm. */
+    /**
+     * Loads a private JWK, as a JSON object map (the shape {@link #publicJwk()} returns, plus the private
+     * members), for the given algorithm.
+     *
+     * @param jwk       the JWK members, including the private key ({@code d}, and for RSA the CRT members)
+     * @param algorithm the JWS algorithm the key signs with, e.g. {@code ES256}
+     * @return the key pair
+     * @throws IllegalArgumentException if the map is not a JWK or has no private key
+     */
+    public static SigningKeyPair fromJwk(Map<String, Object> jwk, String algorithm) {
+        PublicJsonWebKey parsed;
+        try {
+            parsed = PublicJsonWebKey.Factory.newPublicJwk(Objects.requireNonNull(jwk, "jwk"));
+        } catch (JoseException e) {
+            throw new IllegalArgumentException("not a usable JWK: " + e.getMessage(), e);
+        }
+        return fromJwk(parsed, algorithm);
+    }
+
+    /**
+     * Wraps an existing jose4j JWK (which must contain the private key) for the given algorithm.
+     *
+     * <p><b>Experimental</b> (see docs/api.md): it takes a jose4j type, which ties this signature to jose4j.
+     * {@link #fromJwk(Map, String)} is the Stable way to load a key.
+     *
+     * @param jwk       the jose4j JWK, with its private key
+     * @param algorithm the JWS algorithm the key signs with
+     * @return the key pair
+     */
     public static SigningKeyPair fromJwk(PublicJsonWebKey jwk, String algorithm) {
         if (jwk.getPrivateKey() == null) {
             throw new IllegalArgumentException("JWK does not contain a private key");
@@ -87,6 +115,10 @@ public final class SigningKeyPair {
     /**
      * The public-only key as a jose4j {@link JsonWebKey} — e.g. to embed in a DPoP {@code jwk} header
      * or to register with a verifier's attester-key resolver.
+     *
+     * <p><b>Experimental</b> (see docs/api.md): it returns a jose4j type. {@link #publicJwk()} is Stable.
+     *
+     * @return the public key as a jose4j JWK
      */
     public JsonWebKey publicJsonWebKey() {
         try {

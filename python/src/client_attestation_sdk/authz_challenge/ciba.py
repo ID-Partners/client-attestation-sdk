@@ -37,7 +37,6 @@ import threading
 import time
 import urllib.parse
 import uuid
-import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
 
@@ -76,21 +75,13 @@ class CibaError(Exception):
 HttpFn = Callable[[str, str, dict, dict], "tuple[int, str]"]
 
 
-def urllib_http(*, timeout: float = 30.0, dangerously_disable_tls_verification: bool = False,
-                insecure_tls: Optional[bool] = None) -> HttpFn:
+def urllib_http(*, timeout: float = 30.0, dangerously_disable_tls_verification: bool = False) -> HttpFn:
     """Default transport.
 
     ``dangerously_disable_tls_verification`` skips certificate AND hostname verification, so anyone
     on the path can impersonate the AS and read every client assertion and token. Only for an AS
     reached on an internal self-signed address in development, never for a public one.
-
-    ``insecure_tls`` is the old name for the same switch. It still works for one release and emits
-    a :class:`DeprecationWarning`; it will be removed.
     """
-    if insecure_tls is not None:
-        warnings.warn("urllib_http(insecure_tls=...) is deprecated; use "
-                      "dangerously_disable_tls_verification=... instead", DeprecationWarning, stacklevel=2)
-        dangerously_disable_tls_verification = dangerously_disable_tls_verification or bool(insecure_tls)
     ctx = None
     if dangerously_disable_tls_verification:
         ctx = ssl.create_default_context()

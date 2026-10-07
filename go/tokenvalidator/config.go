@@ -2,24 +2,33 @@ package tokenvalidator
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 )
 
-// DefaultAlgorithms is the accepted-algorithm set used when a Config leaves
-// AcceptedAlgorithms empty: ECDSA / RSA-PKCS1 / RSA-PSS at 256/384/512.
-var DefaultAlgorithms = []string{
-	"ES256", "ES384", "ES512",
-	"RS256", "RS384", "RS512",
-	"PS256", "PS384", "PS512",
-}
+// DefaultAlgorithms returns the accepted-algorithm set used when a Config leaves
+// AcceptedAlgorithms nil: ECDSA / RSA-PKCS1 / RSA-PSS at 256/384/512. Each call
+// returns a new slice, so changing it has no effect on validation.
+func DefaultAlgorithms() []string { return append([]string(nil), defaultAlgorithms...) }
 
-// DefaultTokenTypes is the accepted "typ" header set when a Config leaves
-// AcceptedTokenTypes empty: RFC 9068 section 2.1 at+jwt (the application/
-// prefix is optional).
-var DefaultTokenTypes = []string{"at+jwt"}
+// DefaultTokenTypes returns the accepted "typ" header set used when a Config
+// leaves AcceptedTokenTypes nil: RFC 9068 section 2.1 at+jwt (the application/
+// prefix is optional). Each call returns a new slice.
+func DefaultTokenTypes() []string { return append([]string(nil), defaultTokenTypes...) }
+
+// The defaults the validator uses. Unexported, so no other package can widen
+// what a validator with a default Config accepts.
+var (
+	defaultAlgorithms = []string{
+		"ES256", "ES384", "ES512",
+		"RS256", "RS384", "RS512",
+		"PS256", "PS384", "PS512",
+	}
+	defaultTokenTypes = []string{"at+jwt"}
+)
 
 // DefaultLeewaySeconds is the clock skew allowance applied to exp/nbf/iat when a
-// Config leaves LeewaySeconds at zero.
+// Config leaves LeewaySeconds at zero and ZeroLeeway unset.
 const DefaultLeewaySeconds = 60
 
 // IntrospectionConfig holds an RFC 7662 introspection endpoint and the client
@@ -55,15 +64,20 @@ type Config struct {
 	// RequiredScopes must all be granted unless Validate is called with an
 	// explicit override.
 	RequiredScopes []string
-	// AcceptedAlgorithms is the set of accepted "alg" header values. Defaults to
-	// DefaultAlgorithms when empty.
+	// AcceptedAlgorithms is the set of accepted "alg" header values. nil means
+	// DefaultAlgorithms; a non-nil empty slice accepts nothing. "none" and the
+	// HS* algorithms are refused even when listed.
 	AcceptedAlgorithms []string
-	// LeewaySeconds is the clock skew allowance for exp/nbf/iat. Defaults to
-	// DefaultLeewaySeconds when zero.
+	// LeewaySeconds is the clock skew allowance for exp/nbf/iat. Zero means
+	// DefaultLeewaySeconds, because an int can't tell "unset" from 0: set
+	// ZeroLeeway for no allowance at all.
 	LeewaySeconds int
+	// ZeroLeeway allows no clock skew at all. LeewaySeconds must then be 0.
+	ZeroLeeway bool
 	// AcceptedTokenTypes is checked against the JWT "typ" header when the token
-	// carries one, so an ID token can't stand in for an access token. Defaults
-	// to DefaultTokenTypes when empty.
+	// carries one, so an ID token can't stand in for an access token. nil
+	// means DefaultTokenTypes; a non-nil empty slice accepts no typ (a token
+	// without one is still accepted).
 	AcceptedTokenTypes []string
 	// DisableTokenTypeCheck turns the "typ" check off, for an issuer that
 	// stamps something other than at+jwt.
@@ -72,17 +86,29 @@ type Config struct {
 	Introspection *IntrospectionConfig
 }
 
+// check refuses a contradictory config.
+func (c *Config) check() error {
+	if c.ZeroLeeway && c.LeewaySeconds != 0 {
+		return errors.New("tokenvalidator: ZeroLeeway is set but LeewaySeconds is not 0")
+	}
+	return nil
+}
+
 // acceptedAlgorithms returns the configured accepted algorithms, or the
-// defaults when none are configured.
+// defaults when the field is nil (an empty slice accepts nothing).
 func (c *Config) acceptedAlgorithms() []string {
-	if len(c.AcceptedAlgorithms) == 0 {
-		return DefaultAlgorithms
+	if c.AcceptedAlgorithms == nil {
+		return defaultAlgorithms
 	}
 	return c.AcceptedAlgorithms
 }
 
-// leeway returns the configured leeway, or the default when zero.
+// leeway returns the configured leeway: 0 with ZeroLeeway, else the default
+// when LeewaySeconds is zero.
 func (c *Config) leeway() int {
+	if c.ZeroLeeway {
+		return 0
+	}
 	if c.LeewaySeconds == 0 {
 		return DefaultLeewaySeconds
 	}
@@ -95,8 +121,8 @@ func (c *Config) acceptsTokenType(typ string) bool {
 		return true
 	}
 	types := c.AcceptedTokenTypes
-	if len(types) == 0 {
-		types = DefaultTokenTypes
+	if types == nil {
+		types = defaultTokenTypes
 	}
 	for _, t := range types {
 		if normaliseType(t) == normaliseType(typ) {

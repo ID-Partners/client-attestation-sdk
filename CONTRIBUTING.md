@@ -14,10 +14,11 @@ You need Go 1.25+, Python 3.11+, Node 20+, a JDK 17+ and Maven.
 ```bash
 (cd go && go vet ./... && go test -race -cover ./...)
 (cd python && pip install -e '.[test]' && pytest --cov)
-(cd typescript && npm ci && npx tsc --noEmit && npx vitest run --coverage)
-(cd java && mvn verify)
-./verify-validation.sh      # the three validators return the same verdict on every case
+(cd typescript && npm ci && npx tsc --noEmit && npx vitest run --coverage && npm run test:edge)
+(cd java && ./mvnw verify)
+./verify-validation.sh      # the four validators return the same verdict on every case
 ./verify-interop.sh         # every port's credential passes the Java AS-side verifier
+python3 scripts/api_surface.py --check   # each port's public API matches docs/api-surface/
 ```
 
 CI runs all of it except `verify-interop.sh`, which needs the AS-side verifier (`client-attestation`
@@ -27,6 +28,24 @@ use `mvn verify -Pinterop` to include the Java round-trip tests.
 Each port has a coverage floor (Go in `ci.yml`, Python in `pyproject.toml`, TypeScript in
 `vitest.config.ts`, Java in `pom.xml`). They sit at what was measured when they were set. Raise one when
 you add tests; don't lower one to get a change through.
+
+## Changing the public API
+
+Each port's public API is snapshotted in `docs/api-surface/<port>.txt`, generated from the real build by
+`scripts/api_surface.py`, and each port's CI job fails if its build no longer matches.
+[`docs/api.md`](docs/api.md) says what the API is and which tier (Stable, Experimental, Internal) each
+part is in.
+
+An intended API change updates the snapshot in the same pull request: run
+`python3 scripts/api_surface.py <port>` (for Python, with an interpreter that has the package's
+dependencies, or `--python path/to/python`) and commit the result. It also adds a line under
+`[Unreleased]` in `CHANGELOG.md` saying what changed and in which tier. Stable API follows semver: to
+remove or rename a Stable name, deprecate it in a minor release (a "Deprecated" entry naming the major
+that removes it) and remove it in the next major. Experimental API can change in a minor release. If a
+change moves something between tiers, update `docs/api.md` and the item's doc comment too.
+
+A snapshot diff you didn't expect means the change touched the API by accident: fix the code, not the
+snapshot.
 
 ## Pull requests
 

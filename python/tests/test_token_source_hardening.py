@@ -143,8 +143,8 @@ def test_present_spiffe_socket_and_unset_vars_keep_auto_detect(clean_env, tmp_pa
 # ── 11c: https everywhere except loopback or an explicit opt-out ─────────────────────────────────
 
 @pytest.mark.parametrize("host", ["http://pf.example.com", "http://10.0.0.5:9031", "http://127.0.0.2"])
-def test_plain_http_pf_host_is_refused(host):
-    with pytest.raises(ClientAttestationError, match="pf_host must use https") as info:
+def test_plain_http_attester_url_is_refused(host):
+    with pytest.raises(ClientAttestationError, match="attester_url must use https") as info:
         ClientAttestation(host)
     assert host in str(info.value)
 

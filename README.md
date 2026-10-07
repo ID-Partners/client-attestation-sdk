@@ -19,7 +19,7 @@ the standards this SDK implements — open [`docs/explainer.html`](docs/explaine
    headers. Any of them can sign with a key held in a vault (`OpenBaoTransitSigner`). The attestation can
    also name an `operator` — the human or org accountable for running the client, distinct from `sub` and
    from the principal it acts for — an RFC 8693 `may_act`-shaped assertion, not proof of authorisation.
-3. **Token validator + MCP/A2A resource helper** *(Python / TypeScript / Go)* — the resource-server side:
+3. **Token validator + MCP/A2A resource helper** *(all four ports)* — the resource-server side:
    *validate* a token it receives — JWT signature via the issuer's JWKS, `iss`/`exp`/`nbf`, audience and
    scope — with optional RFC 7662 introspection, AS-metadata discovery, and RFC 9728 protected-resource
    metadata.
@@ -34,19 +34,32 @@ the standards this SDK implements — open [`docs/explainer.html`](docs/explaine
 
 ## Status and versioning
 
-Pre-1.0. The API can still change between minor versions, and the changelog says when it does.
+From 1.0.0 the SDK follows [semver](https://semver.org/). All four ports share one version and release
+together. Every public name is in one of three tiers, listed port by port in [`docs/api.md`](docs/api.md):
 
-- All four ports share one version and release together. Version numbers follow semver: a patch is a fix,
-  and while the version is below 1.0 a minor version can break the API.
+- **Stable** API follows semver. A breaking change needs a major release. Anything Stable that is to be
+  removed or renamed is deprecated for at least one minor release first, and goes in the next major.
+- **Experimental** API may change or go in any minor release, with a CHANGELOG entry but no deprecation
+  period. Each Experimental item says so in its doc comment, and `docs/api.md` gives the reason: mostly
+  it exists in one port only, depends on someone else's API, or is an interface you implement.
+- **Internal** code is not API and is not covered, even where the language lets you reach it. Each port
+  hides it as far as the language allows.
+
+The rest of the versioning:
+
+- CI checks each port's public API against a snapshot in [`docs/api-surface/`](docs/api-surface/), so an
+  API change can't land by accident. See [CONTRIBUTING.md](CONTRIBUTING.md).
 - The SDK tracks **draft -10** of draft-ietf-oauth-attestation-based-client-auth. Moving to a new draft
-  revision is a minor version and gets a changelog entry, because a draft bump can change what goes on the
-  wire.
+  revision always gets a changelog entry, because it can change what goes on the wire. It is a minor
+  release if no Stable API breaks, and a major one if it does.
 - Each port exports the revision it implements (`DRAFT_REVISION`, `DraftRevision` in Go), so code can check
   it rather than read this page.
-- Two things the SDK relies on are **not in the draft**. The attester's discovery document at
-  `/.well-known/client-attester` (evidence audience, attestation, challenge and token endpoints) is a
-  PingFederate convention, and the instance proof sent when minting an attestation uses the proprietary
-  `typ` `oauth-attestation-instance-proof+jwt`. Both are specific to the attester this SDK was built against.
+- The draft doesn't say how a workload gets its attestation from the attester, so that part is an
+  **attester profile** you can swap. The default profile is PingFederate, the attester this SDK was built
+  against: discovery at `/.well-known/client-attester` and an instance proof with the proprietary `typ`
+  `oauth-attestation-instance-proof+jwt`. Neither is in the draft. For another attester, give its
+  endpoints directly (no discovery) or plug in your own profile – see
+  [`docs/attester-profiles.md`](docs/attester-profiles.md).
 - Install:
 
   | Language | Package | Install |
@@ -76,6 +89,7 @@ or the explainer drifts from it. A dash means the port doesn't have the feature 
 | Name the operator on the one-call class | ✓ | ✓ | ✓ | ✓ |
 | Drop the token-endpoint challenge | ✓ | ✓ | ✓ | ✓ |
 | Logging hooks | ✓ | ✓ | ✓ | ✓ |
+| Attester profiles | ✓ | ✓ | ✓ | ✓ |
 | Trace every call as curl | — | — | ✓ | — |
 | Asserted context at mint | — | — | ✓ | — |
 | **Building credentials** | | | | |
@@ -91,19 +105,20 @@ or the explainer drifts from it. A dash means the port doesn't have the feature 
 | AWS web-identity evidence | — | — | ✓ | — |
 | SPIFFE issuance bootstrap | ✓ | ✓ | ✓ | ✓ |
 | **Resource server** | | | | |
-| Token validator | ✓ | — | ✓ | ✓ |
-| MCP and A2A protected-resource helper | ✓ | — | ✓ | ✓ |
-| Authorization-server metadata discovery | — | — | ✓ | — |
+| Token validator | ✓ | ✓ | ✓ | ✓ |
+| MCP and A2A protected-resource helper | ✓ | ✓ | ✓ | ✓ |
+| Authorization-server metadata discovery | — | ✓ | ✓ | — |
 | **Step-up** | | | | |
 | Challenge handling | — | — | ✓ | — |
 <!-- features:end -->
 
 ## Get a token in one call
 
-Give it the PingFederate host. It finds the workload's platform identity by itself (a projected token file,
-a SPIRE socket, the GCP metadata server, or an env token — override with `evidence=`), runs the attestation
-flow, and returns an access token. Use the token, or hand the SDK to your HTTP client so every call carries
-it.
+Give it the attester's host (PingFederate by default; for another attester, see
+[`docs/attester-profiles.md`](docs/attester-profiles.md)). It finds the workload's platform identity by
+itself (a projected token file, a SPIRE socket, the GCP metadata server, or an env token — override with
+`evidence=`), runs the attestation flow, and returns an access token. Use the token, or hand the SDK to your
+HTTP client so every call carries it.
 
 ```python
 from client_attestation_sdk import ClientAttestation
@@ -204,9 +219,12 @@ both PoP and DPoP modes. A Python-, TypeScript-, or Go-built credential is accep
 as a Java-built one. Reproduce with [`./verify-interop.sh`](verify-interop.sh).
 
 **Validator** — every port validates the shared [`validation/tokens.json`](validation/tokens.json)
-(pre-signed tokens: valid, expired, not-yet-valid, wrong issuer/audience, missing scope, bad signature) and
-must return the **identical verdict** for every case. [`validation/check.py`](validation/check.py) confirms
-all three agree with the expected verdicts. Reproduce with [`./verify-validation.sh`](verify-validation.sh).
+(pre-signed tokens, each with one defect: expiry and leeway, issuer, audience, scope, signature, `alg: none`
+and HMAC key confusion, malformed and duplicate-keyed JSON, out-of-range dates, wrongly typed claims) and
+[`validation/introspection.json`](validation/introspection.json) (canned RFC 7662 responses), and must
+return the **identical verdict** for every case. [`validation/check.py`](validation/check.py) confirms all
+four agree with the expected verdicts; [`validation/SEMANTICS.md`](validation/SEMANTICS.md) defines every
+rule. Reproduce with [`./verify-validation.sh`](verify-validation.sh).
 
 ## Test coverage
 
@@ -231,7 +249,7 @@ CI runs all of it on every push and pull request except `verify-interop.sh` (see
 ## Layout
 
 ```
-java/         builder + one-call client, no validator     (jose4j)
+java/         builder + one-call client + tokenvalidator  (jose4j)
 python/       client_attestation_sdk (+ .token_validator, .authz_challenge)  (PyJWT + cryptography)
 typescript/   src/ builder + src/validator/               (panva jose; Node 20+ or edge)
 go/           builder package + tokenvalidator/           (lestrrat-go/jwx)
@@ -325,10 +343,14 @@ if result.valid:
 result = validator.validate_active(access_token)   # introspection
 ```
 
-`validate` runs a fixed error-precedence order — identical across all ports so their verdicts match:
-algorithm → key → signature → `iss` → `exp` → `nbf` → audience → scope, returning the first failure's stable
-code (`invalid_signature`, `invalid_issuer`, `expired`, `not_yet_valid`, `invalid_audience`,
-`insufficient_scope`, …).
+Java has the same shape (`global.idpartners.clientattestation.tokenvalidator`, see the
+[Java README](java/README.md#resource-server-validate-an-access-token)). `validate` runs a fixed
+error-precedence order — identical across all ports so their verdicts match:
+structure → algorithm → key → signature → payload → `typ` → `iss` → `exp` / `nbf` / `iat` → audience →
+scope → `sub`, returning the first failure's stable code (`invalid_signature`, `invalid_issuer`, `expired`,
+`not_yet_valid`, `invalid_audience`, `insufficient_scope`, …). `alg: none` and the `HS*` algorithms are
+refused even if configured, and a failed introspection call raises (Go: returns an error) rather than
+returning a verdict. [`validation/SEMANTICS.md`](validation/SEMANTICS.md) is the precise contract.
 
 ## Resource server for MCP / A2A
 

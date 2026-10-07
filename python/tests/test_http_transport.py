@@ -9,7 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from client_attestation_sdk.authz_challenge import CibaClient, CibaError, urllib_http
+from client_attestation_sdk.authz_challenge import CibaClient, CibaError
+from client_attestation_sdk.authz_challenge.ciba import urllib_http
 from client_attestation_sdk import (
     AttestationIssuanceClient,
     ClientAttestation,

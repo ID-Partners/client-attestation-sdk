@@ -15,22 +15,17 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/google/uuid"
-
 	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
 // DraftRevision is the draft-ietf-oauth-attestation-based-client-auth revision this SDK implements.
 const DraftRevision = "10"
 
-// wellKnownPath is the attester discovery document path.
-const wellKnownPath = "/.well-known/client-attester"
-
 // DefaultExpirySkew is how long before actual expiry a cached token is refreshed, so a token is never
 // used at the edge.
 const DefaultExpirySkew = 30 * time.Second
 
-// ClientAttestation gets and caches an access token from a PingFederate host using client attestation.
+// ClientAttestation gets and caches an access token using client attestation.
 //
 // It runs the whole flow in one call: discover -> get the workload's platform identity (evidence) ->
 // get a challenge -> mint the attestation -> call the token endpoint with the attestation headers ->
@@ -38,6 +33,7 @@ const DefaultExpirySkew = 30 * time.Second
 // the attestation, built from the identity its runtime already gives it (auto-detected; see evidence.go).
 type ClientAttestation struct {
 	baseURL              string
+	profile              AttesterProfile
 	evidence             SvidSource
 	authorizationDetails []map[string]any
 	operator             map[string]any
@@ -59,7 +55,7 @@ type ClientAttestation struct {
 	tokenType   string          // "Bearer" or "DPoP", parsed from the token response
 	boundKey    *SigningKeyPair // instance key that minted the attestation behind cachedToken
 	expiresAt   time.Time
-	discovery   *discoveryDoc
+	metadata    *AttesterMetadata
 
 	// nonceMu guards nonces: the last DPoP-Nonce each origin returned.
 	nonceMu sync.Mutex
@@ -153,22 +149,32 @@ func WithRequireChallenge(require bool) Option {
 	return func(c *ClientAttestation) { c.requireChallenge = require }
 }
 
-// WithAllowInsecure permits plain-http pfHost and discovery endpoints on non-loopback hosts. Without it
+// WithAttesterProfile sets the attester profile that discovers the attester and mints the attestation.
+// The default is PingFederateProfile, the behaviour of every earlier release. See docs/attester-profiles.md.
+func WithAttesterProfile(profile AttesterProfile) Option {
+	return func(c *ClientAttestation) { c.profile = profile }
+}
+
+// WithAttesterMetadata gives the attester's endpoints directly (evidence audience, attestation and token
+// endpoints, optionally challenge endpoint and PoP audience), for an attester that publishes no discovery
+// document. No discovery request is made; the profile still mints. With it, NewClientAttestation's
+// attesterURL may be "".
+func WithAttesterMetadata(metadata AttesterMetadata) Option {
+	return func(c *ClientAttestation) { c.metadata = &metadata }
+}
+
+// WithAllowInsecure permits plain-http attesterURL and discovery endpoints on non-loopback hosts. Without it
 // every such URL must be https (localhost, 127.0.0.1 and ::1 are always allowed).
 func WithAllowInsecure() Option {
 	return func(c *ClientAttestation) { c.allowInsecure = true }
 }
 
-// NewClientAttestation builds a token source aimed at pfHost — "pf.example.com", or a full base URL
+// NewClientAttestation builds a token source aimed at attesterURL — "pf.example.com", or a full base URL
 // "https://pf.example.com". Plain hostnames default to https. An http:// host is refused unless it is
-// loopback or WithAllowInsecure() is given.
-func NewClientAttestation(pfHost string, opts ...Option) (*ClientAttestation, error) {
-	base, err := normalizeBaseURL(pfHost)
-	if err != nil {
-		return nil, err
-	}
+// loopback or WithAllowInsecure() is given. attesterURL may be "" when WithAttesterMetadata or
+// WithAttesterProfile is given.
+func NewClientAttestation(attesterURL string, opts ...Option) (*ClientAttestation, error) {
 	c := &ClientAttestation{
-		baseURL:          base,
 		algorithm:        "ES256",
 		popMethod:        PopMethodAttestationPopJWT,
 		skew:             DefaultExpirySkew,
@@ -176,11 +182,24 @@ func NewClientAttestation(pfHost string, opts ...Option) (*ClientAttestation, er
 		requireChallenge: true,
 		challengeAtToken: true,
 	}
+	customProfile := false
 	for _, opt := range opts {
 		opt(c)
 	}
-	if err := c.checkSecure(c.baseURL); err != nil {
-		return nil, err
+	if c.profile == nil {
+		c.profile = PingFederateProfile{}
+	} else {
+		customProfile = true
+	}
+	if attesterURL != "" || (c.metadata == nil && !customProfile) {
+		base, err := normalizeBaseURL(attesterURL)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.checkSecure(base); err != nil {
+			return nil, err
+		}
+		c.baseURL = base
 	}
 	c.httpClient = safeClient(c.httpClient, c.timeout)
 	c.logger = sdklog.OrDiscard(c.logger)
@@ -354,8 +373,11 @@ func (c *ClientAttestation) RoundTripperOver(base http.RoundTripper) http.RoundT
 	return &authRoundTripper{source: c, base: base}
 }
 
-// Discovery returns the attester's /.well-known/client-attester document (fetched once, then cached).
-func (c *ClientAttestation) Discovery(ctx context.Context) (*discoveryDoc, error) {
+// AttesterMetadata returns the attester's metadata: what the profile discovered (for PingFederateProfile,
+// the /.well-known/client-attester document, with the token endpoint fallback applied), fetched once and
+// then cached; or the WithAttesterMetadata value. The raw discovery document is in its Document field.
+// It is attesterMetadata() / attester_metadata() in the other ports.
+func (c *ClientAttestation) AttesterMetadata(ctx context.Context) (*AttesterMetadata, error) {
 	if err := c.acquire(ctx); err != nil {
 		return nil, err
 	}
@@ -365,33 +387,40 @@ func (c *ClientAttestation) Discovery(ctx context.Context) (*discoveryDoc, error
 
 // ── the flow ────────────────────────────────────────────────────────────────────────────────────────
 
-type discoveryDoc struct {
-	EvidenceAudience    string `json:"evidence_audience"`
-	AttestationEndpoint string `json:"attestation_endpoint"`
-	ChallengeEndpoint   string `json:"challenge_endpoint"`
-	TokenEndpoint       string `json:"token_endpoint"`
-	PopAudience         string `json:"pop_audience"`
-}
-
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int64  `json:"expires_in"`
 	TokenType   string `json:"token_type"`
 }
 
-// getDiscovery fetches and caches the discovery document. Caller holds c.lock.
-func (c *ClientAttestation) getDiscovery(ctx context.Context) (*discoveryDoc, error) {
-	if c.discovery != nil {
+// getDiscovery returns the static metadata, or asks the profile to discover it and caches the result.
+// Caller holds c.lock.
+func (c *ClientAttestation) getDiscovery(ctx context.Context) (*AttesterMetadata, error) {
+	if c.metadata != nil {
 		c.log(ctx, slog.LevelDebug, "discovery.cached", "host", sdklog.Host(c.baseURL))
-		return c.discovery, nil
+		return c.metadata, nil
 	}
-	var doc discoveryDoc
-	if err := c.getJSON(ctx, "discover", http.MethodGet, c.baseURL+wellKnownPath, nil, &doc); err != nil {
+	md, err := c.profile.Discover(ctx, clientTransport{c}, c.baseURL)
+	if err != nil {
 		return nil, err
 	}
-	c.discovery = &doc
+	if md == nil {
+		return nil, &ClientAttestationError{Message: "attester profile returned no metadata"}
+	}
+	c.metadata = md
 	c.log(ctx, slog.LevelDebug, "discovery.fetched", "host", sdklog.Host(c.baseURL))
-	return c.discovery, nil
+	return c.metadata, nil
+}
+
+// clientTransport is the AttesterTransport handed to the profile: the client's HTTP client, https rule
+// and logging.
+type clientTransport struct{ c *ClientAttestation }
+
+func (t clientTransport) RequestJSON(ctx context.Context, step, method, target string, body any, out any) error {
+	if err := t.c.checkSecure(target); err != nil {
+		return err
+	}
+	return t.c.getJSON(ctx, step, method, target, body, out)
 }
 
 // runFlow runs the full attestation exchange and returns the token endpoint response together with the
@@ -403,9 +432,6 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 	}
 	if doc.EvidenceAudience == "" {
 		return nil, nil, &ClientAttestationError{Message: "attester discovery document has no evidence_audience"}
-	}
-	if doc.AttestationEndpoint == "" {
-		return nil, nil, &ClientAttestationError{Message: "attester discovery document has no attestation_endpoint"}
 	}
 
 	source := c.evidence
@@ -429,16 +455,26 @@ func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *Signi
 	if err != nil {
 		return nil, nil, err
 	}
-	attestation, err := c.mint(ctx, doc, instanceKey, svid, challenge)
+	minted, err := c.profile.Mint(ctx, clientTransport{c}, doc, &MintRequest{
+		InstanceKey:          instanceKey,
+		Evidence:             svid,
+		Challenge:            challenge,
+		AuthorizationDetails: c.authorizationDetails,
+		Operator:             c.operator,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
+	if minted == nil || minted.Attestation == "" {
+		return nil, nil, &ClientAttestationError{Message: "attester response contained no attestation"}
+	}
+	attestation := minted.Attestation
 
-	// token_endpoint is advertised by current attesters; fall back to the standard PF path so an older
-	// discovery document still works from the host alone.
+	// The profile resolves the token endpoint (PingFederate: the advertised one, else the standard path on
+	// the attester host).
 	tokenEndpoint := doc.TokenEndpoint
 	if tokenEndpoint == "" {
-		tokenEndpoint = c.baseURL + "/as/token.oauth2"
+		return nil, nil, &ClientAttestationError{Message: "attester metadata has no token_endpoint"}
 	}
 	if err := c.checkSecure(tokenEndpoint); err != nil {
 		return nil, nil, err
@@ -537,7 +573,7 @@ func normalizeTokenType(tokenType string) string {
 // fetchChallenge asks the challenge endpoint for a challenge if one is advertised. No advertised
 // endpoint means no challenge and no error. When one IS advertised, any failure to get a challenge
 // fails the flow closed — unless WithRequireChallenge(false), which proceeds without one.
-func (c *ClientAttestation) fetchChallenge(ctx context.Context, doc *discoveryDoc) (string, error) {
+func (c *ClientAttestation) fetchChallenge(ctx context.Context, doc *AttesterMetadata) (string, error) {
 	if doc.ChallengeEndpoint == "" {
 		return "", nil
 	}
@@ -570,50 +606,6 @@ func (c *ClientAttestation) fetchChallenge(ctx context.Context, doc *discoveryDo
 	}
 	c.log(ctx, slog.LevelDebug, "challenge.fetched", "host", sdklog.Host(doc.ChallengeEndpoint))
 	return body.AttestationChallenge, nil
-}
-
-// mint builds the instance proof and exchanges evidence for a minted attestation. Evidence-first: the
-// body carries no client_id; the attester maps the identity to a client.
-func (c *ClientAttestation) mint(ctx context.Context, doc *discoveryDoc, instanceKey *SigningKeyPair, svid, challenge string) (string, error) {
-	proofClaims := map[string]any{
-		"aud": doc.EvidenceAudience,
-		"jti": uuid.NewString(),
-		"iat": time.Now().Unix(),
-	}
-	if challenge != "" {
-		proofClaims["challenge"] = challenge
-	}
-	proof, err := instanceKey.signCompact(proofClaims, InstanceProofTyp, false)
-	if err != nil {
-		return "", err
-	}
-
-	body := map[string]any{
-		"instance_key": instanceKey.PublicJWK(),
-		"svid":         svid,
-		"proof":        proof,
-	}
-	if len(c.authorizationDetails) > 0 {
-		body["authorization_details"] = c.authorizationDetails
-	}
-	if len(c.operator) > 0 {
-		// Asked for at mint time so the ATTESTER is what states the operator, rather than the client
-		// asserting it about itself at the token endpoint.
-		body["operator"] = c.operator
-	}
-	var response struct {
-		Attestation string `json:"attestation"`
-	}
-	if err := c.checkSecure(doc.AttestationEndpoint); err != nil {
-		return "", err
-	}
-	if err := c.getJSON(ctx, "mint", http.MethodPost, doc.AttestationEndpoint, body, &response); err != nil {
-		return "", err
-	}
-	if response.Attestation == "" {
-		return "", &ClientAttestationError{Message: "attester response contained no attestation"}
-	}
-	return response.Attestation, nil
 }
 
 // sendTokenRequest posts the client_credentials grant with the attestation header plus a
@@ -741,10 +733,10 @@ func (e *ClientAttestationError) Error() string {
 
 // normalizeBaseURL turns a bare host into an https base URL and strips a trailing slash. A host that
 // already carries a scheme is kept as-is (so in-cluster http://… works).
-func normalizeBaseURL(pfHost string) (string, error) {
-	host := strings.TrimRight(strings.TrimSpace(pfHost), "/")
+func normalizeBaseURL(attesterURL string) (string, error) {
+	host := strings.TrimRight(strings.TrimSpace(attesterURL), "/")
 	if host == "" {
-		return "", fmt.Errorf("pfHost is required")
+		return "", fmt.Errorf("attesterURL is required")
 	}
 	if !strings.Contains(host, "://") {
 		host = "https://" + host

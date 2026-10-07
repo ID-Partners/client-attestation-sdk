@@ -327,7 +327,7 @@ func (b *DpopProofBuilder) Build() (string, error) {
 	}
 	claims := map[string]any{
 		"htm": strings.ToUpper(b.htm),
-		"htu": NormalizeHTU(b.htu),
+		"htu": normalizeHTU(b.htu),
 		"jti": jti,
 		"iat": iat,
 	}

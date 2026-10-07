@@ -10,7 +10,7 @@
  * - the GCP metadata server (GCE, GKE, Cloud Run, Vertex AI Agent Engine).
  *
  * {@link autoDetectEvidence} tries these in order and returns the first that applies, so a developer
- * can write `new ClientAttestation(pfHost)` and have it work without naming the source. Override by
+ * can write `new ClientAttestation(attesterUrl)` and have it work without naming the source. Override by
  * passing an explicit {@link SvidSource} to {@link ClientAttestation}.
  */
 import { TransportError } from "./errors.js";
@@ -29,9 +29,17 @@ export const ENV_SPIFFE_SOCKET = "SPIFFE_ENDPOINT_SOCKET";
 export const DEFAULT_TOKEN_FILE = "/var/run/secrets/tokens/attester-token";
 /** Default SPIRE agent socket path. */
 export const DEFAULT_SPIFFE_SOCKET = "/tmp/spire-agent/public/api.sock";
-/** GCP metadata server origin. */
+/**
+ * GCP metadata server origin.
+ *
+ * @internal
+ */
 export const GCP_METADATA_BASE = "http://metadata.google.internal";
-/** GCP metadata server identity endpoint (returns a Google-signed ID token for the runtime SA). */
+/**
+ * GCP metadata server identity endpoint (returns a Google-signed ID token for the runtime SA).
+ *
+ * @internal
+ */
 export const GCP_METADATA_IDENTITY =
   GCP_METADATA_BASE + "/computeMetadata/v1/instance/service-accounts/default/identity";
 
@@ -139,6 +147,8 @@ export interface AutoDetectOptions {
   defaultSpiffeSocket?: string;
   /** Origin used in place of {@link GCP_METADATA_BASE} for the probe and the identity call. */
   gcpMetadataBase?: string;
+  /** Timeout for the GCP metadata probe, in place of the 300 ms default (tests on a loaded runner). */
+  gcpProbeTimeoutMs?: number;
 }
 
 /**
@@ -148,6 +158,9 @@ export interface AutoDetectOptions {
  * by an environment variable ({@link ENV_TOKEN_FILE}, {@link ENV_SPIFFE_SOCKET}) whose path does not
  * exist throws {@link EvidenceNotFound} naming the variable; it never falls through to the next source.
  */
+export function autoDetectEvidence(): Promise<SvidSource>;
+/** @internal */
+export function autoDetectEvidence(opts: AutoDetectOptions): Promise<SvidSource>;
 export async function autoDetectEvidence(opts: AutoDetectOptions = {}): Promise<SvidSource> {
   const exists = await pathProbe();
   const defaultTokenFile = opts.defaultTokenFile ?? DEFAULT_TOKEN_FILE;
@@ -184,7 +197,7 @@ export async function autoDetectEvidence(opts: AutoDetectOptions = {}): Promise<
     return new SpireWorkloadApiSvidSource(defaultSocket);
   }
 
-  if (await gcpMetadataAvailable(metadataBase)) {
+  if (await gcpMetadataAvailable(metadataBase, opts.gcpProbeTimeoutMs)) {
     return new GoogleMetadataSvidSource(
       5000,
       metadataBase + "/computeMetadata/v1/instance/service-accounts/default/identity",

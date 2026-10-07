@@ -5,6 +5,159 @@ and versions follow [semver](https://semver.org/) as described under "Status and
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-08
+
+The first stable release. The public API of every port is frozen under semver: [`docs/api.md`](docs/api.md)
+says what is Stable, what is Experimental and what is internal, and CI fails on any change to it that isn't
+deliberate. Coming from 0.3.0, read Changed and Removed below; every break is listed there.
+
+### Added
+
+- **The 1.0 API, frozen and written down.** [`docs/api.md`](docs/api.md) puts every public name in each
+  port into one of three tiers: Stable (semver from 1.0.0), Experimental (may change in any minor
+  release; each item is marked in its doc comment and listed with the reason) and Internal (not API). See
+  "Status and versioning" in the README for the policy.
+- **API snapshots that CI checks.** `scripts/api_surface.py` writes each port's public API from the real
+  build to `docs/api-surface/{python,typescript,go,java}.txt`, and each port's CI job runs it with
+  `--check`, which fails and prints the diff if the build no longer matches. An intended API change
+  regenerates the snapshot in the same pull request (see CONTRIBUTING.md).
+- Java: a `module-info.java` (module `global.idpartners.clientattestation`) that exports the API packages
+  and not `internal`. It `requires transitive org.jose4j` and `java.net.http`.
+- Java: `SigningKeyPair.fromJwk(Map<String, Object>, String)`, so a key can be loaded without jose4j types.
+- Java: `ClientAttestation.LOGGER_NAME`. Go: `tokenvalidator.HTTPGetFunc` and `HTTPPostFunc`, the types
+  `WithHTTPGet` and `WithHTTPPost` already took. TypeScript: the `AttesterDiscovery` type that
+  `discovery()` returns.
+- **Attester profiles in all four ports.** The attester-specific steps – discovering the attester's
+  endpoints and building, sending and reading the mint request (including the instance proof and its
+  `typ`) – now belong to an `AttesterProfile`. The built-in `PingFederateProfile` is the default and is
+  exactly the previous behaviour, byte for byte on the wire. The draft-defined parts (challenge, PoP or DPoP
+  proof, token request, nonce retry, caching, https rule) stay in the client, and the log events keep their
+  names. See [`docs/attester-profiles.md`](docs/attester-profiles.md).
+  - Static endpoints for an attester with no discovery document: `metadata=AttesterMetadata(...)` (Python),
+    the `metadata` option (TypeScript), `WithAttesterMetadata` (Go), `.metadata(...)` (Java). No discovery
+    request is made, and the attester URL becomes optional.
+  - A custom profile: `profile=` (Python), the `profile` option (TypeScript), `WithAttesterProfile` (Go),
+    `.profile(...)` (Java). `AttestationIssuanceClient` takes one too.
+  - New types in each port: `AttesterProfile`, `PingFederateProfile`, `AttesterMetadata`, `AttesterTransport`,
+    `MintRequest` (with `instance_proof` / `sign` helpers) and `MintResult`; and `attester_metadata()` /
+    `attesterMetadata()` on the one-call client (Go's `Discovery` now returns `*AttesterMetadata`).
+- TypeScript: `new ClientAttestation(options)` with the URL as `options.attesterUrl`, or none at all with
+  static `metadata`. Java: `ClientAttestation.builder()` with no URL, and `Builder.attesterUrl(...)`.
+- **Java: the resource-server token validator**, closing the last gap between the ports.
+  `global.idpartners.clientattestation.tokenvalidator` has `AccessTokenValidator` (JWT validation with the
+  same check order, stable error codes and defaults as Python, TypeScript and Go, plus RFC 7662
+  introspection), JWKS caching with the same refetch cooldown, single flight, max age and size cap,
+  `Discovery.discover` for AS metadata, and `ProtectedResource` for RFC 9728 metadata, bearer extraction
+  and `WWW-Authenticate` challenges. It logs the same validator events through a `System.Logger` passed to
+  `AccessTokenValidator.builder(config).logger(...)`. `./verify-validation.sh` now checks all four ports
+  agree on the shared vectors, and CI's validation job has a JDK for it.
+- **[`validation/SEMANTICS.md`](validation/SEMANTICS.md)**, the precise contract every port's validator
+  implements, and 101 new shared vectors that pin it: 93 token cases (up from 11) and 19 introspection
+  cases. `./verify-validation.sh` now also runs each port's `validate_active` against canned RFC 7662
+  responses.
+- **An injectable validator clock in every port**: Python `AccessTokenValidator(config, clock=...)` (epoch
+  seconds), TypeScript `{ clock }` (epoch milliseconds), Go `WithClock(func() time.Time)` and Java
+  `AccessTokenValidator.Builder.clock(...)` (now public).
+- **Go: `Config.ZeroLeeway`**, because `LeewaySeconds: 0` still means the 60-second default.
+
+### Changed
+
+- **Go: `ClientAttestation.Discovery(ctx)` is renamed `AttesterMetadata(ctx)`**, the name every other port
+  uses for the same thing. Breaking: there is no alias, because the next release is 1.0.
+- **Go: `tokenvalidator.DefaultAlgorithms` and `DefaultTokenTypes` are functions** that return a new
+  slice each call. They were exported slices that any importer could change to widen what a default
+  validator accepted. Breaking: `DefaultAlgorithms` becomes `DefaultAlgorithms()`.
+- **Go: `DefaultTokenFile` and `DefaultSpiffeSocket` are constants.** They were variables, so any importer
+  could change where evidence auto-detection looked. Breaking only for code that assigned to them.
+- **Java: `HttpTransport` and `SdkLogging` moved to `global.idpartners.clientattestation.internal`** (as
+  `HttpTransport` and `SdkLog`), which the module doesn't export. They were public only so the SDK's own
+  packages could share them, and were never API. Breaking for code that imported them: use
+  `ClientAttestation.LOGGER_NAME` for the logger name. `TransportException`'s constructors are now public.
+- TypeScript: `DEFAULT_ALGORITHMS` and `DEFAULT_TOKEN_TYPES` are frozen arrays, so they can't be widened at
+  run time. `autoDetectEvidence()` no longer shows its test-only options parameter in the types.
+- Python: `ValidationResult.success` and `.failure` are now private (`_success`, `_failure`); the
+  validator builds results and the other ports never exposed them.
+- Marked **Experimental** (see docs/api.md for why): the attester-profile interface (`AttesterProfile`,
+  `AttesterTransport`, `MintRequest`, `MintResult`), `OpenBaoTransitSigner`, the issuance client
+  (`AttestationIssuanceClient`, `IssuedAttestation`, `IssuanceError`, `INSTANCE_PROOF_TYP`), the SPIRE CLI
+  and HTTP SVID sources, the log event vocabulary, Java's jose4j-typed `SigningKeyPair` methods, and the
+  Python-only `authz_challenge`, `spiffe` helpers, Azure and AWS sources, `trace` and `asserted_context`.
+- **The four validators now agree on every malformed or hostile token.** Before this, the shared vectors
+  only covered well-formed tokens, and the ports disagreed on 32 of the new shared-config cases. The verdicts
+  users will see change:
+  - A signed payload that isn't a JSON object (not JSON at all, or an array, string or `null`) is
+    `invalid_token` everywhere. Python, TypeScript and Java said `invalid_signature` for some of these.
+  - `alg: none` (any case) and every `HS*` algorithm are `unsupported_algorithm` even when listed in the
+    accepted algorithms, and refused before any key lookup. A configured `none` used to get
+    `invalid_token` or `invalid_signature` depending on the port.
+  - Headers and payloads are parsed as strict JSON in every port: invalid UTF-8, a byte-order mark, `NaN`,
+    trailing commas, leading zeros, raw control characters, trailing data and nesting deeper than 64 levels
+    are `invalid_token`. jose4j (Java) took trailing commas, leading zeros and raw control characters;
+    TypeScript, Go and Java took invalid UTF-8; Python took `NaN` and a BOM.
+  - **Duplicate member names are rejected** (`invalid_token`) at any depth in the header and payload, and
+    in introspection responses. Python, TypeScript and Go used to keep the last value.
+  - A header with `crit`, a padded or non-canonical base64url segment, or the wrong number of segments is
+    `invalid_token`. Go accepted a padded segment and a `crit` header.
+  - `exp`, `nbf` and `iat` must be finite numbers within ±(2^53 − 1), else `invalid_token`. Python, Java
+    and TypeScript accepted `exp: 1e20`; Go overflowed it into `expired`.
+  - Non-string entries in `aud` or `scp`, a non-string `scope`, and a non-string `sub` make the token
+    `invalid_token` instead of being dropped.
+  - A string `scp` (as Microsoft Entra ID issues it) is now read as space-delimited scopes, like `scope`.
+    Every port used to ignore it and grant no scopes.
+  - `scope` is split on spaces only (RFC 6749 section 3.3), so a tab or no-break space no longer separates
+    scopes.
+  - A non-string `typ` is always `invalid_token_type`; a non-string or empty `kid` is `key_not_found`; a
+    token without `kid` only matches a key set holding exactly one key.
+- **Introspection: only `"active": true` is active** in Python and TypeScript, as RFC 7662 says and Go and
+  Java already did. `"true"`, `1` and other truthy values are now `inactive`.
+- **Go: `ValidateActive` returns `(Result, error)`.** A failed introspection call (no endpoint, transport
+  failure, non-2xx, oversized or malformed body) is now an error in every port, never an `invalid_token`
+  verdict; Go was the odd one out. This is a breaking change to the Go signature.
+- **Go: an explicitly empty `AcceptedAlgorithms` or `AcceptedTokenTypes` accepts nothing**, as in the other
+  ports. `nil` still means the defaults.
+- **Go: the introspection response cap is 1 MiB**, the same as the other ports (it was 64 KiB), and a
+  larger response is an error rather than silently truncated.
+- The PingFederate mint now rejects a response whose `attestation` is missing or not a string in every
+  port and both clients. Before, the TypeScript and Go issuance clients returned an empty attestation.
+- The https error for the attester URL names `attester_url` (Python, Java) or `attesterUrl` (TypeScript)
+  instead of `pf_host` / `pfHost`.
+- **TypeScript is tested in a real Workers runtime.** CI runs the bundled package in `workerd`,
+  Cloudflare's open-source Workers runtime, with Node compatibility switched off (`npm run test:edge`):
+  key generation, the attestation, PoP and DPoP builders, and the token validator against the shared
+  validation vectors.
+- Coverage floors raised to today's measured coverage: Python 95%, Go 84%, TypeScript lines 99% and
+  statements 98%, Java 95% lines and 91% branches.
+
+### Removed
+
+- **Python: `ClientAttestation(pf_host=...)`.** Pass the attester URL positionally or as `attester_url=`.
+  It was briefly a deprecated alias during this release's development; with the next release being 1.0
+  it is removed instead. The other ports only ever took the URL positionally.
+- Python: `urllib_http(insecure_tls=...)` (deprecated in 0.3.0); use
+  `dangerously_disable_tls_verification=`. `urllib_http`, `new_code` and `new_handle` are also no longer
+  exported from `client_attestation_sdk.authz_challenge` (they are internal; tests import them from
+  their modules).
+- Python: internal helpers that were importable without an underscore are renamed with one:
+  `keys.sign_compact`, `keys.require_text`, `signer.sign_external`, `builders.url_origin`,
+  `builders.normalize_htu`, `builders.access_token_hash`, `token_validator.config.is_forbidden_algorithm`
+  and `normalise_type`. None was in an `__all__`.
+- TypeScript: `normalizeBaseUrl` and `jwtSub` (main entry point) and `resolveConfig` (`/validator`),
+  internal helpers exported by mistake; and the top-level `WELL_KNOWN_PATH`, which is
+  `PingFederateProfile.WELL_KNOWN_PATH` as in the other ports.
+- Go: `NormalizeHTU`, an internal helper exported by mistake.
+- **Python: the top-level `token_validator` and `authz_challenge` packages**, deprecated in 0.3.0. Import
+  `client_attestation_sdk.token_validator` and `client_attestation_sdk.authz_challenge` instead; the
+  module contents are unchanged.
+
+### Fixed
+
+- **Python: the validator no longer crashes on a hostile token.** A signed token with `exp`, `nbf` or `iat`
+  of `1e400` raised an unhandled `OverflowError`, and a numeric `aud` raised `TypeError`, out of
+  `validate()` instead of returning a verdict. Both are now `invalid_token`.
+- **Java: the Maven Central publish.** The 0.3.0 upload was rejected because the runner's Maven 3.10 put
+  `maven-metadata-local.xml` and `_remote.repositories` into the bundle. `java/mvnw` now pins Maven 3.9.16
+  (checked by SHA-256), and CI, the release and the verify scripts all build with it.
+
 ## [0.3.0] - 2026-10-08
 
 ### Added

@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // InstanceProofTyp is the typ of the instance-key proof presented at the issuance endpoint
@@ -53,6 +51,9 @@ func (i *IssuedAttestation) Dpop(method, uri, challenge string) (string, error) 
 // AttestationIssuanceClient bootstraps a Client Attestation for a workload from its SPIFFE JWT-SVID by
 // calling the issuance endpoint (POST /federation/attestation). The inverse of ClientAttestationBuilder:
 // the AS mints the attestation and binds it to the workload's instance key.
+//
+// Experimental (see docs/api.md): it calls a PingFederate demo issuance servlet (/federation/attestation)
+// whose protocol is not standardised.
 type AttestationIssuanceClient struct {
 	Endpoint       string // .../federation/attestation
 	ClientID       string
@@ -60,6 +61,9 @@ type AttestationIssuanceClient struct {
 	Source         SvidSource
 	InstanceKey    *SigningKeyPair
 	HTTPClient     *http.Client
+	// Profile sets the mint protocol; nil means PingFederateProfile. The endpoint is given directly, so
+	// the profile's Discover is not used. See docs/attester-profiles.md.
+	Profile AttesterProfile
 }
 
 // NewAttestationIssuanceClient generates a fresh ES256 instance key and returns a ready client.
@@ -85,49 +89,47 @@ func (c *AttestationIssuanceClient) Bootstrap(authorizationDetails []map[string]
 	if err != nil {
 		return nil, err
 	}
-
-	proofClaims := map[string]any{"aud": c.AttesterIssuer, "jti": uuid.NewString(), "iat": time.Now().Unix()}
-	if challenge != "" {
-		proofClaims["challenge"] = challenge
+	profile := c.Profile
+	if profile == nil {
+		profile = PingFederateProfile{}
 	}
-	proof, err := c.InstanceKey.signCompact(proofClaims, InstanceProofTyp, false)
-	if err != nil {
-		return nil, err
-	}
-
-	body := map[string]any{
-		"client_id":    c.ClientID,
-		"instance_key": c.InstanceKey.PublicJWK(),
-		"svid":         svid,
-		"proof":        proof,
-	}
-	if len(authorizationDetails) > 0 {
-		body["authorization_details"] = authorizationDetails
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	client := safeClient(c.HTTPClient, 20*time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	res, err := doRequest(ctx, client, http.MethodPost, c.Endpoint, map[string]string{
+	minted, err := profile.Mint(ctx, issuanceTransport{safeClient(c.HTTPClient, 20*time.Second)},
+		&AttesterMetadata{EvidenceAudience: c.AttesterIssuer, AttestationEndpoint: c.Endpoint},
+		&MintRequest{
+			InstanceKey:          c.InstanceKey,
+			Evidence:             svid,
+			Challenge:            challenge,
+			ClientID:             c.ClientID,
+			AuthorizationDetails: authorizationDetails,
+		})
+	if err != nil {
+		return nil, err
+	}
+	return &IssuedAttestation{Attestation: minted.Attestation, ExpiresIn: minted.ExpiresIn, InstanceKey: c.InstanceKey}, nil
+}
+
+// issuanceTransport is the issuance endpoint's AttesterTransport: a non-2xx answer is an *IssuanceError.
+type issuanceTransport struct{ client *http.Client }
+
+func (t issuanceTransport) RequestJSON(ctx context.Context, _ string, method, target string, body any, out any) error {
+	var payload []byte
+	if body != nil {
+		var err error
+		if payload, err = json.Marshal(body); err != nil {
+			return err
+		}
+	}
+	res, err := doRequest(ctx, t.client, method, target, map[string]string{
 		"Content-Type": "application/json",
 		"Accept":       "application/json",
 	}, payload, defaultMaxResponseBytes)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !res.ok() {
-		return nil, &IssuanceError{Status: res.Status, Body: string(res.Body)}
+		return &IssuanceError{Status: res.Status, Body: string(res.Body)}
 	}
-	var out struct {
-		Attestation string `json:"attestation"`
-		ExpiresIn   int64  `json:"expires_in"`
-	}
-	if err := decodeJSONOK(res, "POST "+c.Endpoint, &out); err != nil {
-		return nil, err
-	}
-	return &IssuedAttestation{Attestation: out.Attestation, ExpiresIn: out.ExpiresIn, InstanceKey: c.InstanceKey}, nil
+	return decodeJSONOK(res, method+" "+target, out)
 }

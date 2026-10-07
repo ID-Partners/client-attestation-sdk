@@ -15,7 +15,7 @@ import pytest
 
 from client_attestation_sdk import ClientAttestation, DpopProofBuilder, SigningKeyPair, StaticSvidSource
 from client_attestation_sdk import _http
-from client_attestation_sdk.builders import access_token_hash, normalize_htu
+from client_attestation_sdk.builders import _access_token_hash as access_token_hash, _normalize_htu as normalize_htu
 from client_attestation_sdk.keys import _thumbprint
 from client_attestation_sdk.token_source import _is_nonce_challenge, _origin, _token_type
 
@@ -49,6 +49,22 @@ class _Server(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _body(self):
+        # Read the whole request body before answering, chunked included (a streamed body has no
+        # Content-Length). Answering first and closing races the client's write: a broken pipe in CI.
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            raw = b""
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                        pass
+                    return raw
+                raw += self.rfile.read(size)
+                self.rfile.readline()
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
     @property
     def base(self):
         return f"http://{self.headers['Host']}"
@@ -64,8 +80,7 @@ class _Server(BaseHTTPRequestHandler):
         return self._resource(b"")
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
+        raw = self._body()
         s = self.state
         if self.path == "/challenge":
             return self._send(200, {"attestation_challenge": "chal-1"})
@@ -87,8 +102,7 @@ class _Server(BaseHTTPRequestHandler):
         return self._resource(raw)
 
     def do_PUT(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        return self._resource(self.rfile.read(length) if length else b"")
+        return self._resource(self._body())
 
     def _resource(self, raw):
         s = self.state

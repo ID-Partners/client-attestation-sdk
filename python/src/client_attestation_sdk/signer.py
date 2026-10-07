@@ -25,7 +25,7 @@ class JwsSigner(Protocol):
     def sign(self, signing_input: bytes) -> bytes: ...
 
 
-def sign_external(claims: dict, signer: "JwsSigner", typ: str) -> str:
+def _sign_external(claims: dict, signer: "JwsSigner", typ: str) -> str:
     """Assemble a compact JWS whose signature is produced by an external signer. The header carries the
     signer's ``kid`` (external signers hold issuing keys, referenced by id, never an embedded jwk)."""
     header = {"alg": signer.algorithm, "typ": typ, "kid": signer.key_id}
@@ -50,7 +50,11 @@ class OpenBaoTransitSigner:
 
     On construction it reads the key metadata (``GET /v1/transit/keys/<key>``) to pin the latest version,
     derive the public JWK, and compute its RFC 7638 thumbprint ``kid`` — so a concurrent rotation cannot
-    make the emitted ``kid`` lie. Dependency-free (stdlib ``urllib``); fail-closed (vault errors raise)."""
+    make the emitted ``kid`` lie. Dependency-free (stdlib ``urllib``); fail-closed (vault errors raise).
+
+    **Experimental** (see docs/api.md): it is a client for a third-party API and authenticates with a
+    static token only; its constructor will change when other auth methods are added.
+    """
 
     _TIMEOUT = 5
 

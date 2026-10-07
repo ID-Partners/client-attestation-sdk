@@ -9,7 +9,7 @@ export { AccessTokenValidator } from "./validator.js";
 export type { HttpPost, Claims, ValidatorOptions } from "./validator.js";
 export type { HttpGet } from "./jwks.js";
 export type { Logger, LogAttributes, LogLevel } from "../logging.js";
-export { resolveConfig, DEFAULT_ALGORITHMS, DEFAULT_TOKEN_TYPES } from "./config.js";
+export { DEFAULT_ALGORITHMS, DEFAULT_TOKEN_TYPES } from "./config.js";
 export type {
   ValidatorConfig,
   ResolvedConfig,
@@ -22,4 +22,4 @@ export * as errors from "./errors.js";
 export { ProtectedResource, bearerToken } from "./resource.js";
 export type { ProtectedResourceMetadata, AuthDecision } from "./resource.js";
 
-export const VALIDATOR_VERSION = "0.3.0";
+export const VALIDATOR_VERSION = "1.0.0";

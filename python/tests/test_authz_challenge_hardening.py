@@ -12,11 +12,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from client_attestation_sdk.authz_challenge import (
     APPROVED, CHANNEL_DEVICE, EXPIRED, IDENTITY_PROOFING, PENDING, RESOURCE_AUTHORISATION,
     Ceremony, CibaClient, CibaRequest, CibaResolver, Hooks, MemoryStore, Pending, PollResult,
-    PrivateKeyJwtAuth, ProofingResolver, Resolved, Unavailable, WebConsentResolver, new_code,
-    parse_challenge, urllib_http,
+    PrivateKeyJwtAuth, ProofingResolver, Resolved, Unavailable, WebConsentResolver, parse_challenge,
 )
 from client_attestation_sdk.authz_challenge import ciba as ciba_mod
-from client_attestation_sdk.authz_challenge.resolver import new_handle
+from client_attestation_sdk.authz_challenge.ciba import urllib_http
+from client_attestation_sdk.authz_challenge.resolver import new_code, new_handle
 
 BC = "https://pf.example/as/bc-auth.ciba"
 TOK = "https://pf.example/as/token.oauth2"
@@ -441,10 +441,6 @@ def test_dangerously_disable_tls_verification_turns_verification_off_without_war
         assert _captured_context(monkeypatch) is None
 
 
-def test_insecure_tls_is_a_deprecated_alias(monkeypatch):
-    import ssl
-    with pytest.warns(DeprecationWarning, match="dangerously_disable_tls_verification"):
-        ctx = _captured_context(monkeypatch, insecure_tls=True)
-    assert ctx.verify_mode == ssl.CERT_NONE
-    with pytest.warns(DeprecationWarning):
-        assert _captured_context(monkeypatch, insecure_tls=False) is None
+def test_insecure_tls_alias_is_gone(monkeypatch):
+    with pytest.raises(TypeError):
+        _captured_context(monkeypatch, insecure_tls=True)

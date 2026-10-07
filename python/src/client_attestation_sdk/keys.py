@@ -78,7 +78,7 @@ class SigningKeyPair:
         return dict(self._public_jwk)
 
 
-def sign_compact(claims: dict, key: SigningKeyPair, typ: str, embed_jwk: bool) -> str:
+def _sign_compact(claims: dict, key: SigningKeyPair, typ: str, embed_jwk: bool) -> str:
     """Sign claims into a compact JWS with an explicit ``typ`` header, keyed by ``key``.
 
     When ``embed_jwk`` is set the public key travels in a ``jwk`` header (as DPoP requires); otherwise the
@@ -94,7 +94,7 @@ def sign_compact(claims: dict, key: SigningKeyPair, typ: str, embed_jwk: bool) -
     return jwt.encode(claims, key.private_key, algorithm=key.algorithm, headers=headers)
 
 
-def require_text(value, field: str) -> str:
+def _require_text(value, field: str) -> str:
     if not value or not str(value).strip():
         raise ValueError(f"{field} is required")
     return value

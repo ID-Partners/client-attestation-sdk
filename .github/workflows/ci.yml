@@ -1,7 +1,13 @@
 name: ci
 
 # Every port's suite with its coverage floor, then the cross-language validation gate. Branch protection
-# requires the `ci-ok` job, which only passes when everything above it did.
+# requires the `ci-ok` job, which passes when every job that ran passed.
+#
+# To keep Actions minutes down (this repo is private, so they are billed), a pull request or a push to main
+# runs only the ports whose files changed, and a pull request runs the oldest and newest Python only.
+# Anything shared (workflows, scripts, vectors, validation, VERSION) runs everything. Each port's job also
+# checks its public API against docs/api-surface/<port>.txt, and a change to that file runs the job.
+# release.yml calls this workflow and always gets the full matrix.
 on:
   push:
     branches: [main]
@@ -16,8 +22,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: changes + docs checks
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.diff.outputs.go }}
+      python: ${{ steps.diff.outputs.python }}
+      typescript: ${{ steps.diff.outputs.typescript }}
+      java: ${{ steps.diff.outputs.java }}
+      validation: ${{ steps.diff.outputs.validation }}
+      full: ${{ steps.diff.outputs.full }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          all() { for k in go python typescript java validation; do echo "$k=true" >> "$GITHUB_OUTPUT"; done; }
+          case "$EVENT" in
+            pull_request) range="$BASE_SHA...HEAD"; echo "full=false" >> "$GITHUB_OUTPUT" ;;
+            push) range="$BEFORE..$GITHUB_SHA"; echo "full=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "full=true" >> "$GITHUB_OUTPUT"; all; exit 0 ;;   # workflow_call (release): everything
+          esac
+          if ! files=$(git diff --name-only "$range" 2>/dev/null) || [ -z "$files" ]; then all; exit 0; fi
+          echo "$files"
+          if echo "$files" | grep -qE '^(\.github/|scripts/|vectors/|validation/|verify-[a-z]+\.sh$|VERSION$)'; then all; exit 0; fi
+          # a port's job also owns its API snapshot, docs/api-surface/<port>.txt
+          for k in go python typescript java; do
+            echo "$files" | grep -qE "^($k/|docs/api-surface/$k\.txt$)" && echo "$k=true" >> "$GITHUB_OUTPUT" || echo "$k=false" >> "$GITHUB_OUTPUT"
+          done
+          # the validators live in these paths; a change to any of them reruns the four-port agreement
+          echo "$files" | grep -qE '^(go/tokenvalidator/|go/cmd/validate-emit/|python/src/client_attestation_sdk/token_validator/|python/validate_emit\.py|typescript/src/validator/|typescript/validate-emit\.ts|java/src/main/java/global/idpartners/clientattestation/tokenvalidator/|java/ValidateEmit\.java)' \
+            && echo "validation=true" >> "$GITHUB_OUTPUT" || echo "validation=false" >> "$GITHUB_OUTPUT"
+      # cheap and always relevant: README/explainer match docs/features.json, and every version copy agrees
+      - run: python3 scripts/features.py --check
+      - run: python3 scripts/version.py check
+
   go:
     name: go ${{ matrix.go }}
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -34,19 +82,23 @@ jobs:
           cache-dependency-path: go/go.sum
       - run: go vet ./...
       - run: go test -race -coverprofile=coverage.out ./...
-      - name: Coverage floor (82% total, which counts cmd/ and examples/ at 0%; raise it, never lower it)
+      - name: Coverage floor (84% total, which counts cmd/ and examples/ at 0%; raise it, never lower it)
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {sub("%","",$3); print $3}')
           echo "total coverage: ${total}%"
-          awk -v t="$total" 'BEGIN { exit (t >= 82.0) ? 0 : 1 }' || { echo "::error::Go coverage ${total}% is below the 82% floor"; exit 1; }
+          awk -v t="$total" 'BEGIN { exit (t >= 84.0) ? 0 : 1 }' || { echo "::error::Go coverage ${total}% is below the 84% floor"; exit 1; }
+      - name: Public API matches docs/api-surface/go.txt (see CONTRIBUTING.md)
+        run: python3 ../scripts/api_surface.py --check go
 
   python:
     name: python ${{ matrix.python }}
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13", "3.14"]
+        python: ${{ fromJSON(needs.changes.outputs.full == 'true' && '["3.11", "3.12", "3.13", "3.14"]' || '["3.11", "3.14"]') }}
     defaults:
       run:
         working-directory: python
@@ -57,11 +109,15 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e '.[test]'
       - run: python -m pytest --cov   # floor is fail_under in pyproject.toml
+      - name: Public API matches docs/api-surface/python.txt (see CONTRIBUTING.md)
+        run: python ../scripts/api_surface.py --check python
 
   python-minimums:
     # the job above always gets the newest pyjwt and cryptography; this one pins each to the minimum
     # pyproject.toml declares, on the oldest supported Python, so a floor that no longer works fails here
     name: python minimums
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -88,6 +144,8 @@ jobs:
 
   typescript:
     name: node ${{ matrix.node }}
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -106,9 +164,14 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npx vitest run --coverage   # thresholds in vitest.config.ts
+      - run: npm run test:edge   # the bundled SDK in workerd (Cloudflare Workers runtime), no Node compat
+      - name: Public API matches docs/api-surface/typescript.txt (see CONTRIBUTING.md)
+        run: python3 ../scripts/api_surface.py --check typescript
 
   java:
     name: java ${{ matrix.java }}
+    needs: changes
+    if: needs.changes.outputs.java == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -124,10 +187,14 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-      - run: mvn -B verify   # jacoco floors are in pom.xml
+      - run: ./mvnw -B verify   # jacoco floors are in pom.xml; mvnw pins Maven 3.9.16
+      - name: Public API matches docs/api-surface/java.txt (see CONTRIBUTING.md)
+        run: python3 ../scripts/api_surface.py --check --no-build java
 
   validation:
-    name: validation agreement + feature matrix
+    name: validation agreement
+    needs: changes
+    if: needs.changes.outputs.validation == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -143,28 +210,24 @@ jobs:
         with:
           go-version: stable
           cache-dependency-path: go/go.sum
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
       - run: python -m pip install pyjwt cryptography
-      - run: python3 scripts/features.py --check   # README and explainer match docs/features.json
-      - run: python3 scripts/version.py check      # every copy of the version matches VERSION
       - run: ./verify-validation.sh
 
-  interop:
-    name: interop (Java AS-side verifier)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Skip unless the verifier is available
-        run: |
-          # verify-interop.sh needs client-attestation 0.1.0, which is not on Maven Central, so it cannot
-          # run here yet. Run it locally before every release.
-          echo "::warning title=interop gate skipped::verify-interop.sh needs the AS-side verifier (client-attestation 0.1.0), which is not published. Run ./verify-interop.sh locally before releasing."
+  # interop: verify-interop.sh needs the AS-side verifier (client-attestation 0.1.0), which is not
+  # published, so it can't run here. Run ./verify-interop.sh locally before every release.
 
   ci-ok:
     name: ci-ok
-    if: always()
-    needs: [go, python, python-minimums, typescript, java, validation]
+    # not on a cancelled run: a newer push superseded it, and reporting that as a failure is noise
+    if: ${{ !cancelled() }}
+    needs: [changes, go, python, python-minimums, typescript, java, validation]
     runs-on: ubuntu-latest
     steps:
-      - name: All required jobs passed
+      - name: Every job that ran passed (a skipped job had nothing to check)
         run: |
-          echo '${{ toJSON(needs) }}' | python3 -c "import json,sys; n=json.load(sys.stdin); bad=[k for k,v in n.items() if v['result']!='success']; print('failed:', bad) if bad else print('all passed'); sys.exit(1 if bad else 0)"
+          echo '${{ toJSON(needs) }}' | python3 -c "import json,sys; n=json.load(sys.stdin); bad=[k for k,v in n.items() if v['result'] not in ('success','skipped')]; print('failed:', bad) if bad else print('all passed'); sys.exit(1 if bad else 0)"

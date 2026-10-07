@@ -7,6 +7,10 @@ works whichever port a service runs.
 
 Logging is **off by default**. Nothing is written until you configure a logger.
 
+The logger option in each port is Stable API, and the rule that nothing secret is logged never changes.
+The event names and attributes below are **Experimental** (see [`api.md`](api.md)): a minor release may
+add, split or rename them, with a CHANGELOG entry.
+
 ## Turning it on
 
 | Port | How | Default |
@@ -14,7 +18,7 @@ Logging is **off by default**. Nothing is written until you configure a logger.
 | Python | Standard `logging`. Loggers live under `client_attestation_sdk` (`client_attestation_sdk.token_source`, `client_attestation_sdk.validator`, `client_attestation_sdk.authz`). Configure them like any other library's. | The `client_attestation_sdk` logger has a `NullHandler`, so nothing reaches stderr. |
 | Go | `clientattestation.WithLogger(*slog.Logger)` on `NewClientAttestation`; `tokenvalidator.WithLogger(*slog.Logger)` on `tokenvalidator.New`. | Discards. |
 | TypeScript | `logger` option on `ClientAttestation` and in the `AccessTokenValidator` options: any object with `debug`, `info`, `warn` and `error(msg, attrs)` (the `console` object fits). | No-op. |
-| Java | `ClientAttestation.builder(host).logger(System.Logger)`. Pass `System.getLogger(SdkLogging.LOGGER_NAME)` (`global.idpartners.clientattestation`) to route through `java.util.logging`, or any `System.LoggerFinder` you install (SLF4J and Log4j both ship one). | No-op. |
+| Java | `ClientAttestation.builder(host).logger(System.Logger)`, and `AccessTokenValidator.builder(config).logger(System.Logger)` for the validator. Pass `System.getLogger(ClientAttestation.LOGGER_NAME)` (`global.idpartners.clientattestation`) to route through `java.util.logging`, or any `System.LoggerFinder` you install (SLF4J and Log4j both ship one). | No-op. |
 
 ```python
 import logging
@@ -33,7 +37,7 @@ const ca = new ClientAttestation("pf.example.com", { logger: console });
 
 ```java
 ClientAttestation ca = ClientAttestation.builder("pf.example.com")
-        .logger(System.getLogger(SdkLogging.LOGGER_NAME))
+        .logger(System.getLogger(ClientAttestation.LOGGER_NAME))
         .build();
 ```
 
@@ -65,8 +69,8 @@ Levels are the four common ones: `debug`, `info`, `warn` (Python `WARNING`, Java
 | --- | --- | --- | --- |
 | `token.cache_hit` | debug | `expires_in` | A cached token is still good and is returned. |
 | `token.refreshing` | debug | `reason` | A new token is needed. `reason` is `initial`, `expired`, `forced` or `asserted_context` (Python only). |
-| `discovery.fetched` | debug | `host` | The `/.well-known/client-attester` document was fetched. |
-| `discovery.cached` | debug | `host` | The flow used the discovery document fetched earlier. |
+| `discovery.fetched` | debug | `host` | The attester profile discovered the attester (for the PingFederate profile, the `/.well-known/client-attester` document was fetched). `host` is absent when the client has no attester URL. |
+| `discovery.cached` | debug | `host` | The flow used metadata discovered earlier, or static metadata the caller gave. |
 | `evidence.obtained` | debug | `source` | The platform identity was read. `source` is the evidence source's type name. |
 | `challenge.fetched` | debug | `host` | The attester issued a challenge. |
 | `challenge.skipped` | warn | `host` | The challenge could not be fetched and `require_challenge` is off, so the flow mints without one. |
@@ -75,7 +79,7 @@ Levels are the four common ones: `debug`, `info`, `warn` (Python `WARNING`, Java
 | `token.obtained` | info | `host`, `client_id`, `token_type`, `expires_in`, `pop_method` | The token endpoint issued a token. |
 | `http.failed` | warn | `step`, `method`, `host`, `path`, `status`, `reason` | An outbound call failed. See below. |
 
-### Validator (resource server: Python, TypeScript, Go)
+### Validator (resource server, all four ports)
 
 | Event | Level | Attributes | When |
 | --- | --- | --- | --- |
@@ -83,9 +87,7 @@ Levels are the four common ones: `debug`, `info`, `warn` (Python `WARNING`, Java
 | `jwks.fetched` | debug | `host`, `keys` | The JWKS was fetched; `keys` is how many usable keys it held. |
 | `jwks.fetch_failed` | warn | `host`, `reason`, `status` | The JWKS fetch failed. The validator keeps serving the keys it already has. |
 | `jwks.refetch_throttled` | debug | `host` | An unknown `kid` (or a stale set) would have triggered a fetch, but the last attempt was too recent. |
-| `http.failed` | warn | `step`, `method`, `host`, `path`, `status`, `reason` | The introspection call failed (`step` is `introspection`). |
-
-Java has no validator, so it emits none of these.
+| `http.failed` | warn | `step`, `method`, `host`, `path`, `status`, `reason` | The introspection call failed (`step` is `introspection`). The call then raises (Go: returns an error), so no `token.validated` follows. |
 
 ### Authorization challenges (Python only)
 

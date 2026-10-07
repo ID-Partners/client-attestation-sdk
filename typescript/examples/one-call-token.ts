@@ -18,11 +18,11 @@
  */
 import { ClientAttestation } from "../src/index.js";
 
-const pfHost = process.argv[2] ?? "http://pingfederate.pf:9080";
+const attesterUrl = process.argv[2] ?? "http://pingfederate.pf:9080";
 
 // Optional: ask for a specific entitlement (RFC 9396). The attester grants at most what the workload
 // is allowed. Omit to take the full attested ceiling.
-const ca = new ClientAttestation(pfHost, {
+const ca = new ClientAttestation(attesterUrl, {
   allowInsecure: process.env.ALLOW_INSECURE === "1",
   authorizationDetails: [{ type: "sales_agent", sales_regions: ["EMEA"] }],
 });

@@ -284,12 +284,12 @@ func TestAutoDetectRaisesWhenNothingFound(t *testing.T) {
 	t.Setenv(EnvTokenFile, "")
 	t.Setenv(EnvSpiffeSocket, "")
 
-	origTokenFile, origSocket, origProbe := DefaultTokenFile, DefaultSpiffeSocket, gcpMetadataProbe
+	origTokenFile, origSocket, origProbe := defaultTokenFile, defaultSpiffeSocket, gcpMetadataProbe
 	t.Cleanup(func() {
-		DefaultTokenFile, DefaultSpiffeSocket, gcpMetadataProbe = origTokenFile, origSocket, origProbe
+		defaultTokenFile, defaultSpiffeSocket, gcpMetadataProbe = origTokenFile, origSocket, origProbe
 	})
-	DefaultTokenFile = "/nonexistent/attester-token"
-	DefaultSpiffeSocket = "/nonexistent/spire.sock"
+	defaultTokenFile = "/nonexistent/attester-token"
+	defaultSpiffeSocket = "/nonexistent/spire.sock"
 	gcpMetadataProbe = func() bool { return false }
 
 	_, err := AutoDetectEvidence()

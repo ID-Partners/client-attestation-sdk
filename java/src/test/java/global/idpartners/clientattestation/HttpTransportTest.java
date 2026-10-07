@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import global.idpartners.clientattestation.internal.HttpTransport;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.URI;

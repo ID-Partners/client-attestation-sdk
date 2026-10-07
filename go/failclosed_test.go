@@ -171,9 +171,9 @@ func TestExplicitEvidenceEnvPointingNowhereIsAnError(t *testing.T) {
 	}
 
 	t.Setenv(EnvTokenFile, "")
-	origTokenFile := DefaultTokenFile
-	t.Cleanup(func() { DefaultTokenFile = origTokenFile })
-	DefaultTokenFile = "/nonexistent/attester-token"
+	origTokenFile := defaultTokenFile
+	t.Cleanup(func() { defaultTokenFile = origTokenFile })
+	defaultTokenFile = "/nonexistent/attester-token"
 	t.Setenv(EnvSpiffeSocket, "unix://"+missing)
 	_, err = AutoDetectEvidence()
 	if !errors.As(err, &nf) || !strings.Contains(err.Error(), EnvSpiffeSocket) {

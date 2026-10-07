@@ -19,15 +19,15 @@ from client_attestation_sdk import ClientAttestation
 
 
 def main():
-    pf_host = sys.argv[1] if len(sys.argv) > 1 else "http://pingfederate.pf:9080"
+    attester_url = sys.argv[1] if len(sys.argv) > 1 else "http://pingfederate.pf:9080"
 
     # Optional: ask for a specific entitlement (RFC 9396). The attester grants at most what the
     # workload is allowed. Omit to take the full attested ceiling.
     ca = ClientAttestation(
-        pf_host,
+        attester_url,
         authorization_details=[{"type": "sales_agent", "sales_regions": ["EMEA"]}],
         # Plain http is refused for non-loopback hosts unless asked for; the in-cluster default needs it.
-        allow_insecure=pf_host.startswith("http://"),
+        allow_insecure=attester_url.startswith("http://"),
     )
 
     token = ca.token()

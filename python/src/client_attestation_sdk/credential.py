@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .builders import DpopProofBuilder, PopBuilder
-from .keys import SigningKeyPair, require_text
+from .keys import SigningKeyPair, _require_text
 
 ATTESTATION_HEADER = "OAuth-Client-Attestation"
 POP_HEADER = "OAuth-Client-Attestation-PoP"
@@ -14,7 +14,7 @@ class ClientAttestationCredential:
     headers — PoP-JWT mode or DPoP combined mode — minting a fresh proof each call."""
 
     def __init__(self, attestation_jwt: str, instance_key: SigningKeyPair):
-        self._attestation_jwt = require_text(attestation_jwt, "attestation_jwt")
+        self._attestation_jwt = _require_text(attestation_jwt, "attestation_jwt")
         self._instance_key = instance_key
 
     def pop_headers(self, client_id: str, audience: str, challenge: str = None) -> dict:

@@ -1,7 +1,7 @@
 /**
  * One call to get an access token with client attestation.
  *
- * Point it at a PingFederate host and call `.token()`. It runs the whole flow:
+ * Point it at an attester (PingFederate by default) and call `.token()`. It runs the whole flow:
  *
  *     discover -> get platform identity (evidence) -> get a challenge -> mint the attestation ->
  *     call the token endpoint with the attestation headers -> cache the access token
@@ -25,23 +25,30 @@ import { DpopProofBuilder } from "./builders.js";
 import { ClientAttestationCredential, DPOP_HEADER } from "./credential.js";
 import { ClientAttestationError, TransportError } from "./errors.js";
 import { autoDetectEvidence } from "./evidence.js";
-import { INSTANCE_PROOF_TYP } from "./issuance.js";
+import {
+  type AttesterMetadata,
+  type AttesterProfile,
+  type AttesterTransport,
+  MintRequest,
+  PingFederateProfile,
+  metadataDocument,
+} from "./attester.js";
 import { jsonOk, request, type HttpRequestOptions, type HttpResponse } from "./http.js";
 import { emit, failureReason, hostOf, NOOP_LOGGER, urlParts, type Logger } from "./logging.js";
 import { utf8Decode } from "./runtime.js";
-import { SigningKeyPair, signCompact } from "./signing-key-pair.js";
+import { SigningKeyPair } from "./signing-key-pair.js";
 import type { SvidSource } from "./svid-source.js";
 
 export const ATTESTATION_HEADER = "OAuth-Client-Attestation";
 export const POP_HEADER = "OAuth-Client-Attestation-PoP";
-export const WELL_KNOWN_PATH = "/.well-known/client-attester";
 /** Refresh this many seconds before the token actually expires, so a token is never used at the edge. */
 export const DEFAULT_EXPIRY_SKEW_SECONDS = 30;
 
 export { ClientAttestationError, TransportError } from "./errors.js";
 
-/** The attester's `/.well-known/client-attester` discovery document. */
-interface AttesterDiscovery {
+/** The attester's discovery document (PingFederate: `/.well-known/client-attester`). */
+export interface AttesterDiscovery {
+  [member: string]: unknown;
   evidence_audience?: string;
   attestation_endpoint?: string;
   challenge_endpoint?: string;
@@ -51,6 +58,21 @@ interface AttesterDiscovery {
 
 /** Options for {@link ClientAttestation}. */
 export interface ClientAttestationOptions {
+  /**
+   * The attester's host, when the options object is the only argument. The positional argument wins
+   * when both are given.
+   */
+  attesterUrl?: string;
+  /**
+   * The attester profile that discovers the attester and mints the attestation. Default
+   * {@link PingFederateProfile}, the behaviour of every earlier release. See docs/attester-profiles.md.
+   */
+  profile?: AttesterProfile;
+  /**
+   * Static attester metadata (evidence audience, attestation and token endpoints, optionally challenge
+   * endpoint and PoP audience). When set, no discovery request is made; the profile still mints.
+   */
+  metadata?: AttesterMetadata;
   /**
    * How to get the workload's platform identity. Leave unset to auto-detect the runtime (env token,
    * projected token file, SPIRE socket, or GCP metadata). Pass an {@link SvidSource} to override.
@@ -99,7 +121,7 @@ export interface ClientAttestationOptions {
    */
   requireChallenge?: boolean;
   /**
-   * Allow plain `http` for the PingFederate host and the endpoints the attester advertises (default
+   * Allow plain `http` for the attester URL and the endpoints the attester advertises (default
    * `false`). Loopback hosts (`localhost`, `127.0.0.1`, `::1`) are always allowed.
    */
   allowInsecure?: boolean;
@@ -130,14 +152,27 @@ interface TokenResponse {
 const USE_DPOP_NONCE = "use_dpop_nonce";
 const DPOP_NONCE_HEADER = "DPoP-Nonce";
 
+/** What the https check calls the URL a profile's call goes to, by step. */
+const STEP_LABELS: Record<string, string> = {
+  discover: "attesterUrl",
+  mint: "attestation_endpoint",
+  challenge: "challenge_endpoint",
+};
+
 /**
- * Gets and caches an access token from a PingFederate host using client attestation.
+ * Gets and caches an access token using client attestation.
  *
- * @param pfHost the PingFederate host — `"pf.example.com"`, or a full base URL
- *   `"https://pf.example.com"`. Plain hostnames default to https.
+ * `new ClientAttestation(attesterUrl, opts)`, or `new ClientAttestation(opts)` with `opts.metadata` (no
+ * discovery) or a custom `opts.profile`.
+ *
+ * @param attesterUrl the attester's host — `"pf.example.com"`, or a full base URL
+ *   `"https://pf.example.com"`. Plain hostnames default to https. Optional when `metadata` or `profile`
+ *   is given.
  */
 export class ClientAttestation {
+  /** The normalised attester URL, or `""` when the client was built from static metadata alone. */
   readonly baseUrl: string;
+  readonly #profile: AttesterProfile;
   readonly #evidence?: SvidSource;
   readonly #authorizationDetails?: Array<Record<string, unknown>>;
   readonly #operator?: Record<string, unknown>;
@@ -152,13 +187,19 @@ export class ClientAttestation {
 
   /** The token, its type and its bound key: always replaced together, never one without the others. */
   #state: TokenState | null = null;
-  #discovery: AttesterDiscovery | null = null;
+  #metadata: AttesterMetadata | null;
   #refreshing: Promise<TokenState> | null = null;
   /** The last `DPoP-Nonce` each origin returned. */
   readonly #nonces = new Map<string, string>();
 
-  constructor(pfHost: string, opts: ClientAttestationOptions = {}) {
-    this.baseUrl = normalizeBaseUrl(pfHost);
+  constructor(attesterUrl?: string | ClientAttestationOptions, opts: ClientAttestationOptions = {}) {
+    if (typeof attesterUrl === "object" && attesterUrl !== null) {
+      opts = attesterUrl;
+      attesterUrl = undefined;
+    }
+    const url = attesterUrl ?? opts.attesterUrl;
+    this.#profile = opts.profile ?? new PingFederateProfile();
+    this.#metadata = opts.metadata ?? null;
     this.#evidence = opts.evidence;
     this.#authorizationDetails = opts.authorizationDetails;
     this.#operator = opts.operator && Object.keys(opts.operator).length > 0 ? opts.operator : undefined;
@@ -170,7 +211,12 @@ export class ClientAttestation {
     this.#requireChallenge = opts.requireChallenge ?? true;
     this.#allowInsecure = opts.allowInsecure ?? false;
     this.#logger = opts.logger ?? NOOP_LOGGER;
-    this.#checkSecure(this.baseUrl, "pfHost");
+    if (url === undefined && (opts.metadata || opts.profile)) {
+      this.baseUrl = "";
+    } else {
+      this.baseUrl = normalizeBaseUrl(url as string);
+      this.#checkSecure(this.baseUrl, "attesterUrl");
+    }
   }
 
   // ── public API ──────────────────────────────────────────────────────────────────────────────────
@@ -243,15 +289,34 @@ export class ClientAttestation {
     return send();
   }
 
-  /** The attester's `/.well-known/client-attester` document (fetched once, then cached). */
+  /**
+   * The attester's discovery document (PingFederate: `/.well-known/client-attester`), fetched once and
+   * then cached. With static `metadata`, the fields that were given, in the document's snake_case.
+   */
   async discovery(): Promise<AttesterDiscovery> {
-    if (this.#discovery === null) {
-      this.#discovery = await this.#getJson<AttesterDiscovery>("discover", "GET", this.baseUrl + WELL_KNOWN_PATH);
-      emit(this.#logger, "debug", "discovery.fetched", { host: hostOf(this.baseUrl) });
+    return metadataDocument(await this.attesterMetadata()) as AttesterDiscovery;
+  }
+
+  /** The attester's endpoints: the static `metadata`, or what the profile discovered (once, then cached). */
+  async attesterMetadata(): Promise<AttesterMetadata> {
+    const host = this.baseUrl ? hostOf(this.baseUrl) : undefined;
+    if (this.#metadata === null) {
+      this.#metadata = await this.#profile.discover(this.#transport(), this.baseUrl || undefined);
+      emit(this.#logger, "debug", "discovery.fetched", { host });
     } else {
-      emit(this.#logger, "debug", "discovery.cached", { host: hostOf(this.baseUrl) });
+      emit(this.#logger, "debug", "discovery.cached", { host });
     }
-    return this.#discovery;
+    return this.#metadata;
+  }
+
+  /** The transport handed to the profile: this client's https rule, timeout and logging. */
+  #transport(): AttesterTransport {
+    return {
+      requestJson: (step, method, url, body) => {
+        this.#checkSecure(url, STEP_LABELS[step] ?? `${step} URL`);
+        return this.#getJson<Record<string, unknown>>(step, method, url, body);
+      },
+    };
   }
 
   // ── the flow ────────────────────────────────────────────────────────────────────────────────────
@@ -289,8 +354,8 @@ export class ClientAttestation {
   }
 
   async #runFlow(): Promise<{ response: TokenResponse; key: SigningKeyPair }> {
-    const doc = await this.discovery();
-    const audience = doc.evidence_audience;
+    const meta = await this.attesterMetadata();
+    const audience = meta.evidenceAudience;
     if (!audience) {
       throw new ClientAttestationError("attester discovery document has no evidence_audience");
     }
@@ -300,23 +365,34 @@ export class ClientAttestation {
     emit(this.#logger, "debug", "evidence.obtained", { source: evidenceSource.constructor?.name });
 
     const instanceKey = await SigningKeyPair.generate(this.#algorithm);
-    const challenge = await this.#fetchChallenge(doc);
-    const attestation = await this.#mint(doc, instanceKey, svid, challenge);
+    const challenge = await this.#fetchChallenge(meta.challengeEndpoint);
+    const { attestation } = await this.#profile.mint(
+      this.#transport(),
+      meta,
+      new MintRequest({
+        instanceKey,
+        evidence: svid,
+        challenge,
+        authorizationDetails: this.#authorizationDetails,
+        operator: this.#operator,
+      }),
+    );
 
-    // token_endpoint is advertised by current attesters; fall back to the standard PF path so an older
-    // discovery document still works from the host alone.
-    const tokenEndpoint = doc.token_endpoint || this.baseUrl + "/as/token.oauth2";
+    // The profile resolves the token endpoint (PingFederate: the advertised one, else the standard path
+    // on the attester host).
+    const tokenEndpoint = meta.tokenEndpoint;
+    if (!tokenEndpoint) throw new ClientAttestationError("attester metadata has no token_endpoint");
     this.#checkSecure(tokenEndpoint, "token_endpoint");
     const clientId = jwtSub(attestation);
     emit(this.#logger, "debug", "attestation.minted", {
-      host: hostOf(doc.attestation_endpoint as string),
+      host: meta.attestationEndpoint ? hostOf(meta.attestationEndpoint) : undefined,
       client_id: clientId,
       alg: this.#algorithm,
     });
     // The PoP audience must be PF's configured issuer, which the attester advertises as pop_audience.
     // Falling back to the token endpoint URL only works when the dialed URL matches PF's issuer (no
     // proxy in between) — so prefer the advertised value.
-    const popAudience = doc.pop_audience || tokenEndpoint;
+    const popAudience = meta.popAudience || tokenEndpoint;
     // See `challengeAtToken`: some attesters consume the challenge the moment the mint's instance
     // proof uses it, and reject a token request that presents the same value a second time. Against
     // one of those, only the mint gets the challenge.
@@ -351,8 +427,7 @@ export class ClientAttestation {
     return obtained(this.#tokenResponse(tokenEndpoint, res));
   }
 
-  async #fetchChallenge(doc: AttesterDiscovery): Promise<string | undefined> {
-    const endpoint = doc.challenge_endpoint;
+  async #fetchChallenge(endpoint: string | undefined): Promise<string | undefined> {
     if (!endpoint) return undefined;
     this.#checkSecure(endpoint, "challenge_endpoint");
     // The attester advertised a challenge, so minting without one weakens replay protection: fail
@@ -382,48 +457,6 @@ export class ClientAttestation {
       return undefined;
     }
     throw new ClientAttestationError(`challenge endpoint ${endpoint} returned no attestation_challenge`);
-  }
-
-  async #mint(
-    doc: AttesterDiscovery,
-    instanceKey: SigningKeyPair,
-    svid: string,
-    challenge: string | undefined,
-  ): Promise<string> {
-    if (!doc.attestation_endpoint) {
-      throw new ClientAttestationError("attester discovery document has no attestation_endpoint");
-    }
-    this.#checkSecure(doc.attestation_endpoint, "attestation_endpoint");
-    const now = Math.floor(Date.now() / 1000);
-    const proofClaims: Record<string, unknown> = {
-      aud: doc.evidence_audience,
-      jti: crypto.randomUUID(),
-      iat: now,
-    };
-    if (challenge) proofClaims.challenge = challenge;
-    const proof = await signCompact(proofClaims, instanceKey, INSTANCE_PROOF_TYP, false);
-
-    // Evidence-first: no client_id. The attester maps the identity to a client.
-    const body: Record<string, unknown> = {
-      instance_key: instanceKey.publicJwk(),
-      svid,
-      proof,
-    };
-    if (this.#authorizationDetails) body.authorization_details = this.#authorizationDetails;
-    if (this.#operator) body.operator = this.#operator;
-
-    const response = await this.#getJson<{ attestation?: string }>(
-      "mint",
-      "POST",
-      doc.attestation_endpoint,
-      body,
-    );
-    if (!response.attestation) {
-      throw new ClientAttestationError("attester response contained no attestation", {
-        body: JSON.stringify(response),
-      });
-    }
-    return response.attestation;
   }
 
   /** The parsed token response; a failure is logged as `http.failed` before it is thrown. */
@@ -571,6 +604,8 @@ async function isNonceChallenge(res: Response): Promise<boolean> {
 /**
  * Compact JSON with object keys sorted at every depth and non-ASCII escaped as `\uXXXX` - the same
  * bytes as Python's `json.dumps(value, separators=(",", ":"), sort_keys=True)`.
+ *
+ * @internal
  */
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortKeys(value)).replace(
@@ -588,10 +623,11 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
-export function normalizeBaseUrl(pfHost: string): string {
-  let host = (pfHost ?? "").trim().replace(/\/+$/, "");
+/** @internal */
+export function normalizeBaseUrl(attesterUrl: string): string {
+  let host = (attesterUrl ?? "").trim().replace(/\/+$/, "");
   if (!host) {
-    throw new Error("pfHost is required");
+    throw new Error("attesterUrl is required");
   }
   if (!host.includes("://")) {
     host = "https://" + host;
@@ -599,6 +635,7 @@ export function normalizeBaseUrl(pfHost: string): string {
   return host;
 }
 
+/** @internal */
 export function jwtSub(compactJwt: string): string {
   const payload = compactJwt.split(".")[1] ?? "";
   let claims: { sub?: string } | null;

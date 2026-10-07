@@ -85,8 +85,13 @@ Fail-closed defaults:
   `WithRequireChallenge(false)` proceeds without one instead.
 - `CLIENT_ATTESTATION_TOKEN_FILE` or `SPIFFE_ENDPOINT_SOCKET` set to a missing path is an
   `*EvidenceNotFound` naming the variable, not a fall-through to the next source.
-- The PF host and every discovered endpoint must be https unless the host is loopback
+- The attester URL and every discovered endpoint must be https unless the host is loopback
   (`localhost`, `127.0.0.1`, `::1`) or `WithAllowInsecure()` is given.
+
+Other attesters: `NewClientAttestation` speaks PingFederate's discovery and mint protocol by default.
+`WithAttesterProfile(p)` plugs in your own `AttesterProfile`, and `WithAttesterMetadata(m)` gives the
+endpoints directly with no discovery (the URL argument can then be `""`). `AttestationIssuanceClient` has a
+`Profile` field. See [`docs/attester-profiles.md`](../docs/attester-profiles.md).
 
 ## Develop
 

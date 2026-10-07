@@ -4,14 +4,13 @@
  */
 package global.idpartners.clientattestation;
 
+import global.idpartners.clientattestation.internal.HttpTransport;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.time.Duration;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import org.jose4j.json.JsonUtil;
 
 /**
@@ -30,17 +29,24 @@ import org.jose4j.json.JsonUtil;
  * // issued.pop(aud, id, chal)  -> OAuth-Client-Attestation-PoP header (fresh, bound to the instance key)
  * // issued.dpop(m, uri, chal)  -> DPoP header, for PoP method dpop_combined
  * }</pre>
+ *
+ * <p>The mint protocol belongs to an {@link AttesterProfile}, by default {@link PingFederateProfile}. The
+ * endpoint is given directly, so the profile's discovery is not used. See docs/attester-profiles.md.
+  *
+  * <p><b>Experimental</b> (see docs/api.md): it calls a PingFederate demo issuance servlet
+  * (/federation/attestation) whose protocol is not standardised.
  */
 public final class AttestationIssuanceClient {
 
-    /** Instance-key proof typ presented at the issuance endpoint (server InstanceKeyProofValidator.TYP). */
-    public static final String INSTANCE_PROOF_TYP = "oauth-attestation-instance-proof+jwt";
+    /** Instance-key proof typ the PingFederate profile presents (server InstanceKeyProofValidator.TYP). */
+    public static final String INSTANCE_PROOF_TYP = PingFederateProfile.INSTANCE_PROOF_TYP;
 
     private final String endpoint;
     private final String clientId;
     private final String attesterIssuer;   // the SVID audience AND the instance-proof aud
     private final SvidSource svidSource;
     private final SigningKeyPair instanceKey;
+    private final AttesterProfile profile;
     static final Duration TIMEOUT = Duration.ofSeconds(20);
     private final HttpClient http = HttpTransport.client(TIMEOUT);
 
@@ -50,11 +56,27 @@ public final class AttestationIssuanceClient {
 
     public AttestationIssuanceClient(String endpoint, String clientId, String attesterIssuer,
                                      SvidSource svidSource, SigningKeyPair instanceKey) {
+        this(endpoint, clientId, attesterIssuer, svidSource, instanceKey, new PingFederateProfile());
+    }
+
+    /**
+     * A client whose mint request follows {@code profile} instead of the PingFederate protocol.
+     *
+     * @param endpoint       the attestation (mint) endpoint
+     * @param clientId       the client id sent in the mint request
+     * @param attesterIssuer the SVID audience and the instance proof's {@code aud}
+     * @param svidSource     where the SVID comes from
+     * @param instanceKey    the workload's instance key
+     * @param profile        the attester profile that builds and sends the mint request
+     */
+    public AttestationIssuanceClient(String endpoint, String clientId, String attesterIssuer,
+                                     SvidSource svidSource, SigningKeyPair instanceKey, AttesterProfile profile) {
         this.endpoint = endpoint.replaceAll("/+$", "");
         this.clientId = clientId;
         this.attesterIssuer = attesterIssuer;
         this.svidSource = svidSource;
         this.instanceKey = instanceKey;
+        this.profile = profile != null ? profile : new PingFederateProfile();
     }
 
     /** The workload's instance key (bound into the minted attestation's cnf; signs PoPs). */
@@ -71,45 +93,32 @@ public final class AttestationIssuanceClient {
     public IssuedAttestation bootstrap(List<Map<String, Object>> authorizationDetails, String challenge)
             throws Exception {
         String svid = this.svidSource.fetch(this.attesterIssuer);
-
-        Map<String, Object> proofClaims = new LinkedHashMap<>();
-        proofClaims.put("aud", this.attesterIssuer);
-        proofClaims.put("jti", UUID.randomUUID().toString());
-        proofClaims.put("iat", System.currentTimeMillis() / 1000L);
-        if (challenge != null && !challenge.isEmpty()) {
-            proofClaims.put("challenge", challenge);
-        }
-        String proof = Jws.sign(JsonUtil.toJson(proofClaims), this.instanceKey, INSTANCE_PROOF_TYP, false);
-
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("client_id", this.clientId);
-        body.put("instance_key", this.instanceKey.publicJwk());
-        body.put("svid", svid);
-        body.put("proof", proof);
-        if (authorizationDetails != null && !authorizationDetails.isEmpty()) {
-            body.put("authorization_details", authorizationDetails);
-        }
-
-        HttpTransport.Response resp;
-        Map<String, Object> parsed;
+        MintResult minted;
         try {
-            resp = HttpTransport.send(this.http, HttpRequest.newBuilder(URI.create(this.endpoint))
-                    .header("Content-Type", "application/json").header("Accept", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(JsonUtil.toJson(body))), TIMEOUT);
+            minted = this.profile.mint(this::send,
+                    new AttesterMetadata(this.attesterIssuer, this.endpoint, null, null, null, null),
+                    new MintRequest(this.instanceKey, svid, challenge, this.clientId, authorizationDetails, null));
+        } catch (ClientAttestation.ClientAttestationException e) {
+            throw new IssuanceException("attestation issuance failed: " + e.getMessage(), e.status(), e);
+        }
+        return new IssuedAttestation(minted.attestation(), minted.expiresIn(), this.instanceKey);
+    }
+
+    /** The issuance endpoint's transport: a non-2xx answer or a transport failure is an IssuanceException. */
+    private Map<String, Object> send(String step, String method, String url, Map<String, Object> body) {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url))
+                .header("Content-Type", "application/json").header("Accept", "application/json")
+                .method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                        : HttpRequest.BodyPublishers.ofString(JsonUtil.toJson(body)));
+        try {
+            HttpTransport.Response resp = HttpTransport.send(this.http, request, TIMEOUT);
             if (!resp.ok()) {
                 throw new IssuanceException(resp.status(), resp.body());
             }
-            parsed = HttpTransport.jsonOk(resp);
+            return HttpTransport.jsonOk(resp);
         } catch (TransportException e) {
             throw new IssuanceException("attestation issuance failed: " + e.getMessage(), e.status(), e);
         }
-        if (!(parsed.get("attestation") instanceof String attestation) || attestation.isBlank()) {
-            throw new IssuanceException("attestation issuance failed: response carried no attestation",
-                    resp.status(), null);
-        }
-        Object expiresIn = parsed.get("expires_in");
-        return new IssuedAttestation(attestation,
-                expiresIn instanceof Number ? ((Number) expiresIn).longValue() : null, this.instanceKey);
     }
 
     /** A minted Client Attestation plus the instance key it is bound to. */

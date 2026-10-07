@@ -11,13 +11,28 @@ public final class TransportException extends RuntimeException {
     private final int status;
     private final String body;
 
-    TransportException(String message, int status, String body) {
+    /**
+     * A transport failure.
+     *
+     * @param message what failed
+     * @param status  the HTTP status, or 0 when none was received
+     * @param body    at most 512 characters of the response body, or null
+     */
+    public TransportException(String message, int status, String body) {
         super(message);
         this.status = status;
         this.body = body;
     }
 
-    TransportException(String message, int status, String body, Throwable cause) {
+    /**
+     * A transport failure with its cause.
+     *
+     * @param message what failed
+     * @param status  the HTTP status, or 0 when none was received
+     * @param body    at most 512 characters of the response body, or null
+     * @param cause   the underlying exception
+     */
+    public TransportException(String message, int status, String body, Throwable cause) {
         super(message, cause);
         this.status = status;
         this.body = body;

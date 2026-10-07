@@ -66,7 +66,11 @@ Other options on `ClientAttestation`:
 
 - `require_challenge=True` (default) - if the attester advertises a challenge endpoint and it fails, the flow
   fails rather than minting without a challenge. `False` restores the old lenient behaviour.
-- `allow_insecure=False` (default) - `pf_host` and the discovered endpoints must be https, except loopback.
+- `allow_insecure=False` (default) - `attester_url` and the discovered endpoints must be https, except loopback.
+- `profile=` and `metadata=` - talk to an attester other than PingFederate: plug in your own
+  `AttesterProfile`, or give the endpoints directly with `AttesterMetadata` and skip discovery. See
+  [`docs/attester-profiles.md`](../docs/attester-profiles.md). The first argument is `attester_url`
+  (it was `pf_host` before 1.0).
 - `trace=[...]` with `trace_redact=True` (default) - each wire call is recorded as a shell-quoted curl string
   with every credential replaced by `<redacted:N bytes>`. `trace_redact=False` records them verbatim - for
   local debugging only.

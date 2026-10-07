@@ -1,5 +1,9 @@
 /**
  * Client-side builder SDK for OAuth Attestation-Based Client Authentication.
+ *
+ * Everything exported here is the package's API; docs/api.md says which parts are Stable and which are
+ * Experimental. Nothing else under dist/ can be imported: package.json "exports" allows only this entry
+ * point and "./validator".
  */
 export { SigningKeyPair } from "./signing-key-pair.js";
 export {
@@ -45,17 +49,16 @@ export {
   ClientAttestation,
   ClientAttestationError,
   TransportError,
-  normalizeBaseUrl,
-  jwtSub,
   DEFAULT_EXPIRY_SKEW_SECONDS,
-  WELL_KNOWN_PATH,
 } from "./token-source.js";
-export type { ClientAttestationOptions } from "./token-source.js";
+export type { AttesterDiscovery, ClientAttestationOptions } from "./token-source.js";
+export { MintRequest, PingFederateProfile } from "./attester.js";
+export type { AttesterMetadata, AttesterProfile, AttesterTransport, MintResult } from "./attester.js";
 export type { TransportFailure } from "./errors.js";
 export { NOOP_LOGGER } from "./logging.js";
 export type { Logger, LogAttributes, LogLevel } from "./logging.js";
 
-export const VERSION = "0.3.0";
+export const VERSION = "1.0.0";
 
 /** draft-ietf-oauth-attestation-based-client-auth revision this SDK implements. */
 export const DRAFT_REVISION = "10";
