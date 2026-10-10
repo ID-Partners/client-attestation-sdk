@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func resourceFixture(t *testing.T) *ProtectedResource {
@@ -130,5 +131,60 @@ func TestAuthenticateInsufficientScope(t *testing.T) {
 	}
 	if !strings.Contains(d.WWWAuthenticate, `error="insufficient_scope"`) {
 		t.Errorf("WWW-Authenticate = %q", d.WWWAuthenticate)
+	}
+}
+
+func TestResourceChecksItsOwnAudienceWithASharedValidator(t *testing.T) {
+	v := loadVectors(t)
+	other := "https://other.example.com"
+	validator, err := New(&Config{Issuer: v.Issuer, Audiences: []string{v.Audience, other}, JWKS: v.JWKS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := tokenNamed(v, "valid")
+	if !validator.Validate(token, nil).Valid {
+		t.Fatal("shared validator must accept the token")
+	}
+	pr, err := NewProtectedResource(other, []string{v.Issuer}, validator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := pr.Authenticate("Bearer "+token, nil)
+	if d.Authorized || d.Status != 401 || d.Result.Error != ErrInvalidAudience || d.Error != "invalid_token" {
+		t.Fatalf("wrong resource: %+v", d)
+	}
+	pr, err = NewProtectedResource(v.Audience, []string{v.Issuer}, validator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pr.Authenticate("Bearer "+token, nil).Authorized {
+		t.Fatal("intended resource must accept the token")
+	}
+}
+
+func TestBearerGuardRefusesConfirmationWithoutProof(t *testing.T) {
+	for _, cnf := range []any{map[string]any{"jkt": "bound-key"}, map[string]any{"x5t#S256": "certificate"}, map[string]any{}, "malformed"} {
+		key, jwks := newTestKey(t, "key")
+		validator, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resource, err := NewProtectedResource(testAudience, []string{testIssuer}, validator, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claims := map[string]any{"exp": time.Now().Unix() + 300, "cnf": cnf}
+		token := signClaims(t, key, claims)
+		if !validator.Validate(token, nil).Valid {
+			t.Fatal("JWT validation remains available to proof-verifying callers")
+		}
+		d := resource.Authenticate("Bearer "+token, nil)
+		if d.Authorized || d.Status != 401 || d.Result.Error != ErrInvalidToken || d.Error != "invalid_token" {
+			t.Fatalf("confirmation accepted without proof: %+v", d)
+		}
+		claims["cnf"] = nil
+		if !resource.Authenticate("Bearer "+signClaims(t, key, claims), nil).Authorized {
+			t.Fatal("null confirmation must remain a Bearer token")
+		}
 	}
 }

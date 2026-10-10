@@ -119,6 +119,12 @@ func (p *ProtectedResource) Authenticate(authorizationHeader string, requiredSco
 		return AuthDecision{Status: 401, WWWAuthenticate: p.Challenge("", ""), ErrorDescription: "authentication required"}
 	}
 	result := p.validator.Validate(token, requiredScopes)
+	if result.Valid && !contains(result.Audience, p.Resource) {
+		result = failure(ErrInvalidAudience, "token audience is not this resource")
+	}
+	if result.Valid && result.Claims["cnf"] != nil {
+		result = failure(ErrInvalidToken, "sender-constrained token requires proof verification")
+	}
 	if result.Valid {
 		return AuthDecision{Authorized: true, Result: result, Status: 200}
 	}

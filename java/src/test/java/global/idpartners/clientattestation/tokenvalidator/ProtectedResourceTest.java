@@ -108,6 +108,39 @@ class ProtectedResourceTest {
     }
 
     @Test
+    void checksItsOwnAudienceWithASharedValidator() {
+        String other = "https://other.example.com";
+        AccessTokenValidator v = validator(RESOURCE, other);
+        String token = Fixtures.tokenNamed(V, "valid");
+        assertTrue(v.validate(token).valid());
+        AuthDecision denied = new ProtectedResource(other, List.of(AS), v).authenticate("Bearer " + token);
+        assertFalse(denied.authorized());
+        assertEquals(401, denied.status());
+        assertEquals(ErrorCodes.INVALID_AUDIENCE, denied.result().error());
+        assertEquals("invalid_token", denied.error());
+        assertTrue(new ProtectedResource(RESOURCE, List.of(AS), v).authenticate("Bearer " + token).authorized());
+    }
+
+    void refusesConfirmationWithoutProof() {
+        var key = Fixtures.newKey("key");
+        var validator = new AccessTokenValidator(Fixtures.config(key).build());
+        var resource = new ProtectedResource(Fixtures.AUDIENCE, List.of(Fixtures.ISSUER), validator);
+        for (Object cnf : List.of(Map.of("jkt", "bound-key"), Map.of("x5t#S256", "certificate"), Map.of(), "malformed")) {
+            String token = Fixtures.sign(key, Fixtures.claims("cnf", cnf));
+            assertTrue(validator.validate(token).valid());
+            AuthDecision denied = resource.authenticate("Bearer " + token);
+            assertFalse(denied.authorized());
+            assertEquals(401, denied.status());
+            assertEquals(ErrorCodes.INVALID_TOKEN, denied.result().error());
+            assertEquals("invalid_token", denied.error());
+        }
+        assertTrue(resource.authenticate("Bearer " + Fixtures.sign(key, Fixtures.claims())).authorized());
+        var claims = Fixtures.claims();
+        claims.put("cnf", null);
+        assertTrue(resource.authenticate("Bearer " + Fixtures.sign(key, claims)).authorized());
+    }
+
+    @Test
     void authenticateMissingToken() {
         AuthDecision d = fixture().authenticate(null);
         assertFalse(d.authorized());

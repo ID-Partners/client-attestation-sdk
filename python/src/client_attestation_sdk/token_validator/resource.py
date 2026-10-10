@@ -116,6 +116,10 @@ class ProtectedResource:
             return AuthDecision(False, status=401, www_authenticate=self.challenge(),
                                 error_description="authentication required")
         result = self.validator.validate(token, required_scopes)
+        if result.valid and self.resource not in result.audience:
+            result = ValidationResult._failure(errors.INVALID_AUDIENCE, "token audience is not this resource")
+        if result.valid and result.claims.get("cnf") is not None:
+            result = ValidationResult._failure(errors.INVALID_TOKEN, "sender-constrained token requires proof verification")
         if result.valid:
             return AuthDecision(True, result=result)
         status, oauth_error = _http_error(result.error)

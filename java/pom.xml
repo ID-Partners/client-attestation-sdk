@@ -6,7 +6,7 @@
 
     <groupId>global.idpartners</groupId>
     <artifactId>client-attestation-sdk</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <packaging>jar</packaging>
 
     <name>client-attestation-sdk</name>
@@ -93,7 +93,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-source-plugin</artifactId>
-                <version>3.3.1</version>
+                <version>3.4.0</version>
                 <executions>
                     <execution><id>attach-sources</id><goals><goal>jar-no-fork</goal></goals></execution>
                 </executions>
@@ -221,12 +221,4 @@
         </profile>
     </profiles>
 
-    <!-- GitHub Packages, for a plain `mvn deploy`. The `release` profile deploys to Maven Central instead. -->
-    <distributionManagement>
-        <repository>
-            <id>github</id>
-            <name>GitHub Packages</name>
-            <url>https://maven.pkg.github.com/ID-Partners/client-attestation-sdk</url>
-        </repository>
-    </distributionManagement>
 </project>

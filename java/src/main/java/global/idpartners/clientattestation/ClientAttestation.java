@@ -237,9 +237,14 @@ public final class ClientAttestation {
      * remembered for that origin and the request is re-sent once with a new proof carrying it. Bearer
      * tokens are sent once, unchanged. The body publisher must be re-subscribable for the retry (the JDK's
      * {@code ofString}/{@code ofByteArray} publishers are).
+     * The client must use {@code HttpClient.Redirect.NEVER}; a client that follows redirects is refused
+     * before attaching credentials.
      */
     public <T> HttpResponse<T> send(HttpClient client, HttpRequest.Builder request, String method, URI uri,
             HttpResponse.BodyHandler<T> handler) throws IOException, InterruptedException {
+        if (client.followRedirects() != HttpClient.Redirect.NEVER) {
+            throw new IllegalArgumentException("credential requests require HttpClient.Redirect.NEVER");
+        }
         HttpRequest.Builder base = request.copy();
         Map<String, String> headers = requestHeaders(method, uri.toString());
         HttpRequest.Builder first = base.copy();

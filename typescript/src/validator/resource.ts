@@ -9,7 +9,7 @@
  */
 import * as errors from "./errors.js";
 import type { ValidationError } from "./errors.js";
-import type { ValidationResult } from "./result.js";
+import { failure, type ValidationResult } from "./result.js";
 import type { AccessTokenValidator } from "./validator.js";
 
 const WELL_KNOWN = "/.well-known/oauth-protected-resource";
@@ -100,7 +100,13 @@ export class ProtectedResource {
     if (token == null) {
       return { authorized: false, status: 401, wwwAuthenticate: this.challenge(), errorDescription: "authentication required" };
     }
-    const result = await this.#validator.validate(token, requiredScopes);
+    let result = await this.#validator.validate(token, requiredScopes);
+    if (result.valid && !result.audience.includes(this.resource)) {
+      result = failure(errors.INVALID_AUDIENCE, "token audience is not this resource");
+    }
+    if (result.valid && result.claims.cnf != null) {
+      result = failure(errors.INVALID_TOKEN, "sender-constrained token requires proof verification");
+    }
     if (result.valid) {
       return { authorized: true, result, status: 200 };
     }

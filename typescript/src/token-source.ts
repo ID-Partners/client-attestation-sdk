@@ -262,6 +262,7 @@ export class ClientAttestation {
    * as global `fetch`. For a DPoP-bound token it adds a fresh proof and, when the resource answers with
    * a `use_dpop_nonce` challenge and a `DPoP-Nonce`, resends ONCE with a proof carrying that nonce —
    * unless the body is a one-shot stream, which cannot be resent (the challenge response is returned).
+   * Redirects are returned without following them, even if the input or init requests redirect following.
    */
   async fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
     const isRequest = typeof Request !== "undefined" && input instanceof Request;
@@ -276,7 +277,7 @@ export class ClientAttestation {
       const auth = await this.requestHeaders(method, url);
       dpopBound = DPOP_HEADER in auth;
       for (const [name, value] of Object.entries(auth)) headers.set(name, value);
-      return fetch(nextInput(), { ...init, headers });
+      return fetch(nextInput(), { ...init, headers, redirect: "manual" });
     };
 
     const first = await send();

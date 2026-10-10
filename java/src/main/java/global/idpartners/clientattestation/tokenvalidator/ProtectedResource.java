@@ -194,6 +194,13 @@ public final class ProtectedResource {
             return new AuthDecision(false, null, 401, challenge(null, null), null, "authentication required");
         }
         ValidationResult result = this.validator.validate(token, requiredScopes);
+        if (result.valid() && !result.audience().contains(this.resource)) {
+            result = ValidationResult.failure(ErrorCodes.INVALID_AUDIENCE, "token audience is not this resource");
+        }
+        if (result.valid() && result.claims().get("cnf") != null) {
+            result = ValidationResult.failure(ErrorCodes.INVALID_TOKEN,
+                    "sender-constrained token requires proof verification");
+        }
         if (result.valid()) {
             return new AuthDecision(true, result, 200, null, null, null);
         }

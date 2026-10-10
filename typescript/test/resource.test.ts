@@ -3,6 +3,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
+import { SignJWT } from "jose";
+import { SigningKeyPair } from "../src/index.js";
 
 import { AccessTokenValidator, ProtectedResource, bearerToken, errors } from "../src/validator/index.js";
 
@@ -26,6 +28,35 @@ function tokenNamed(name: string): string {
 }
 
 describe("protected resource", () => {
+  it("checks its own audience with a shared validator", async () => {
+    const other = "https://other.example.com";
+    const validator = new AccessTokenValidator({ issuer: vectors.issuer, audiences: [vectors.audience, other], jwks: vectors.jwks });
+    const token = tokenNamed("valid");
+    expect((await validator.validate(token)).valid).toBe(true);
+    const denied = await new ProtectedResource(other, [vectors.issuer], validator).authenticate("Bearer " + token);
+    expect(denied.authorized).toBe(false);
+    expect(denied.status).toBe(401);
+    expect(denied.result?.error).toBe(errors.INVALID_AUDIENCE);
+    expect(denied.error).toBe("invalid_token");
+    expect((await new ProtectedResource(vectors.audience, [vectors.issuer], validator).authenticate("Bearer " + token)).authorized).toBe(true);
+  });
+
+  it.each([{ jkt: "bound-key" }, { "x5t#S256": "certificate" }, {}, "malformed"])("refuses confirmation without proof: %j", async (cnf) => {
+    const key = await SigningKeyPair.generate("ES256");
+    const validator = new AccessTokenValidator({ issuer: "https://issuer.test", audiences: ["https://api.test"], jwks: { keys: [key.publicJwk()] } });
+    const resource = new ProtectedResource("https://api.test", ["https://issuer.test"], validator);
+    const claims = { iss: "https://issuer.test", aud: "https://api.test", exp: Math.floor(Date.now() / 1000) + 300, cnf };
+    const sign = (payload: Record<string, unknown>) => new SignJWT(payload).setProtectedHeader({ alg: "ES256", typ: "at+jwt", kid: key.keyId }).sign(key.privateKey);
+    const token = await sign(claims);
+    expect((await validator.validate(token)).valid).toBe(true);
+    const denied = await resource.authenticate("Bearer " + token);
+    expect(denied.authorized).toBe(false);
+    expect(denied.status).toBe(401);
+    expect(denied.result?.error).toBe(errors.INVALID_TOKEN);
+    expect(denied.error).toBe("invalid_token");
+    expect((await resource.authenticate("Bearer " + await sign({ ...claims, cnf: null }))).authorized).toBe(true);
+  });
+
   it("extracts bearer tokens", () => {
     expect(bearerToken("Bearer abc.def")).toBe("abc.def");
     expect(bearerToken("bearer abc")).toBe("abc");

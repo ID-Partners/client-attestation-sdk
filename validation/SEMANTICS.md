@@ -33,6 +33,17 @@ same string in every port, and never renamed.
 `ProtectedResource` maps `insufficient_scope` to HTTP 403 and every other code to 401 with
 `error="invalid_token"`. No error description ever quotes token bytes.
 
+`ProtectedResource.authenticate` additionally requires its own `resource` in the validated token's
+audience. A validator may accept multiple audiences; a token accepted for another configured audience
+gets `invalid_audience` and HTTP 401 at this resource. The four resource suites exercise the same shared
+`valid` token with a validator configured for two resources, and require acceptance only at its audience.
+
+`ProtectedResource.authenticate` is a Bearer request guard. It rejects a token with a non-null `cnf`
+claim as `invalid_token` and HTTP 401 because this API receives no sender proof. This includes DPoP
+`cnf.jkt`, mTLS `cnf["x5t#S256"]`, and malformed confirmation values. Absent or null `cnf` retains Bearer
+behaviour. All four resource suites sign and exercise these cases. Low-level `validate` remains JWT
+validation only; a caller using a sender-constrained token must verify its sender proof separately.
+
 ## Local validation, in order
 
 `validate` runs these steps in this order and returns the first failure. The order is part of the contract:

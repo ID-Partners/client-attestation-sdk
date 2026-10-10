@@ -56,4 +56,4 @@ __all__ = [
     "CHANNEL_DEVICE", "CHANNEL_WEB", "CHANNEL_LOCAL",
     "ASSURANCE_DEVICE_APPROVED", "ASSURANCE_WEB_CONSENT",
 ]
-__version__ = "1.0.0"
+__version__ = "1.0.1"

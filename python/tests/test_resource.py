@@ -1,5 +1,11 @@
 import json
 import os
+import time
+
+import jwt
+import pytest
+
+from client_attestation_sdk import SigningKeyPair
 
 from client_attestation_sdk.token_validator import (
     AccessTokenValidator,
@@ -94,3 +100,37 @@ def test_insufficient_scope_is_403():
     decision = _resource(v).authenticate("Bearer " + _token(v, "valid"), required_scopes=["read", "admin"])
     assert decision.status == 403 and decision.error == "insufficient_scope"
     assert 'error="insufficient_scope"' in decision.www_authenticate
+
+
+def test_resource_checks_its_own_audience_with_a_shared_validator():
+    v = _vectors()
+    other = "https://other.example.com"
+    validator = AccessTokenValidator(ValidatorConfig(
+        issuer=v["issuer"], audiences=[v["audience"], other], jwks=v["jwks"]))
+    token = _token(v, "valid")
+    assert validator.validate(token).valid
+    decision = ProtectedResource(other, [v["issuer"]], validator).authenticate("Bearer " + token)
+    assert not decision.authorized
+    assert decision.status == 401
+    assert decision.result.error == errors.INVALID_AUDIENCE
+    assert decision.error == "invalid_token"
+    assert ProtectedResource(v["audience"], [v["issuer"]], validator).authenticate("Bearer " + token).authorized
+
+
+@pytest.mark.parametrize("cnf", [{"jkt": "bound-key"}, {"x5t#S256": "certificate"}, {}, "malformed"])
+def test_bearer_guard_refuses_confirmation_without_proof(cnf):
+    key = SigningKeyPair.generate("ES256")
+    validator = AccessTokenValidator(ValidatorConfig(
+        issuer="https://issuer.test", audiences=["https://api.test"], jwks={"keys": [key.public_jwk()]}))
+    resource = ProtectedResource("https://api.test", ["https://issuer.test"], validator)
+    claims = {"iss": "https://issuer.test", "aud": "https://api.test", "exp": int(time.time()) + 300, "cnf": cnf}
+    token = jwt.encode(claims, key.private_key, algorithm="ES256", headers={"typ": "at+jwt", "kid": key.key_id})
+    assert validator.validate(token).valid
+    decision = resource.authenticate("Bearer " + token)
+    assert not decision.authorized
+    assert decision.status == 401
+    assert decision.result.error == errors.INVALID_TOKEN
+    assert decision.error == "invalid_token"
+    claims["cnf"] = None
+    bearer = jwt.encode(claims, key.private_key, algorithm="ES256", headers={"typ": "at+jwt", "kid": key.key_id})
+    assert resource.authenticate("Bearer " + bearer).authorized

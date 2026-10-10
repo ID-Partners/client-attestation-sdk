@@ -79,6 +79,16 @@ class HttpTransportTest {
     }
 
     @Test
+    void refusesRedirectFollowingClientBeforeSendingCredentials() {
+        for (HttpClient.Redirect policy : new HttpClient.Redirect[]{HttpClient.Redirect.NORMAL, HttpClient.Redirect.ALWAYS}) {
+            HttpClient following = HttpClient.newBuilder().followRedirects(policy).build();
+            assertThrows(IllegalArgumentException.class, () -> HttpTransport.send(following,
+                    get("/hop").header("Authorization", "Bearer secret"), TIMEOUT));
+        }
+        assertEquals(0, this.server.hits("/hop"));
+    }
+
+    @Test
     void oversizeChunkedBodyIsRefusedWhileStreaming() {
         // No Content-Length: the cap must trip while reading, not after buffering the whole stream.
         this.server.route("/stream", exchange -> {

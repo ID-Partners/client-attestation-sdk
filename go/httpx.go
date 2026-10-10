@@ -44,19 +44,14 @@ func refuseRedirect(req *http.Request, _ []*http.Request) error {
 }
 
 // safeClient returns the client to use for SDK requests. A nil client yields a fresh one with
-// defaultTimeout. A caller-supplied client is never mutated: when it lacks a redirect policy or a
-// timeout, a shallow copy is returned with refuseRedirect and/or defaultTimeout filled in.
+// defaultTimeout. A caller-supplied client is copied without mutation. SDK calls always refuse
+// redirects, including when the caller's client has a redirect policy that permits them.
 func safeClient(client *http.Client, defaultTimeout time.Duration) *http.Client {
 	if client == nil {
 		return &http.Client{Timeout: defaultTimeout, CheckRedirect: refuseRedirect}
 	}
-	if client.CheckRedirect != nil && (client.Timeout > 0 || defaultTimeout <= 0) {
-		return client
-	}
 	cp := *client
-	if cp.CheckRedirect == nil {
-		cp.CheckRedirect = refuseRedirect
-	}
+	cp.CheckRedirect = refuseRedirect
 	if cp.Timeout <= 0 {
 		cp.Timeout = defaultTimeout
 	}

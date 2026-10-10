@@ -5,6 +5,28 @@ and versions follow [semver](https://semver.org/) as described under "Status and
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-10
+
+A security release. Upgrade from 1.0.0. Two fixes change what some callers see - check these before you
+upgrade:
+
+- A resource that accepts DPoP-bound or mTLS-bound access tokens through `ProtectedResource.authenticate`
+  now gets HTTP 401 for them. That guard receives no sender proof, so it can't accept them safely. Verify
+  the proof yourself and call `validate` directly.
+- Java: a credential request on an `HttpClient` built with `Redirect.NORMAL` or `Redirect.ALWAYS` now
+  throws `IllegalArgumentException`. Build the client with `HttpClient.Redirect.NEVER`, which is the
+  `HttpClient` default.
+
+### Fixed
+
+- All four ports: `ProtectedResource.authenticate` checks this resource's audience when its validator
+  accepts multiple audiences. Tokens naming only another resource return HTTP 401.
+- All four ports: the Bearer `ProtectedResource.authenticate` guard refuses tokens with a non-null `cnf`
+  claim. Sender-constrained tokens require separate proof verification before a resource grants access.
+- Go: SDK HTTP calls refuse redirects even when an injected client's redirect policy permits them.
+- TypeScript: `ClientAttestation.fetch` returns redirects without resending credentials to the target.
+- Java: credential send helpers require `HttpClient.Redirect.NEVER` before obtaining or sending credentials.
+
 ## [1.0.0] - 2026-10-08
 
 The first stable release. The public API of every port is frozen under semver: [`docs/api.md`](docs/api.md)

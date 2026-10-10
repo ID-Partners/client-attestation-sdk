@@ -103,25 +103,49 @@ func TestInjectedClientIsNotMutated(t *testing.T) {
 	}
 }
 
-func TestSafeClientKeepsCallerPolicy(t *testing.T) {
+func TestSafeClientOverridesCallerRedirectPolicy(t *testing.T) {
 	custom := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	c := &http.Client{Timeout: 3 * time.Second, CheckRedirect: custom}
-	if got := safeClient(c, time.Second); got != c {
-		t.Fatal("a fully configured client should be used as-is")
+	if got := safeClient(c, time.Second); got == c || got.Timeout != c.Timeout {
+		t.Fatal("the client must be copied while preserving its timeout")
 	}
 	c2 := &http.Client{CheckRedirect: custom}
 	got := safeClient(c2, time.Second)
 	if got == c2 || got.Timeout != time.Second || got.CheckRedirect == nil || c2.Timeout != 0 {
 		t.Fatalf("expected a copy with the default timeout, got %+v", got)
 	}
-	// Caller asked for ErrUseLastResponse: the 3xx surfaces as a non-2xx status, which decodeJSONOK refuses.
+	// The caller's policy cannot weaken the SDK redirect refusal.
 	front, hits := redirectPair(t)
-	res, err := doRequest(context.Background(), got, http.MethodGet, front.URL, nil, nil, 0)
-	if err != nil {
-		t.Fatal(err)
+	_, err := doRequest(context.Background(), got, http.MethodGet, front.URL, nil, nil, 0)
+	if err == nil || atomic.LoadInt32(hits) != 0 {
+		t.Fatalf("redirect not refused: %v", err)
 	}
-	if res.Status != http.StatusFound || decodeJSONOK(res, "GET", &struct{}{}) == nil || atomic.LoadInt32(hits) != 0 {
-		t.Fatalf("3xx not treated as an error: status %d", res.Status)
+}
+
+func TestInjectedClientCannotAllowCredentialRedirect(t *testing.T) {
+	var hits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer target.Close()
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("OAuth-Client-Attestation") != "attestation" {
+			t.Error("missing test credential")
+		}
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer front.Close()
+	var policyCalls atomic.Int32
+	injected := &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { policyCalls.Add(1); return nil }}
+	_, err := doRequest(context.Background(), safeClient(injected, time.Second), http.MethodPost, front.URL,
+		map[string]string{"OAuth-Client-Attestation": "attestation", "DPoP": "proof"}, []byte("svid=secret"), 0)
+	if err == nil || hits.Load() != 0 || policyCalls.Load() != 0 {
+		t.Fatalf("redirect escaped SDK policy: err=%v target=%d policy=%d", err, hits.Load(), policyCalls.Load())
+	}
+	if injected.CheckRedirect == nil || injected.Timeout != time.Second {
+		t.Fatal("caller client was mutated")
 	}
 }
 

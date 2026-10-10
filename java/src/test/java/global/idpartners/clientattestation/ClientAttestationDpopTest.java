@@ -83,6 +83,18 @@ class ClientAttestationDpopTest {
                 .popMethod("dpop_combined").build();
     }
 
+    @Test
+    void refusesRedirectFollowingResourceClientBeforeObtainingCredentials() {
+        URI uri = URI.create(this.server.url("/resource"));
+        for (HttpClient.Redirect policy : new HttpClient.Redirect[]{HttpClient.Redirect.NORMAL, HttpClient.Redirect.ALWAYS}) {
+            HttpClient following = HttpClient.newBuilder().followRedirects(policy).build();
+            assertThrows(IllegalArgumentException.class, () -> dpopClient().send(following,
+                    HttpRequest.newBuilder(uri).GET(), "GET", uri, HttpResponse.BodyHandlers.ofString()));
+        }
+        assertEquals(0, this.issued.get());
+        assertEquals(0, this.server.hits("/resource"));
+    }
+
     // ── fake AS ─────────────────────────────────────────────────────────────────────────────────────
 
     private void tokenEndpoint(HttpExchange exchange) throws IOException {

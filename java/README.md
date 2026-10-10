@@ -24,38 +24,14 @@ round-trip tested against it.
 <dependency>
   <groupId>global.idpartners</groupId>
   <artifactId>client-attestation-sdk</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
 </dependency>
 ```
 
-The SDK isn't on Maven Central yet; it will be from a coming release, at the same coordinates. Until then
-it's published to GitHub Packages, which needs a GitHub token even to read public packages. Add the
-repository to your `pom.xml`:
+From [Maven Central](https://central.sonatype.com/artifact/global.idpartners/client-attestation-sdk), so no
+repository or token setup. Releases before 1.0.0 went to GitHub Packages only.
 
-```xml
-<repositories>
-  <repository>
-    <id>github-idpartners</id>
-    <url>https://maven.pkg.github.com/ID-Partners/client-attestation-sdk</url>
-  </repository>
-</repositories>
-```
-
-and a matching server to `~/.m2/settings.xml`, with a
-[personal access token (classic)](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-apache-maven-registry#authenticating-to-github-packages)
-that has the `read:packages` scope:
-
-```xml
-<servers>
-  <server>
-    <id>github-idpartners</id>
-    <username>YOUR_GITHUB_USERNAME</username>
-    <password>YOUR_TOKEN</password>
-  </server>
-</servers>
-```
-
-Or build it from this repository with `mvn install` in `java/`.
+Or build it from this repository with `./mvnw install` in `java/`.
 
 ## Attester: issue an attestation
 

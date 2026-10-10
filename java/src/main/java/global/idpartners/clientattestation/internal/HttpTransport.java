@@ -90,6 +90,9 @@ public final class HttpTransport {
      * @throws TransportException on any transport failure
      */
     public static Response send(HttpClient client, HttpRequest.Builder req, Duration timeout, long maxBytes) {
+        if (client.followRedirects() != HttpClient.Redirect.NEVER) {
+            throw new IllegalArgumentException("credential requests require HttpClient.Redirect.NEVER");
+        }
         HttpRequest request = req.timeout(timeout).build();
         String what = request.method() + " " + request.uri();
         CompletableFuture<HttpResponse<byte[]>> future =

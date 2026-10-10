@@ -67,9 +67,7 @@ The rest of the versioning:
   | Python | [PyPI](https://pypi.org/project/client-attestation-sdk/) | `pip install client-attestation-sdk` |
   | TypeScript | [npm](https://www.npmjs.com/package/@idpartners/client-attestation-sdk) | `npm install @idpartners/client-attestation-sdk` |
   | Go | [pkg.go.dev](https://pkg.go.dev/github.com/id-partners/client-attestation-sdk/go) | `go get github.com/id-partners/client-attestation-sdk/go` |
-  | Java | GitHub Packages | `global.idpartners:client-attestation-sdk` – see the [Java README](java/README.md) |
-
-  Java isn't on Maven Central yet, and GitHub Packages needs a GitHub token even to read a public package.
+  | Java | [Maven Central](https://central.sonatype.com/artifact/global.idpartners/client-attestation-sdk) | `global.idpartners:client-attestation-sdk` – see the [Java README](java/README.md) |
 
 See [CHANGELOG.md](CHANGELOG.md), [SECURITY.md](SECURITY.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 

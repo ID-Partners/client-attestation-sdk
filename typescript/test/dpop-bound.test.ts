@@ -14,6 +14,26 @@ import { ClientAttestation, DpopProofBuilder, SigningKeyPair, StaticSvidSource }
 
 const servers: Server[] = [];
 
+describe("credential redirects", () => {
+  it.each([false, true])("does not follow resource redirects, DPoP=%s", async (dpop) => {
+    let targetHits = 0;
+    const target = await listen((_req, res) => { targetHits++; res.end("leaked"); });
+    const front = await listen((req, res) => {
+      expect(req.headers.authorization).toBe(`${dpop ? "DPoP" : "Bearer"} secret`);
+      res.writeHead(307, { Location: target });
+      res.end();
+    });
+    const ca = new ClientAttestation("https://attester.example");
+    vi.spyOn(ca, "requestHeaders").mockResolvedValue(dpop ? { Authorization: "DPoP secret", DPoP: "proof" } : { Authorization: "Bearer secret" });
+    for (const input of [front, new Request(front, { redirect: "follow" })]) {
+      const response = await ca.fetch(input, { redirect: "follow" });
+      expect(response.status).toBe(307);
+      await response.body?.cancel();
+    }
+    expect(targetHits).toBe(0);
+  });
+});
+
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise<void>((r) => s.close(() => r()))));
 });
