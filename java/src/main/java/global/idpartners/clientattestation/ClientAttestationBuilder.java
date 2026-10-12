@@ -58,9 +58,17 @@ public final class ClientAttestationBuilder {
         return this;
     }
 
-    /** Binds the client instance key as {@code cnf.jwk}. Must be a public JWK. */
+    /**
+     * Binds the client instance key as {@code cnf.jwk}: an EC ({@code crv} P-256, P-384 or P-521, {@code x},
+     * {@code y}) or RSA ({@code n}, {@code e}) public key. Only those members and an optional {@code kid} are
+     * copied into the attestation.
+     *
+     * @throws IllegalArgumentException if the JWK carries private or secret members ({@code d}, {@code p},
+     *                                  {@code q}, {@code dp}, {@code dq}, {@code qi}, {@code oth}, {@code k}),
+     *                                  is another {@code kty} or curve, or lacks a member
+     */
     public ClientAttestationBuilder confirmationJwk(Map<String, Object> publicInstanceJwk) {
-        this.confirmationJwk = publicInstanceJwk;
+        this.confirmationJwk = publicConfirmationJwk(publicInstanceJwk);
         return this;
     }
 
@@ -158,13 +166,65 @@ public final class ClientAttestationBuilder {
     }
 
     private Instant resolveExpiry(Instant iat) {
+        Instant exp;
         if (this.expiresAt != null) {
-            return this.expiresAt;
+            exp = this.expiresAt;
+        } else if (this.ttl != null) {
+            exp = iat.plus(this.ttl);
+        } else {
+            throw new IllegalStateException("expiry is required: call expiresAt(...) or expiresIn(...)");
         }
-        if (this.ttl != null) {
-            return iat.plus(this.ttl);
+        // Compared as the claims carry them: whole epoch seconds.
+        if (exp.getEpochSecond() <= iat.getEpochSecond()) {
+            throw new IllegalArgumentException("attestation exp (" + exp.getEpochSecond()
+                    + ") must be after iat (" + iat.getEpochSecond() + ")");
         }
-        throw new IllegalStateException("expiry is required: call expiresAt(...) or expiresIn(...)");
+        return exp;
+    }
+
+    /** JWK members that carry private or secret key material (RFC 7518 section 6). */
+    private static final List<String> PRIVATE_JWK_MEMBERS = List.of("d", "p", "q", "dp", "dq", "qi", "oth", "k");
+
+    /**
+     * The public key to bind as {@code cnf.jwk}: {@code kty}, the key type's public members and an optional
+     * {@code kid}, in the order the input has them. Refuses private or secret members, another {@code kty}
+     * or curve, or a missing member, so a private key is never signed into an attestation.
+     */
+    static Map<String, Object> publicConfirmationJwk(Map<String, Object> jwk) {
+        if (jwk == null) {
+            throw new IllegalArgumentException("cnf.jwk must be a JWK object");
+        }
+        for (String member : PRIVATE_JWK_MEMBERS) {
+            if (jwk.containsKey(member)) {
+                throw new IllegalArgumentException(
+                        "cnf.jwk must be a public key: it carries the private member '" + member + "'");
+            }
+        }
+        Object kty = jwk.get("kty");
+        List<String> required = "EC".equals(kty) ? List.of("crv", "x", "y")
+                : "RSA".equals(kty) ? List.of("n", "e") : null;
+        if (required == null) {
+            throw new IllegalArgumentException("cnf.jwk must be an EC or RSA public key, not kty " + kty);
+        }
+        for (String member : required) {
+            if (!(jwk.get(member) instanceof String value) || value.isEmpty()) {
+                throw new IllegalArgumentException("cnf.jwk (kty " + kty + ") is missing '" + member + "'");
+            }
+        }
+        if ("EC".equals(kty) && !List.of("P-256", "P-384", "P-521").contains(jwk.get("crv"))) {
+            throw new IllegalArgumentException(
+                    "cnf.jwk curve must be P-256, P-384 or P-521, not " + jwk.get("crv"));
+        }
+        if (jwk.containsKey("kid") && (!(jwk.get("kid") instanceof String kid) || kid.isEmpty())) {
+            throw new IllegalArgumentException("cnf.jwk kid must be a non-empty string");
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        jwk.forEach((member, value) -> {
+            if (member.equals("kty") || member.equals("kid") || required.contains(member)) {
+                out.put(member, value);
+            }
+        });
+        return out;
     }
 
     private static String requireText(String value, String field) {

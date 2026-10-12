@@ -5,8 +5,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.function.Function;
 import org.jose4j.json.JsonUtil;
 
 /**
@@ -22,7 +21,7 @@ import org.jose4j.json.JsonUtil;
 public final class ProtectedResource {
 
     private static final String WELL_KNOWN = "/.well-known/oauth-protected-resource";
-    private static final Pattern BEARER = Pattern.compile("^\\s*Bearer\\s+(.+?)\\s*$", Pattern.CASE_INSENSITIVE);
+    private static final String BEARER = "bearer";
 
     private final String resource;
     private final List<String> authorizationServers;
@@ -73,8 +72,49 @@ public final class ProtectedResource {
         if (authorizationHeader == null) {
             return null;
         }
-        Matcher m = BEARER.matcher(authorizationHeader);
-        return m.matches() ? m.group(1) : null;
+        // One linear pass, no regex: a backtracking pattern here costs cubic time on a hostile header. The
+        // result is what Go's RE2 (?i)^\s*Bearer\s+(.+?)\s*$ returns, so every port extracts the same token.
+        String h = authorizationHeader;
+        int n = h.length();
+        int i = 0;
+        while (i < n && isSpace(h.charAt(i))) {
+            i++;
+        }
+        if (n - i <= BEARER.length()) {
+            return null;
+        }
+        for (int k = 0; k < BEARER.length(); k++, i++) {
+            if ((h.charAt(i) | 0x20) != BEARER.charAt(k)) {
+                return null;
+            }
+        }
+        if (!isSpace(h.charAt(i))) {
+            return null;
+        }
+        int end = n;
+        while (end > i && isSpace(h.charAt(end - 1))) {
+            end--;
+        }
+        if (end == i) {
+            // Only whitespace after the scheme: RE2 takes the last non-LF whitespace character after the first.
+            for (int j = n - 1; j > i; j--) {
+                if (h.charAt(j) != '\n') {
+                    return h.substring(j, j + 1);
+                }
+            }
+            return null;
+        }
+        int start = i + 1;
+        while (isSpace(h.charAt(start))) {
+            start++;
+        }
+        String token = h.substring(start, end);
+        return token.indexOf('\n') < 0 ? token : null;
+    }
+
+    /** RE2's {@code \s}: space, tab, LF, FF and CR. */
+    private static boolean isSpace(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r';
     }
 
     public String resource() {
@@ -189,11 +229,34 @@ public final class ProtectedResource {
      * @return the decision
      */
     public AuthDecision authenticate(String authorizationHeader, List<String> requiredScopes) {
+        return guard(authorizationHeader, token -> this.validator.validate(token, requiredScopes));
+    }
+
+    /**
+     * {@link #authenticate(String, List)} for tokens checked by RFC 7662 introspection
+     * ({@link AccessTokenValidator#validateActive(String, List)}), such as opaque tokens, with the same rules: the
+     * response's {@code aud} must name this resource, so a response without one is refused (401), and a
+     * sender-constrained token ({@code cnf}) is refused (401). A failed introspection call is not a verdict: it
+     * throws, as {@code validateActive} does, and the caller answers it (503, say).
+     *
+     * @param authorizationHeader the {@code Authorization} header value, or null
+     * @param requiredScopes      scopes this request needs, overriding the configured ones; null uses the
+     *                            validator's config
+     * @return the decision
+     * @throws IllegalStateException when no introspection endpoint is configured
+     * @throws global.idpartners.clientattestation.TransportException when the introspection call fails (the
+     *                                default transport)
+     */
+    public AuthDecision authenticateActive(String authorizationHeader, List<String> requiredScopes) {
+        return guard(authorizationHeader, token -> this.validator.validateActive(token, requiredScopes));
+    }
+
+    private AuthDecision guard(String authorizationHeader, Function<String, ValidationResult> validate) {
         String token = bearerToken(authorizationHeader);
         if (token == null) {
             return new AuthDecision(false, null, 401, challenge(null, null), null, "authentication required");
         }
-        ValidationResult result = this.validator.validate(token, requiredScopes);
+        ValidationResult result = validate.apply(token);
         if (result.valid() && !result.audience().contains(this.resource)) {
             result = ValidationResult.failure(ErrorCodes.INVALID_AUDIENCE, "token audience is not this resource");
         }

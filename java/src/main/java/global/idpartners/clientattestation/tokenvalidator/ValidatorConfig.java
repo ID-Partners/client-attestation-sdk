@@ -1,5 +1,6 @@
 package global.idpartners.clientattestation.tokenvalidator;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -7,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import org.jose4j.json.JsonUtil;
 import org.jose4j.lang.JoseException;
 
@@ -16,7 +18,10 @@ import org.jose4j.lang.JoseException;
  * token types and optional introspection.
  *
  * <p>The issuer and at least one audience are required: {@link Builder#build()} refuses a config without
- * them, because a validator that skips either accepts tokens minted for someone else.
+ * them, because a validator that skips either accepts tokens minted for someone else. It also refuses a
+ * {@code jwks_uri} or introspection endpoint that is not https, unless its host is loopback ({@code localhost},
+ * {@code 127.0.0.1}, {@code ::1}) or {@link Builder#allowInsecure(boolean)} is set: over plain http anyone on
+ * the path could serve their own keys, or read the resource server's client secret.
  */
 public final class ValidatorConfig {
 
@@ -30,6 +35,8 @@ public final class ValidatorConfig {
     /** Clock skew allowed on {@code exp}, {@code nbf} and {@code iat} by default, in seconds. */
     public static final int DEFAULT_LEEWAY_SECONDS = 60;
 
+    private static final Set<String> LOOPBACK_HOSTS = Set.of("localhost", "127.0.0.1", "::1", "[::1]");
+
     private final String issuer;
     private final List<String> audiences;
     private final Map<String, Object> jwks;
@@ -39,6 +46,7 @@ public final class ValidatorConfig {
     private final int leewaySeconds;
     private final List<String> acceptedTokenTypes;
     private final IntrospectionConfig introspection;
+    private final boolean allowInsecure;
 
     private ValidatorConfig(Builder b) {
         if (b.issuer == null || b.issuer.isEmpty()) {
@@ -46,6 +54,15 @@ public final class ValidatorConfig {
         }
         if (b.audiences.isEmpty()) {
             throw new IllegalArgumentException("at least one audience is required");
+        }
+        if (b.leewaySeconds < 0) {
+            throw new IllegalArgumentException("leewaySeconds must not be negative");
+        }
+        if (b.jwksUri != null && !b.jwksUri.isEmpty()) {
+            requireSecure(b.jwksUri, "jwks_uri", b.allowInsecure);
+        }
+        if (b.introspection != null) {
+            requireSecure(b.introspection.endpoint(), "introspection endpoint", b.allowInsecure);
         }
         this.issuer = b.issuer;
         this.audiences = List.copyOf(b.audiences);
@@ -64,6 +81,7 @@ public final class ValidatorConfig {
             this.acceptedTokenTypes = List.copyOf(types);
         }
         this.introspection = b.introspection;
+        this.allowInsecure = b.allowInsecure;
     }
 
     /**
@@ -122,6 +140,38 @@ public final class ValidatorConfig {
     }
 
     /**
+     * Whether a plain-http {@code jwks_uri} and introspection endpoint are allowed on non-loopback hosts.
+     *
+     * @return true when {@link Builder#allowInsecure(boolean)} was set
+     */
+    public boolean allowInsecure() {
+        return this.allowInsecure;
+    }
+
+    /**
+     * Throws unless {@code url} is https, its host is loopback ({@code localhost}, {@code 127.0.0.1},
+     * {@code ::1}), or {@code allowInsecure} is set: the rule the client applies to its own endpoints.
+     */
+    static void requireSecure(String url, String what, boolean allowInsecure) {
+        if (allowInsecure) {
+            return;
+        }
+        URI uri;
+        try {
+            uri = URI.create(url);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(what + " is not a valid URL: " + url, e);
+        }
+        String host = uri.getHost();
+        if ("https".equalsIgnoreCase(uri.getScheme())
+                || host != null && LOOPBACK_HOSTS.contains(host.toLowerCase(Locale.ROOT))) {
+            return;
+        }
+        throw new IllegalArgumentException(what + " must use https, got " + url
+                + " (only loopback hosts are exempt; set allowInsecure(true) to override)");
+    }
+
+    /**
      * Compare JOSE {@code typ} values the way RFC 7515 section 4.1.9 says to: case-insensitively, with an
      * optional {@code application/} prefix.
      */
@@ -141,6 +191,7 @@ public final class ValidatorConfig {
         private int leewaySeconds = DEFAULT_LEEWAY_SECONDS;
         private List<String> acceptedTokenTypes = DEFAULT_TOKEN_TYPES;
         private IntrospectionConfig introspection;
+        private boolean allowInsecure;
 
         private Builder() {
         }
@@ -271,7 +322,7 @@ public final class ValidatorConfig {
 
         /**
          * Clock skew allowed on {@code exp}, {@code nbf} and {@code iat}, in seconds. Default:
-         * {@link #DEFAULT_LEEWAY_SECONDS}; 0 allows none.
+         * {@link #DEFAULT_LEEWAY_SECONDS}; 0 allows none. {@link #build()} refuses a negative leeway.
          *
          * @param leewaySeconds the leeway
          * @return this builder
@@ -327,10 +378,24 @@ public final class ValidatorConfig {
         }
 
         /**
+         * Allow a plain-http {@code jwks_uri} and introspection endpoint on non-loopback hosts. Default: false,
+         * and {@link #build()} refuses them.
+         *
+         * @param allowInsecure whether to allow plain http
+         * @return this builder
+         */
+        public Builder allowInsecure(boolean allowInsecure) {
+            this.allowInsecure = allowInsecure;
+            return this;
+        }
+
+        /**
          * The config.
          *
          * @return the config
-         * @throws IllegalArgumentException without an issuer or an audience
+         * @throws IllegalArgumentException without an issuer or an audience, with a negative leeway, or with a
+         *                                  plain-http {@code jwks_uri} or introspection endpoint on a non-loopback
+         *                                  host without {@link #allowInsecure(boolean)}
          */
         public ValidatorConfig build() {
             return new ValidatorConfig(this);

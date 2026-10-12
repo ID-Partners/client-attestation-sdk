@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from client_attestation_sdk import OpenBaoTransitSigner
+from client_attestation_sdk.errors import TransportError
 
 KEY_NAME = "attestation-es256"
 TOKEN = "unit-test-token"
@@ -108,5 +109,28 @@ def test_sign_response_without_signature_fails():
         signer = OpenBaoTransitSigner(bao.url, TOKEN, KEY_NAME)
         with pytest.raises(RuntimeError, match="no signature"):
             signer.sign(b"header.payload")
+    finally:
+        bao.close()
+
+
+def test_public_key_on_another_curve_than_the_key_type_fails():
+    p384 = ec.generate_private_key(ec.SECP384R1())
+    bao = StubBao((200, _key_metadata(_pem(p384))))  # claims ecdsa-p256 but serves a P-384 key
+    try:
+        with pytest.raises(ValueError, match="P-384"):
+            OpenBaoTransitSigner(bao.url, TOKEN, KEY_NAME)
+    finally:
+        bao.close()
+
+
+@pytest.mark.parametrize("raw", ["AAAA!AAAA", "AAAA AAAA", "AAAA+AAA", "AAAA==", "abcde", "A"])
+def test_signature_that_is_not_strict_base64url_fails(raw):
+    p256 = ec.generate_private_key(ec.SECP256R1())
+    bao = StubBao((200, _key_metadata(_pem(p256))),
+                  (200, json.dumps({"data": {"signature": "vault:v1:" + raw}})))
+    try:
+        signer = OpenBaoTransitSigner(bao.url, TOKEN, KEY_NAME)
+        with pytest.raises(TransportError, match="malformed signature"):
+            signer.sign(b"h.p")
     finally:
         bao.close()

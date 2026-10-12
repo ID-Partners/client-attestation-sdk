@@ -64,7 +64,7 @@ class JwtSvid:
     validity. ``attributes`` is the bridge payload — the workload attributes to disclose."""
 
     spiffe_id: str
-    token: str
+    token: str = field(repr=False)
     attributes: dict
     audience: str
     issued_at: int

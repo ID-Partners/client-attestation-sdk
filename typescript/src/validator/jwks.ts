@@ -39,6 +39,27 @@ const defaultGet: HttpGet = async (url) => {
   return resp.body;
 };
 
+/** The JWK members only a private or symmetric key carries (RFC 7518 section 6). */
+const PRIVATE_MEMBERS = ["d", "p", "q", "dp", "dq", "qi", "k"];
+
+/**
+ * Whether a JWK may verify a signature: not when its `use` is present and not `sig`, its `key_ops` is present
+ * and lacks `verify`, or it carries private members. Checked on the JWK as published, before jose's
+ * `importJWK` (which drops `use`) sees it.
+ */
+function verifiesSignatures(jwk: unknown): jwk is JWK {
+  if (typeof jwk !== "object" || jwk === null || Array.isArray(jwk)) {
+    return false; // not a JWK at all: skipped like any key that can't be read
+  }
+  if ("use" in jwk && jwk.use !== "sig") {
+    return false;
+  }
+  if ("key_ops" in jwk && !(Array.isArray(jwk.key_ops) && (jwk.key_ops as unknown[]).includes("verify"))) {
+    return false;
+  }
+  return !PRIVATE_MEMBERS.some((member) => member in jwk);
+}
+
 /** Best-effort JWS `alg` for a JWK that omits `alg`, from its key type / curve. */
 function algorithmFor(jwk: JWK): string {
   if (jwk.kty === "EC") {
@@ -53,7 +74,12 @@ function algorithmFor(jwk: JWK): string {
   return "RS256";
 }
 
-type Entry = { key: VerificationKey; alg?: string };
+/**
+ * One usable JWK: its `kid`, its declared `alg` (a JWK that declares one is only used for that alg) and its
+ * imports so far, one per algorithm (`null`: that algorithm can't use the key). A JWK without `alg` is
+ * imported for whichever algorithm a token names, so an RSA key verifies any RS* or PS* algorithm.
+ */
+type Entry = { kid?: string; jwk: JWK; alg?: string; imported: Map<string, VerificationKey | null> };
 
 /** @internal */
 export interface JwksProviderOptions {
@@ -64,7 +90,10 @@ export interface JwksProviderOptions {
   minRefreshSeconds?: number;
   /** Refresh a fetched set once it is this old. Defaults to {@link DEFAULT_MAX_AGE_SECONDS}. */
   maxAgeSeconds?: number;
-  /** Milliseconds clock, injectable for tests. Defaults to `Date.now`. */
+  /**
+   * Monotonic milliseconds clock the set ages and the refetch cooldown runs on, injectable for tests.
+   * Defaults to `performance.now`: a wall-clock step must not throttle every refetch or keep an old set.
+   */
   clock?: () => number;
   /** Where to send `jwks.*` log events. Unset, nothing is logged. */
   logger?: Logger;
@@ -79,8 +108,8 @@ export class JwksProvider {
   readonly #maxAgeMs: number;
   readonly #clock: () => number;
   readonly #logger: Logger;
-  /** kid -> key, plus the JWK's declared `alg` (a JWK that declares one is only used for that alg). */
-  #keys = new Map<string | undefined, Entry>();
+  /** The usable keys, in document order: kid-less JWKs are distinct keys, and the first of a duplicate kid wins. */
+  #keys: Entry[] = [];
   #loaded: Promise<void> | null = null;
   #inFlight: Promise<void> | null = null;
   #loadedAt: number | null = null;
@@ -94,7 +123,7 @@ export class JwksProvider {
     this.#httpGet = opts.httpGet ?? defaultGet;
     this.#minRefreshMs = (opts.minRefreshSeconds ?? DEFAULT_MIN_REFRESH_SECONDS) * 1000;
     this.#maxAgeMs = (opts.maxAgeSeconds ?? DEFAULT_MAX_AGE_SECONDS) * 1000;
-    this.#clock = opts.clock ?? Date.now;
+    this.#clock = opts.clock ?? (() => performance.now());
     this.#logger = opts.logger ?? NOOP_LOGGER;
     if (opts.jwks != null) {
       this.#loaded = JwksProvider.#parse(opts.jwks).then((keys) => {
@@ -103,12 +132,21 @@ export class JwksProvider {
     }
   }
 
-  static async #parse(jwks: JSONWebKeySet): Promise<Map<string | undefined, Entry>> {
-    const keys = new Map<string | undefined, Entry>();
-    for (const jwk of jwks.keys ?? []) {
-      const alg = jwk.alg ?? algorithmFor(jwk);
+  static async #parse(jwks: JSONWebKeySet): Promise<Entry[]> {
+    const keys: Entry[] = [];
+    for (const published of (jwks.keys ?? []) as unknown[]) {
+      if (!verifiesSignatures(published)) {
+        continue;
+      }
+      // Imported without its key_ops: verifiesSignatures has checked them, and jose would hand them to
+      // WebCrypto as the key's usages, which refuses a public key with any usage but "verify" (a JWK exported
+      // from a key pair says ["sign","verify"]). Every later import of this entry (resolve) uses this copy.
+      const { key_ops: _keyOps, ...jwk } = published;
+      // a JWK jose can't read at all is skipped; its key type and curve say how to read it
+      const inferred = algorithmFor(jwk);
       try {
-        keys.set(jwk.kid, { key: await importJWK(jwk, alg), alg: jwk.alg });
+        const key = await importJWK(jwk, inferred);
+        keys.push({ kid: jwk.kid, jwk, alg: jwk.alg, imported: new Map([[inferred, key]]) });
       } catch {
         continue;
       }
@@ -118,37 +156,54 @@ export class JwksProvider {
 
   /**
    * Resolve the verification key for a header `kid` (and `alg`). Falls back to the single configured key
-   * when the header carries no `kid`. Returns `undefined` when no key can be found; never rejects — a
-   * failed fetch leaves its reason in {@link lastError}.
+   * when the header carries no `kid`. Returns `undefined` when no key can be found, and `null` when the key
+   * found can't be used with `alg` (an EC key of another curve, an RSA key for an EC algorithm); never
+   * rejects — a failed fetch leaves its reason in {@link lastError}.
    */
-  async resolve(kid: string | undefined, alg?: string): Promise<VerificationKey | undefined> {
+  async resolve(kid: string | undefined, alg?: string): Promise<VerificationKey | null | undefined> {
     if (this.#loaded) {
       await this.#loaded;
     }
-    if (!this.#static && this.#jwksUri && (this.#lookup(kid) === undefined || this.#stale())) {
-      await this.#refresh();
+    if (!this.#static && this.#jwksUri) {
+      const held = this.#lookup(kid, alg) !== undefined;
+      if (!held || this.#stale()) {
+        await this.#refresh(held);
+      }
     }
-    const entry = this.#lookup(kid);
-    if (entry === undefined || (alg != null && entry.alg != null && entry.alg !== alg)) {
+    const entry = this.#lookup(kid, alg);
+    if (entry === undefined) {
       return undefined;
     }
-    return entry.key;
+    const as = alg ?? entry.alg ?? algorithmFor(entry.jwk);
+    if (!entry.imported.has(as)) {
+      entry.imported.set(as, await importJWK(entry.jwk, as).catch(() => null));
+    }
+    return entry.imported.get(as) ?? null;
   }
 
-  #lookup(kid: string | undefined): Entry | undefined {
+  /**
+   * For a `kid`, the first key with that `kid` that may be used for `alg`; without one, the sole key when the
+   * set holds exactly one. An empty `kid` names no key.
+   */
+  #lookup(kid: string | undefined, alg: string | undefined): Entry | undefined {
+    const allowed = (entry: Entry) => alg == null || entry.alg == null || entry.alg === alg;
     if (kid != null) {
-      return this.#keys.get(kid);
+      return kid === "" ? undefined : this.#keys.find((entry) => entry.kid === kid && allowed(entry));
     }
-    return this.#keys.size === 1 ? this.#keys.values().next().value : undefined;
+    return this.#keys.length === 1 && allowed(this.#keys[0]) ? this.#keys[0] : undefined;
   }
 
   #stale(): boolean {
     return this.#loadedAt === null || this.#clock() - this.#loadedAt >= this.#maxAgeMs;
   }
 
-  #refresh(): Promise<void> {
+  /**
+   * A caller that already holds a usable (if stale) key never waits for another request's fetch: it goes on
+   * with the key it has. One without a key waits for a fetch in flight, which may bring its key.
+   */
+  #refresh(haveKey: boolean): Promise<void> {
     if (this.#inFlight) {
-      return this.#inFlight;
+      return haveKey ? Promise.resolve() : this.#inFlight;
     }
     const now = this.#clock();
     if (this.#lastAttempt !== null && now - this.#lastAttempt < this.#minRefreshMs) {
@@ -165,7 +220,7 @@ export class JwksProvider {
         this.#keys = await JwksProvider.#parse(JSON.parse(body) as JSONWebKeySet);
         this.#loadedAt = this.#clock();
         this.lastError = null;
-        emit(this.#logger, "debug", "jwks.fetched", { host: hostOf(this.#jwksUri as string), keys: this.#keys.size });
+        emit(this.#logger, "debug", "jwks.fetched", { host: hostOf(this.#jwksUri as string), keys: this.#keys.length });
       } catch (exc) {
         emit(this.#logger, "warn", "jwks.fetch_failed", {
           host: hostOf(this.#jwksUri as string),

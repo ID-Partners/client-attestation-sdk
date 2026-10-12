@@ -5,7 +5,9 @@ from typing import Optional
 
 
 class ClientAttestationError(RuntimeError):
-    """A step in the flow failed. `status` and `body` are set for HTTP failures."""
+    """A step in the flow failed. `status` and `body` are set for HTTP failures. `body` is at most the first
+    512 bytes of a non-2xx response, and None for a 2xx response that could not be used: that body may
+    hold a token, attestation or SVID."""
 
     def __init__(self, message: str, *, status: Optional[int] = None, body: Optional[str] = None):
         super().__init__(message)

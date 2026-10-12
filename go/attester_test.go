@@ -133,7 +133,7 @@ func keysOf(m map[string]any) []string {
 
 func TestDefaultProfileIsPingFederate(t *testing.T) {
 	a := newProfileAttester(t)
-	ca, err := NewClientAttestation(a.srv.URL, WithEvidence(StaticSvidSource{SVID: "svid"}))
+	ca, err := NewClientAttestation(a.srv.URL, WithEvidenceAudience(a.srv.URL), WithEvidence(StaticSvidSource{SVID: "svid"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestDefaultProfileIsPingFederate(t *testing.T) {
 
 func TestCustomProfileGetsATokenEndToEnd(t *testing.T) {
 	a := newProfileAttester(t)
-	ca, err := NewClientAttestation(a.srv.URL, WithEvidence(StaticSvidSource{SVID: "svid"}), WithAttesterProfile(acmeProfile{}))
+	ca, err := NewClientAttestation(a.srv.URL, WithEvidenceAudience("acme-aud"), WithEvidence(StaticSvidSource{SVID: "svid"}), WithAttesterProfile(acmeProfile{}))
 	if err != nil {
 		t.Fatal(err)
 	}

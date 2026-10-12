@@ -53,7 +53,9 @@ func (b *ClientAttestationBuilder) ClientID(clientID string) *ClientAttestationB
 	return b
 }
 
-// ConfirmationJWK binds a public instance JWK as cnf.jwk.
+// ConfirmationJWK binds a public instance JWK as cnf.jwk. It must be an EC (crv P-256, P-384 or P-521,
+// x, y) or RSA (n, e) public key; Build refuses one carrying private or secret members (d, p, q, dp, dq,
+// qi, oth, k) or another kty. Only those members and an optional "kid" are copied into the attestation.
 func (b *ClientAttestationBuilder) ConfirmationJWK(publicInstanceJWK map[string]any) *ClientAttestationBuilder {
 	b.cnfJWK = publicInstanceJWK
 	return b
@@ -127,6 +129,10 @@ func (b *ClientAttestationBuilder) Build() (string, error) {
 	if b.cnfJWK == nil {
 		return "", fmt.Errorf("confirmation key (cnf.jwk) is required")
 	}
+	cnfJWK, err := confirmationJWK(b.cnfJWK)
+	if err != nil {
+		return "", err
+	}
 	iat := b.resolveIssuedAt()
 	exp, err := b.resolveExpiry(iat)
 	if err != nil {
@@ -137,7 +143,7 @@ func (b *ClientAttestationBuilder) Build() (string, error) {
 		"sub": sub,
 		"iat": iat,
 		"exp": exp,
-		"cnf": map[string]any{"jwk": b.cnfJWK},
+		"cnf": map[string]any{"jwk": cnfJWK},
 	}
 	if len(b.authorizationDetails) > 0 {
 		claims["authorization_details"] = b.authorizationDetails
@@ -170,13 +176,60 @@ func (b *ClientAttestationBuilder) resolveIssuedAt() int64 {
 }
 
 func (b *ClientAttestationBuilder) resolveExpiry(iat int64) (int64, error) {
-	if b.expiresAt != nil {
-		return *b.expiresAt, nil
+	var exp int64
+	switch {
+	case b.expiresAt != nil:
+		exp = *b.expiresAt
+	case b.ttl != nil:
+		exp = iat + *b.ttl
+	default:
+		return 0, fmt.Errorf("expiry is required: call ExpiresAt(...) or ExpiresIn(...)")
 	}
-	if b.ttl != nil {
-		return iat + *b.ttl, nil
+	if exp <= iat {
+		return 0, fmt.Errorf("attestation exp (%d) must be after iat (%d)", exp, iat)
 	}
-	return 0, fmt.Errorf("expiry is required: call ExpiresAt(...) or ExpiresIn(...)")
+	return exp, nil
+}
+
+// privateJWKMembers are the JWK members that carry private or secret key material (RFC 7518 section 6).
+var privateJWKMembers = []string{"d", "p", "q", "dp", "dq", "qi", "oth", "k"}
+
+// confirmationJWKMembers are the public members a cnf.jwk of each key type must carry.
+var confirmationJWKMembers = map[string][]string{"EC": {"crv", "x", "y"}, "RSA": {"n", "e"}}
+
+// confirmationJWK returns the public key to bind as cnf.jwk: kty, the key type's public members and an
+// optional kid, copied from in. It refuses a JWK with private or secret members, an unsupported kty or
+// curve, or a missing member, so a private key is never signed into an attestation.
+func confirmationJWK(in map[string]any) (map[string]any, error) {
+	for _, m := range privateJWKMembers {
+		if _, ok := in[m]; ok {
+			return nil, fmt.Errorf("cnf.jwk must be a public key: it carries the private member %q", m)
+		}
+	}
+	kty, _ := in["kty"].(string)
+	required, ok := confirmationJWKMembers[kty]
+	if !ok {
+		return nil, fmt.Errorf("cnf.jwk must be an EC or RSA public key, not kty %q", kty)
+	}
+	out := map[string]any{"kty": kty}
+	for _, m := range required {
+		v, _ := in[m].(string)
+		if v == "" {
+			return nil, fmt.Errorf("cnf.jwk (kty %s) is missing %q", kty, m)
+		}
+		out[m] = v
+	}
+	if crv, _ := out["crv"].(string); kty == "EC" && crv != "P-256" && crv != "P-384" && crv != "P-521" {
+		return nil, fmt.Errorf("cnf.jwk curve must be P-256, P-384 or P-521, not %q", crv)
+	}
+	if kid, present := in["kid"]; present {
+		s, _ := kid.(string)
+		if s == "" {
+			return nil, fmt.Errorf("cnf.jwk kid must be a non-empty string")
+		}
+		out["kid"] = s
+	}
+	return out, nil
 }
 
 // PopBuilder builds a Client Attestation PoP JWT proving possession of the
@@ -280,8 +333,11 @@ func (b *DpopProofBuilder) Method(htm string) *DpopProofBuilder {
 	return b
 }
 
-// URI sets the target URL ("htu") — required. At Build it is normalised per RFC 9449 §4.2: the query
-// and fragment are dropped and the scheme and host lower-cased.
+// URI sets the target URL ("htu") — required. At Build it is normalised per RFC 9449 §4.2 by the rule
+// in vectors/README.md: the userinfo, query, fragment and a default port are dropped and the scheme and
+// host lower-cased. Build refuses a URL that is not an absolute http(s) URL with a valid ASCII host,
+// port and path, or that has a backslash, ASCII whitespace or a control character before its query or
+// fragment.
 func (b *DpopProofBuilder) URI(htu string) *DpopProofBuilder {
 	b.htu = htu
 	return b
@@ -317,6 +373,10 @@ func (b *DpopProofBuilder) Build() (string, error) {
 	if _, err := requireText(b.htu, "uri (htu)"); err != nil {
 		return "", err
 	}
+	htu, err := normalizeHTU(b.htu)
+	if err != nil {
+		return "", err
+	}
 	iat := time.Now().Unix()
 	if b.issuedAt != nil {
 		iat = *b.issuedAt
@@ -327,7 +387,7 @@ func (b *DpopProofBuilder) Build() (string, error) {
 	}
 	claims := map[string]any{
 		"htm": strings.ToUpper(b.htm),
-		"htu": normalizeHTU(b.htu),
+		"htu": htu,
 		"jti": jti,
 		"iat": iat,
 	}

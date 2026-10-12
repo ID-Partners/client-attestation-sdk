@@ -5,6 +5,7 @@
 package global.idpartners.clientattestation;
 
 import global.idpartners.clientattestation.internal.HttpTransport;
+import global.idpartners.clientattestation.internal.StrictJson;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -12,14 +13,16 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Produces a workload's compact JWT-SVID for an audience. The default {@link SpireWorkloadApi} source
@@ -89,8 +92,12 @@ public interface SvidSource {
      * auto-rotated service-account token into the pod as a projected {@code serviceAccountToken} volume;
      * reading it fresh each call picks up the rotation. The file's audience must already be the attester's
      * evidence audience — set it when the volume is declared, so the {@code audience} argument is ignored.
+     * The path must be a regular file of at most 64 KiB; anything else is an
+     * {@link Evidence.EvidenceNotFoundException}.
      */
     final class File implements SvidSource {
+        static final int MAX_BYTES = 64 * 1024;
+
         private final Path path;
 
         public File(String path) {
@@ -99,7 +106,19 @@ public interface SvidSource {
 
         @Override
         public String fetch(String audience) throws Exception {
-            return Files.readString(this.path, StandardCharsets.UTF_8).strip();
+            // Checked before opening: opening a FIFO blocks, and a device such as /dev/zero never ends.
+            if (!Files.readAttributes(this.path, BasicFileAttributes.class).isRegularFile()) {
+                throw new Evidence.EvidenceNotFoundException("token file " + this.path + " is not a regular file");
+            }
+            byte[] data;
+            try (InputStream in = Files.newInputStream(this.path)) {
+                data = in.readNBytes(MAX_BYTES + 1);
+            }
+            if (data.length > MAX_BYTES) {
+                throw new Evidence.EvidenceNotFoundException(
+                        "token file " + this.path + " is larger than " + MAX_BYTES + " bytes");
+            }
+            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(data)).toString().strip();
         }
     }
 
@@ -107,7 +126,8 @@ public interface SvidSource {
      * Fetches a Google-signed ID token for the runtime service account from the GCP metadata server.
      * Works on any Google runtime that exposes the metadata server (GCE, GKE, Cloud Run, Vertex AI Agent
      * Engine). The token's {@code aud} is the audience passed here; {@code sub} is the service account.
-     * No google-auth dependency — a plain metadata call.
+     * No google-auth dependency — a plain metadata call, never through a proxy. The answer must be HTTP 200
+     * carrying the {@code Metadata-Flavor: Google} response header, as the real metadata server sends.
      */
     final class GoogleMetadata implements SvidSource {
         static final String IDENTITY_URL =
@@ -124,7 +144,7 @@ public interface SvidSource {
         GoogleMetadata(Duration timeout, String identityUrl) {
             this.timeout = timeout;
             this.identityUrl = identityUrl;
-            this.http = HttpTransport.client(timeout);
+            this.http = Evidence.metadataClient(timeout);
         }
 
         @Override
@@ -141,6 +161,9 @@ public interface SvidSource {
             if (r.status() != 200) {
                 throw new IllegalStateException("GCP metadata identity -> " + r.status());
             }
+            if (!Evidence.fromGoogleMetadata(r)) {
+                throw new IllegalStateException("GCP metadata identity answered without Metadata-Flavor: Google");
+            }
             return r.body().strip();
         }
     }
@@ -151,14 +174,30 @@ public interface SvidSource {
      * if you prefer no subprocess.
      *
      * <p>The subprocess is bounded: if {@code spire-agent} has not exited within the timeout (default 30s)
-     * it is killed and {@link IllegalStateException} is thrown. Its output (stderr merged into stdout) is
-     * drained on a separate thread, capped at 1 MiB, so a chatty or hung agent cannot block the wait.
+     * it is killed and {@link IllegalStateException} is thrown. Its stdout is drained on a separate thread so
+     * a chatty or hung agent cannot block the wait, and at most 1 MiB of it is read: an agent that prints more
+     * is killed and {@link IllegalStateException} is thrown. Its stderr is discarded, never read as output or
+     * held in memory. {@code fetch} returns the first JWT-SVID on stdout and throws
+     * {@link Evidence.EvidenceNotFoundException} if there is none, or {@link IllegalStateException} if the
+     * agent exits with a non-zero status.
+     *
+     * <p>The agent's exit decides the outcome, as in the other ports: once it has exited, stdout is read for at
+     * most 250 ms more (a helper the agent started can inherit the pipe and hold it open), then the pipe is
+     * closed. On exit status 0, what was read is parsed; on any other status the fetch fails. A helper holding
+     * stdout never turns a success into a failure, and never keeps {@code fetch} waiting longer than that.
       *
       * <p><b>Experimental</b> (see docs/api.md): it shells out to the spire-agent CLI, and its constructor
       * will change when it moves to the Workload API socket.
      */
     final class SpireWorkloadApi implements SvidSource {
         static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
+        /** The most stdout read from {@code spire-agent}; more fails the fetch (as in the other ports). */
+        static final int MAX_OUTPUT_BYTES = 1 << 20;
+        /**
+         * How long stdout is still read after {@code spire-agent} has exited (as in the other ports). A helper the
+         * agent started can inherit the pipe and hold it open; after this the pipe is closed.
+         */
+        static final Duration STDOUT_GRACE = Duration.ofMillis(250);
 
         private final String socketPath;
         private final String spireAgentBin;
@@ -182,61 +221,205 @@ public interface SvidSource {
         public String fetch(String audience) throws Exception {
             Process p = new ProcessBuilder(this.spireAgentBin, "api", "fetch", "jwt",
                     "-audience", audience, "-socketPath", this.socketPath)
-                    .redirectErrorStream(true).start();
+                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
             p.getOutputStream().close();
-            CompletableFuture<String> output = new CompletableFuture<>();
-            Thread drain = new Thread(() -> {
-                try {
-                    output.complete(readCapped(p.getInputStream(), HttpTransport.DEFAULT_MAX_BYTES));
-                } catch (Throwable t) {
-                    output.completeExceptionally(t);
-                }
-            }, "spire-agent-output");
+            StdoutReader stdout = new StdoutReader(p);
+            Thread drain = new Thread(stdout, "spire-agent-output");
             drain.setDaemon(true);
             drain.start();
-            String out;
+            byte[] raw;
             try {
                 if (!p.waitFor(this.timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                     p.destroyForcibly();
+                    stdout.stop();
                     throw new IllegalStateException(
                             "spire-agent did not exit within " + this.timeout.toMillis() + "ms; killed");
                 }
-                // The process has exited; its output pipe closes with it (bounded in case a child holds it).
-                out = output.get(this.timeout.toMillis(), TimeUnit.MILLISECONDS);
+                // The agent has exited. What it wrote is in the pipe; give the reader the grace period to finish,
+                // then take what it has and close the pipe, whether or not a helper still holds it open.
+                drain.join(STDOUT_GRACE.toMillis());
             } catch (InterruptedException e) {
                 p.destroyForcibly();
+                stdout.stop();
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted waiting for spire-agent", e);
-            } catch (TimeoutException e) {
-                throw new IllegalStateException("spire-agent output was not closed after exit", e);
-            } catch (ExecutionException e) {
-                throw new IllegalStateException("could not read spire-agent output: " + e.getCause(), e.getCause());
             }
-            for (String line : out.split("\n")) {
-                line = line.trim();
-                if (line.startsWith("token(")) {                 // "token(spiffe://…): eyJ…"
-                    int i = line.indexOf("):");
-                    if (i >= 0) {
-                        return line.substring(i + 2).trim();
-                    }
-                }
-                if (line.chars().filter(c -> c == '.').count() == 2) {   // a bare compact JWT line
-                    return line;
-                }
+            raw = stdout.stop();
+            if (raw == null) {
+                throw new IllegalStateException(
+                        "spire-agent fetch failed: output is larger than " + MAX_OUTPUT_BYTES + " bytes");
             }
-            throw new IllegalStateException("could not parse SVID from spire-agent output:\n" + out);
+            IOException readError = stdout.error();
+            if (readError != null) {
+                throw new IllegalStateException("could not read spire-agent output: " + readError, readError);
+            }
+            if (p.exitValue() != 0) {
+                throw new IllegalStateException("spire-agent fetch failed: exit status " + p.exitValue());
+            }
+            String out = new String(raw, StandardCharsets.UTF_8);
+            String svid = parseJwtOutput(out);
+            if (svid != null) {
+                return svid;
+            }
+            // The output may hold a token or bundle that failed to parse, so the error gives only its size.
+            long lines = out.isEmpty() ? 0 : out.chars().filter(c -> c == '\n').count() + (out.endsWith("\n") ? 0 : 1);
+            throw new Evidence.EvidenceNotFoundException("could not parse a JWT-SVID from spire-agent output ("
+                    + out.getBytes(StandardCharsets.UTF_8).length + " bytes, " + lines + " lines; not shown)");
         }
 
-        /** Read {@code in} to EOF, keeping at most {@code max} bytes (the rest is drained and dropped). */
-        private static String readCapped(InputStream in, long max) throws IOException {
-            ByteArrayOutputStream kept = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                int room = (int) Math.max(0, Math.min(n, max - kept.size()));
-                kept.write(buf, 0, room);
+        /**
+         * Reads the agent's stdout on its own thread, keeping at most {@link #MAX_OUTPUT_BYTES}: past that it kills
+         * the agent and keeps nothing. {@link #stop} hands back what has been read and closes the pipe.
+         */
+        private static final class StdoutReader implements Runnable {
+            private final Process process;
+            private final InputStream in;
+            private final ByteArrayOutputStream kept = new ByteArrayOutputStream();
+            private boolean over;
+            private boolean stopped;
+            private IOException error;
+
+            StdoutReader(Process process) {
+                this.process = process;
+                this.in = process.getInputStream();
             }
-            return kept.toString(StandardCharsets.UTF_8);
+
+            @Override
+            public void run() {
+                byte[] chunk = new byte[65536];
+                try (InputStream stream = this.in) {
+                    int n;
+                    while ((n = stream.read(chunk)) >= 0) {
+                        if (!keep(chunk, n)) {
+                            return;
+                        }
+                    }
+                } catch (IOException e) {
+                    synchronized (this) {
+                        if (!this.stopped) {   // a read cut short by stop() is not an error
+                            this.error = e;
+                        }
+                    }
+                }
+            }
+
+            /** Adds a chunk; false once reading should stop. */
+            private synchronized boolean keep(byte[] chunk, int n) {
+                if (this.stopped || this.over) {
+                    return false;
+                }
+                if (this.kept.size() + n > MAX_OUTPUT_BYTES) {
+                    this.over = true;
+                    this.kept.reset();
+                    this.process.destroyForcibly();   // too much output: stop the agent rather than read on
+                    return false;
+                }
+                this.kept.write(chunk, 0, n);
+                return true;
+            }
+
+            /**
+             * Stops reading and closes the pipe (a helper may hold it open), returning what was read, or null if
+             * the output went past the cap.
+             */
+            byte[] stop() {
+                byte[] result;
+                synchronized (this) {
+                    this.stopped = true;
+                    result = this.over ? null : this.kept.toByteArray();
+                }
+                try {
+                    this.in.close();
+                } catch (IOException ignored) {
+                    // closing is best effort: what was read is already taken
+                }
+                return result;
+            }
+
+            synchronized IOException error() {
+                return this.error;
+            }
+        }
+
+        private static final Pattern SECTION = Pattern.compile("(token|hint|bundle)\\(.*?\\):(.*)", Pattern.DOTALL);
+        private static final Pattern BASE64URL = Pattern.compile("[A-Za-z0-9_-]+");
+
+        /**
+         * The first JWT-SVID in the output of {@code spire-agent api fetch jwt}, or {@code null}. SPIRE prints
+         * each SVID as {@code token(<spiffe id>):} with the JWT on the next, tab-indented line, then
+         * {@code hint(<spiffe id>):} and {@code bundle(<trust domain>):} sections laid out the same way. The
+         * single-line form {@code token(<spiffe id>): <jwt>} and a bare JWT line are accepted too. Only a
+         * syntactically valid compact JWS is returned; the values of hint and bundle sections are skipped. A
+         * label with no value takes the next line as its value only if that line is not itself a label. Only
+         * ASCII space, tab and CR around a line or value are ignored.
+         */
+        static String parseJwtOutput(String out) {
+            String[] lines = out.split("\n", -1);
+            for (int i = 0; i < lines.length; i++) {
+                String line = trimSpace(lines[i]);
+                Matcher section = SECTION.matcher(line);
+                if (!section.matches()) {
+                    if (isCompactJws(line)) {                          // a bare compact JWT line
+                        return line;
+                    }
+                    continue;
+                }
+                String value = trimSpace(section.group(2));
+                if (value.isEmpty() && i + 1 < lines.length) {          // the value is on the next line,
+                    String following = trimSpace(lines[i + 1]);         // unless that is another label
+                    if (!SECTION.matcher(following).matches()) {
+                        value = following;
+                        i++;
+                    }
+                }
+                if (section.group(1).equals("token") && isCompactJws(value)) {
+                    return value;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * {@code s} without the ASCII spaces, tabs and CRs around it, and nothing else: not a BOM, an NBSP or
+         * other Unicode space, so every port reads the same output the same way.
+         */
+        private static String trimSpace(String s) {
+            int start = 0;
+            int end = s.length();
+            while (start < end && isSpace(s.charAt(start))) {
+                start++;
+            }
+            while (end > start && isSpace(s.charAt(end - 1))) {
+                end--;
+            }
+            return s.substring(start, end);
+        }
+
+        private static boolean isSpace(char c) {
+            return c == ' ' || c == '\t' || c == '\r';
+        }
+
+        /**
+         * Three non-empty base64url segments whose first is the canonical encoding of a strict JSON object (the
+         * token validator's reader) with a non-empty string {@code alg}. It verifies nothing; it tells a JWT from
+         * a version string or log line.
+         */
+        static boolean isCompactJws(String s) {
+            String[] parts = s.split("\\.", -1);
+            if (parts.length != 3) {
+                return false;
+            }
+            for (String part : parts) {
+                if (!BASE64URL.matcher(part).matches()) {
+                    return false;
+                }
+            }
+            try {
+                Map<String, Object> header = StrictJson.parseObject(StrictJson.decodeSegment(parts[0]), "header");
+                return header.get("alg") instanceof String alg && !alg.isEmpty();
+            } catch (StrictJson.Malformed e) {
+                return false;
+            }
         }
     }
 }

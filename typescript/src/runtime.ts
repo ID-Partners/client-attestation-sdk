@@ -41,6 +41,16 @@ export function base64Encode(bytes: Uint8Array): string {
 }
 
 /**
+ * Milliseconds on a monotonic clock (`performance.now()`, which Node, Deno, Bun and workerd provide), for
+ * measuring how long something has been cached: unlike `Date.now()`, a wall-clock step does not move it.
+ *
+ * @internal
+ */
+export function monotonicMs(): number {
+  return performance.now();
+}
+
+/**
  * An environment variable, or `undefined` on a runtime with no `process.env` (most edge runtimes).
  *
  * @internal

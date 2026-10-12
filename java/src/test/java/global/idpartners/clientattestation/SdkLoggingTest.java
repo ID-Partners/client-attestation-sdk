@@ -14,6 +14,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.text.MessageFormat;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -23,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.concurrent.TimeoutException;
+import org.jose4j.json.JsonUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -32,6 +35,8 @@ import org.junit.jupiter.api.Test;
  * carries a credential, and that nothing is logged unless a logger is configured. Loopback fakes only.
  */
 class SdkLoggingTest {
+    /** The evidence_audience the fake attester's discovery document names. */
+    private static final String AUD = "https://attester.example.com";
 
     private static final String CHALLENGE = "chal-do-not-log-42";
     private static final String SVID = jwt("{\"sub\":\"spiffe://example.org/workload\"}");
@@ -63,7 +68,7 @@ class SdkLoggingTest {
 
     /** Point discovery at these paths (null leaves the member out); a path may carry a query string. */
     private void discover(String attest, String challenge, String token) {
-        StringBuilder b = new StringBuilder("{\"evidence_audience\":\"https://attester.example.com\"");
+        StringBuilder b = new StringBuilder("{\"evidence_audience\":\"" + AUD + "\"");
         b.append(",\"attestation_endpoint\":\"").append(this.server.url(attest)).append('"');
         if (challenge != null) {
             b.append(",\"challenge_endpoint\":\"").append(this.server.url(challenge)).append('"');
@@ -123,7 +128,7 @@ class SdkLoggingTest {
     }
 
     private ClientAttestation.Builder builder() {
-        return ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static(SVID))
+        return ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static(SVID)).evidenceAudience(AUD)
                 .logger(this.logger);
     }
 
@@ -280,7 +285,7 @@ class SdkLoggingTest {
         assertEquals("global.idpartners.clientattestation", ClientAttestation.LOGGER_NAME);
         // a client with no logger configured runs the whole flow (and logs nowhere)
         assertEquals(ACCESS_TOKEN, ClientAttestation.builder(this.server.url(""))
-                .evidence(new SvidSource.Static(SVID)).build().token());
+                .evidence(new SvidSource.Static(SVID)).evidenceAudience(AUD).build().token());
         new SdkLog(null).warn("http.failed", "host", "h");
         assertTrue(this.logger.records.isEmpty());
     }
@@ -293,6 +298,78 @@ class SdkLoggingTest {
         log.debug("token.cache_hit", "expires_in", 10);
         log.info("token.obtained", "host", "h");
         assertEquals(List.of("token.obtained"), infoOnly.events());
+    }
+
+    // Synthetic, built here so no scanner mistakes them for real ones.
+    private static List<String> vaultTokens() {
+        List<String> out = new ArrayList<>();
+        for (String prefix : List.of("hvs.", "hvb.", "hvr.", "s.", "b.", "r.")) {
+            for (String suffix : List.of("", "-_x9")) {
+                out.add(prefix + "TESTONLY".repeat(3) + suffix);
+            }
+        }
+        return out;
+    }
+
+    @Test
+    void formatRedactsAnyValueUnderACredentialKey() {
+        for (String key : List.of("auth_req_id", "code", "handle", "token", "secret", "password", "assertion",
+                "client_assertion", "vault_token", "x-vault-token", "X-Vault-Token", "Authorization", "dpop",
+                "private_key", "refresh_token", "session_token", "api-token", "client_secret", "db_password")) {
+            assertEquals("e " + key + "=\"<redacted:16 bytes>\" n=7",
+                    SdkLog.format("e", key, "opaque-value-123", "n", 7), key);
+        }
+        assertEquals("e code=\"<redacted:6 bytes>\"", SdkLog.format("e", "code", 123456));
+    }
+
+    @Test
+    void guardRedactsValuesThatCarryACredential() {
+        List<String> values = new ArrayList<>(List.of("Bearer 2YotnFZFEjr1zCsicMWpAA",
+                "DPoP 2YotnFZFEjr1zCsicMWpAA", "bearer opaque", "Basic YWxhZGRpbjpvcGVuc2VzYW1l",
+                " Bearer 2YotnFZFEjr1zCsicMWpAA", "Authorization: Bearer 2YotnFZFEjr1zCsicMWpAA"));
+        for (String token : vaultTokens()) {
+            values.add(token);
+            values.add("X-Vault-Token: " + token);
+        }
+        for (String v : values) {
+            assertTrue(SdkLog.guard(v).startsWith("<redacted:"), v);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void formatRedactionSharedCases() throws Exception {
+        // validation/redaction.json: the Go, Python and TypeScript tests read the same cases.
+        List<Map<String, Object>> cases = (List<Map<String, Object>>) JsonUtil.parseJson(
+                Files.readString(Path.of("..", "validation", "redaction.json"))).get("cases");
+        assertFalse(cases.isEmpty());
+        for (Map<String, Object> c : cases) {
+            String key = (String) c.get("key");
+            String got = SdkLog.format("e", key, c.get("value"));
+            if ((Boolean) c.get("redacted")) {
+                assertTrue(got.startsWith("e " + key + "=\"<redacted:"), got);
+            } else {
+                assertFalse(got.contains("<redacted"), got);
+                assertTrue(got.contains(String.valueOf(c.get("value"))), got);
+            }
+        }
+    }
+
+    @Test
+    void formatKeepsOrdinaryAttributes() {
+        // A backstop, not a filter: the vocabulary in docs/logging.md passes through untouched.
+        Object[] attrs = {"host", "pf.example.com:9031", "path", "/as/token.oauth2", "method", "POST",
+            "status", 400, "step", "token", "reason", "timeout", "token_type", "Bearer", "pop_method",
+            "dpop_combined", "client_id", "urn:agent:x", "alg", "ES256", "source", "StaticSvidSource", "at",
+            "token_endpoint", "keys", 3, "result", "invalid_audience", "mode", "introspection", "error",
+            "authorization_pending", "expires_in", 120, "detail", "s.example.com", "other", "hvs.short",
+            "label", "bob.smith", "host2", "vault.s.abcdefghijklmnopqrstuvwxyz.internal", "word", "DPoP",
+            "scheme", "Bearer"};
+        StringBuilder want = new StringBuilder("token.obtained");
+        for (int i = 0; i < attrs.length; i += 2) {
+            want.append(' ').append(attrs[i]).append('=').append(attrs[i + 1]);
+        }
+        assertEquals(want.toString(), SdkLog.format("token.obtained", attrs));
     }
 
     @Test
@@ -357,5 +434,17 @@ class SdkLoggingTest {
                         .map(Entry::level).findFirst().orElse(null);
             }
         }
+    }
+
+    @Test
+    void aThrowingToStringNeverThrowsOutOfLogging() {
+        Object hostile = new Object() {
+            @Override
+            public String toString() {
+                throw new IllegalStateException("boom");
+            }
+        };
+        String line = global.idpartners.clientattestation.internal.SdkLog.format("e", "k", hostile, hostile, "v");
+        org.junit.jupiter.api.Assertions.assertTrue(line.startsWith("e "), line);
     }
 }

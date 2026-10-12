@@ -22,4 +22,4 @@ export * as errors from "./errors.js";
 export { ProtectedResource, bearerToken } from "./resource.js";
 export type { ProtectedResourceMetadata, AuthDecision } from "./resource.js";
 
-export const VALIDATOR_VERSION = "1.0.1";
+export const VALIDATOR_VERSION = "1.1.0";

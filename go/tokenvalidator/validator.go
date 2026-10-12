@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,11 +18,15 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jws"
 
+	"github.com/id-partners/client-attestation-sdk/go/internal/netpolicy"
 	"github.com/id-partners/client-attestation-sdk/go/internal/sdklog"
 )
 
 // HTTPPostFunc performs a form POST and returns the parsed JSON object, for WithHTTPPost (introspection).
-// The default uses net/http with the SDK's timeout, no redirects and a response size cap.
+// The default uses net/http with the SDK's timeout, no redirects and a response size cap. A hook's error is
+// logged with the reason it carries: a timeout, a *json.SyntaxError or *json.UnmarshalTypeError (malformed),
+// and so on. A hook that returns a nil map and no error is logged as malformed. An error of a type the SDK
+// doesn't recognise, such as the hook's own size-limit error, is logged as network.
 type HTTPPostFunc func(endpoint, body string, headers map[string]string) (map[string]any, error)
 
 // AccessTokenValidator validates access tokens for a resource server.
@@ -53,8 +58,14 @@ func WithHTTPPost(f HTTPPostFunc) Option { return func(v *AccessTokenValidator) 
 // fixed instant.
 func WithClock(now func() time.Time) Option { return func(v *AccessTokenValidator) { v.now = now } }
 
-// New builds a validator from config. It refuses a config without an issuer or an audience.
+// New builds a validator from config. It refuses a config without an issuer or an audience, with a
+// negative LeewaySeconds, or with a plain-http JWKSURI or introspection endpoint on a non-loopback host
+// (unless AllowInsecure is set).
+//
+// The validator keeps its own copy of config: changing the Config (or its slices) after New returns does
+// not change what the validator accepts.
 func New(config *Config, opts ...Option) (*AccessTokenValidator, error) {
+	config = config.clone()
 	if config.Issuer == "" {
 		return nil, errors.New("tokenvalidator: issuer is required")
 	}
@@ -111,7 +122,9 @@ func (v *AccessTokenValidator) validate(token string, requiredScopes []string) R
 		}
 	}
 	if err != nil {
-		return failure(ErrKeyNotFound, err.Error())
+		// the fetch failure's detail (internal host, dial error, IdP body) went to the logger as
+		// jwks.fetch_failed; the description lands in WWW-Authenticate, in front of anyone
+		return failure(ErrKeyNotFound, "signing keys unavailable")
 	}
 	if key == nil {
 		return failure(ErrKeyNotFound, "no signing key matches the token")
@@ -192,13 +205,35 @@ func (v *AccessTokenValidator) acceptsType(typ any) bool {
 	return v.config.acceptsTokenType(s)
 }
 
+// minRSAKeyBits is the smallest RSA modulus a key may have to verify a signature (RFC 7518 section 3.3).
+const minRSAKeyBits = 2048
+
+// curveOf is the one curve an ES* algorithm verifies with.
+var curveOf = map[string]jwa.EllipticCurveAlgorithm{"ES256": jwa.P256, "ES384": jwa.P384, "ES512": jwa.P521}
+
 // verifySignature checks the JWS signature over the signing input with key, for alg only.
 func verifySignature(alg string, key jwk.Key, parts *compactParts) bool {
+	if !keyFits(alg, key) {
+		return false
+	}
 	verifier, err := jws.NewVerifier(jwa.SignatureAlgorithm(alg))
 	if err != nil {
 		return false
 	}
 	return verifier.Verify(parts.signingInput, parts.signature, key) == nil
+}
+
+// keyFits reports whether alg may use key at all. jwx sizes an ECDSA signature by the key's curve but hashes
+// by the header alg, so without this a P-256 key would verify an ES384 signature; and it takes an RSA key
+// of any size.
+func keyFits(alg string, key jwk.Key) bool {
+	switch k := key.(type) {
+	case jwk.ECDSAPublicKey:
+		return curveOf[alg] != "" && k.Crv() == curveOf[alg]
+	case jwk.RSAPublicKey:
+		return new(big.Int).SetBytes(k.N()).BitLen() >= minRSAKeyBits
+	}
+	return true
 }
 
 // Introspect performs an RFC 7662 introspection request and returns the parsed response.
@@ -227,7 +262,7 @@ func (v *AccessTokenValidator) Introspect(token string) (map[string]any, error) 
 	}
 	data, err := post(cfg.Endpoint, form.Encode(), headers)
 	if err == nil && data == nil {
-		err = errors.New("introspection: the response is not a JSON object")
+		err = &malformedError{err: errors.New("introspection: the response is not a JSON object")}
 	}
 	if err != nil {
 		reason, status := failureReason(err)
@@ -285,23 +320,27 @@ const MaxIntrospectionBytes = 1024 * 1024
 
 // introspectionHTTPClient never follows a redirect: it would carry the resource server's credentials.
 var introspectionHTTPClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout:   10 * time.Second,
+	Transport: netpolicy.Transport, // an environment proxy only for https to a remote host
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return errors.New("introspection: redirects are not followed")
 	},
 }
 
 func defaultHTTPPost(endpoint, body string, headers map[string]string) (map[string]any, error) {
+	if netpolicy.HasUserinfo(endpoint) {
+		return nil, fmt.Errorf("POST %s: %w", netpolicy.Display(endpoint), netpolicy.ErrUserinfo)
+	}
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, netpolicy.RedactError(err)
 	}
 	for k, val := range headers {
 		req.Header.Set(k, val)
 	}
 	resp, err := introspectionHTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, netpolicy.RedactError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -312,10 +351,14 @@ func defaultHTTPPost(endpoint, body string, headers map[string]string) (map[stri
 		return nil, err
 	}
 	if len(raw) > MaxIntrospectionBytes {
-		return nil, fmt.Errorf("introspection: response is larger than %d bytes", MaxIntrospectionBytes)
+		return nil, &tooLargeError{msg: fmt.Sprintf("introspection: response is larger than %d bytes", MaxIntrospectionBytes)}
 	}
 	// like every port's shared transport, invalid UTF-8 becomes U+FFFD; the JSON itself is parsed strictly
-	return parseObject(bytes.ToValidUTF8(raw, []byte("\uFFFD")), "introspection response")
+	obj, err := parseObject(bytes.ToValidUTF8(raw, []byte("\uFFFD")), "introspection response")
+	if err != nil {
+		return nil, &malformedError{err: err}
+	}
+	return obj, nil
 }
 
 // --- claim helpers (also used by result.go's success) ---

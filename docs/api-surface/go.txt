@@ -44,8 +44,9 @@ type AttestationIssuanceClient struct {
 	InstanceKey    *SigningKeyPair
 	HTTPClient     *http.Client
 	Profile AttesterProfile
+	AllowInsecure bool
 }
-func NewAttestationIssuanceClient(endpoint, clientID, attesterIssuer string, source SvidSource) (*AttestationIssuanceClient, error)
+func NewAttestationIssuanceClient(endpoint, clientID, attesterIssuer string, source SvidSource, opts ...IssuanceOption) (*AttestationIssuanceClient, error)
 func (c *AttestationIssuanceClient) Bootstrap(authorizationDetails []map[string]any, challenge string) (*IssuedAttestation, error)
 type AttesterMetadata struct {
 	EvidenceAudience string `json:"evidence_audience,omitempty"`
@@ -68,9 +69,11 @@ func NewClientAttestation(attesterURL string, opts ...Option) (*ClientAttestatio
 func (c *ClientAttestation) AttesterMetadata(ctx context.Context) (*AttesterMetadata, error)
 func (c *ClientAttestation) AuthorizationHeader(ctx context.Context) (string, error)
 func (c *ClientAttestation) AuthorizationHeaderWithOptions(ctx context.Context, opts ...TokenOption) (string, error)
+func (c *ClientAttestation) GoString() string
 func (c *ClientAttestation) RequestHeaders(ctx context.Context, method, url string) (map[string]string, error)
 func (c *ClientAttestation) RoundTripper() http.RoundTripper
 func (c *ClientAttestation) RoundTripperOver(base http.RoundTripper) http.RoundTripper
+func (c *ClientAttestation) String() string
 func (c *ClientAttestation) Token(ctx context.Context) (string, error)
 func (c *ClientAttestation) TokenWithOptions(ctx context.Context, opts ...TokenOption) (string, error)
 type ClientAttestationBuilder struct {
@@ -91,7 +94,9 @@ type ClientAttestationCredential struct {
 }
 func NewClientAttestationCredential(attestationJWT string, instanceKey *SigningKeyPair) (*ClientAttestationCredential, error)
 func (c *ClientAttestationCredential) DpopHeaders(method, uri, challenge string) (map[string]string, error)
+func (c *ClientAttestationCredential) GoString() string
 func (c *ClientAttestationCredential) PopHeaders(clientID, audience, challenge string) (map[string]string, error)
+func (c *ClientAttestationCredential) String() string
 type ClientAttestationError struct {
 	Message string
 	Status  int
@@ -128,13 +133,18 @@ type IssuanceError struct {
 	Body   string
 }
 func (e *IssuanceError) Error() string
+type IssuanceOption func(*AttestationIssuanceClient)
+func WithIssuanceAllowInsecure() IssuanceOption
 type IssuedAttestation struct {
 	Attestation string
 	ExpiresIn   int64
 	InstanceKey *SigningKeyPair
 }
 func (i *IssuedAttestation) Dpop(method, uri, challenge string) (string, error)
+func (i IssuedAttestation) GoString() string
+func (i IssuedAttestation) LogValue() slog.Value
 func (i *IssuedAttestation) Pop(audience, clientID, challenge string) (string, error)
+func (i IssuedAttestation) String() string
 type JwsSigner interface {
 	Algorithm() string
 	KeyID() string
@@ -149,19 +159,29 @@ type MintRequest struct {
 	AuthorizationDetails []map[string]any
 	Operator map[string]any
 }
+func (r MintRequest) GoString() string
 func (r *MintRequest) InstanceProof(typ, audience string) (string, error)
+func (r MintRequest) LogValue() slog.Value
 func (r *MintRequest) Sign(claims map[string]any, typ string) (string, error)
+func (r MintRequest) String() string
 type MintResult struct {
 	Attestation string
 	ExpiresIn   int64
 }
+func (r MintResult) GoString() string
+func (r MintResult) LogValue() slog.Value
+func (r MintResult) String() string
+type OpenBaoOption func(*openBaoOptions)
+func WithOpenBaoAllowInsecure() OpenBaoOption
 type OpenBaoTransitSigner struct {
 }
-func NewOpenBaoTransitSigner(baoAddr, token, keyName string) (*OpenBaoTransitSigner, error)
+func NewOpenBaoTransitSigner(baoAddr, token, keyName string, opts ...OpenBaoOption) (*OpenBaoTransitSigner, error)
 func (s *OpenBaoTransitSigner) Algorithm() string
+func (s *OpenBaoTransitSigner) GoString() string
 func (s *OpenBaoTransitSigner) KeyID() string
 func (s *OpenBaoTransitSigner) PublicJWK() map[string]any
 func (s *OpenBaoTransitSigner) Sign(signingInput []byte) ([]byte, error)
+func (s *OpenBaoTransitSigner) String() string
 type Option func(*ClientAttestation)
 func WithAlgorithm(algorithm string) Option
 func WithAllowInsecure() Option
@@ -170,6 +190,7 @@ func WithAttesterProfile(profile AttesterProfile) Option
 func WithAuthorizationDetails(details []map[string]any) Option
 func WithChallengeAtToken(enabled bool) Option
 func WithEvidence(source SvidSource) Option
+func WithEvidenceAudience(audience string) Option
 func WithExpirySkew(skew time.Duration) Option
 func WithHTTPClient(client *http.Client) Option
 func WithLogger(logger *slog.Logger) Option
@@ -203,6 +224,9 @@ type SpireWorkloadAPISvidSource struct {
 func (s SpireWorkloadAPISvidSource) Fetch(audience string) (string, error)
 type StaticSvidSource struct{ SVID string }
 func (s StaticSvidSource) Fetch(string) (string, error)
+func (s StaticSvidSource) GoString() string
+func (s StaticSvidSource) LogValue() slog.Value
+func (s StaticSvidSource) String() string
 type SvidSource interface {
 	Fetch(audience string) (string, error)
 }
@@ -265,6 +289,7 @@ type Config struct {
 	AcceptedTokenTypes []string
 	DisableTokenTypeCheck bool
 	Introspection *IntrospectionConfig
+	AllowInsecure bool
 }
 type HTTPGetFunc func(url string) ([]byte, error)
 type HTTPPostFunc func(endpoint, body string, headers map[string]string) (map[string]any, error)
@@ -286,6 +311,7 @@ type ProtectedResource struct {
 }
 func NewProtectedResource(resource string, authorizationServers []string, validator *AccessTokenValidator, scopesSupported []string) (*ProtectedResource, error)
 func (p *ProtectedResource) Authenticate(authorizationHeader string, requiredScopes []string) AuthDecision
+func (p *ProtectedResource) AuthenticateActive(authorizationHeader string, requiredScopes []string) (AuthDecision, error)
 func (p *ProtectedResource) Challenge(errCode, errDescription string) string
 func (p *ProtectedResource) Metadata() ProtectedResourceMetadata
 func (p *ProtectedResource) MetadataPath() string

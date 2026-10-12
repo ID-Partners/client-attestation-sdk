@@ -133,12 +133,20 @@ export class AccessTokenValidator {
     }
 
     const kid = header.kid;
-    const key = kid == null || typeof kid === "string" ? await this.#jwks.resolve(kid ?? undefined, alg) : null;
-    if (key == null) {
-      return failure(errors.KEY_NOT_FOUND, this.#jwks.lastError ?? "no signing key for this kid");
+    const key = kid == null || typeof kid === "string" ? await this.#jwks.resolve(kid ?? undefined, alg) : undefined;
+    if (key === undefined) {
+      // a fetch failure's detail (internal host, dial error, IdP body) went to the logger as jwks.fetch_failed;
+      // the description lands in WWW-Authenticate, in front of anyone
+      return failure(
+        errors.KEY_NOT_FOUND,
+        this.#jwks.lastError !== null ? "signing keys unavailable" : "no signing key for this kid",
+      );
     }
 
     try {
+      if (key === null) {
+        throw new Error("the key can't be used with this algorithm");
+      }
       await compactVerify(token, key, { algorithms: [alg] });
     } catch {
       return failure(errors.INVALID_SIGNATURE, "signature verification failed");

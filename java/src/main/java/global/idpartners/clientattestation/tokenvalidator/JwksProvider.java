@@ -5,10 +5,12 @@ import global.idpartners.clientattestation.internal.HttpTransport;
 import global.idpartners.clientattestation.internal.SdkLog;
 import java.nio.charset.StandardCharsets;
 import java.security.Key;
+import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 import org.jose4j.json.JsonUtil;
 import org.jose4j.jwk.JsonWebKey;
@@ -25,22 +27,30 @@ import org.jose4j.lang.JoseException;
  */
 final class JwksProvider {
 
-    /** A verification key and the {@code alg} its JWK declares (null when it declares none). */
-    record Entry(Key key, String alg) {
+    /** A verification key, its JWK's {@code kid} and the {@code alg} it declares (each null when absent). */
+    record Entry(String kid, Key key, String alg) {
+
+        /** A JWK that declares an alg is only used for that alg. */
+        boolean allows(String algorithm) {
+            return algorithm == null || this.alg == null || this.alg.equals(algorithm);
+        }
     }
+
+    /** The JWK members only a private or symmetric key carries (RFC 7518 section 6). */
+    private static final List<String> PRIVATE_MEMBERS = List.of("d", "p", "q", "dp", "dq", "qi", "k");
 
     private final boolean isStatic;
     private final String jwksUri;
     private final AccessTokenValidator.HttpGet get;
-    private final LongSupplier clock;
+    private final LongSupplier clock;   // monotonic milliseconds, never the validation clock
     private final ValidatorLog log;
     long minRefreshMillis = AccessTokenValidator.DEFAULT_JWKS_MIN_REFRESH.toMillis();
     long maxAgeMillis = AccessTokenValidator.DEFAULT_JWKS_MAX_AGE.toMillis();
 
-    private final Object refreshLock = new Object();   // one fetch at a time
+    private final ReentrantLock refreshLock = new ReentrantLock();   // one fetch at a time
 
     // guarded by this
-    private Map<String, Entry> keys = Map.of();
+    private List<Entry> keys = List.of();
     private Long loadedAt;
     private Long lastAttempt;
     private String lastError;
@@ -57,15 +67,26 @@ final class JwksProvider {
         }
     }
 
-    /** kid -&gt; entry. Keys that cannot be read are skipped; a later key with the same kid wins. */
-    static Map<String, Entry> parse(Map<String, Object> jwks) {
-        Map<String, Entry> out = new LinkedHashMap<>();
+    /**
+     * Milliseconds on {@link System#nanoTime()}: the clock the set ages and the refetch cooldown runs on. A
+     * wall-clock step, or a fixed validation clock, must not throttle every refetch or keep an old set forever.
+     */
+    static long monotonicMillis() {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
+    }
+
+    /**
+     * The usable keys, in document order: kid-less JWKs are distinct keys. Keys that cannot be read, or that may
+     * not verify a signature ({@link #verifiesSignatures}), are skipped.
+     */
+    static List<Entry> parse(Map<String, Object> jwks) {
+        List<Entry> out = new ArrayList<>();
         Object list = jwks.get("keys");
         if (!(list instanceof List)) {
-            return Collections.unmodifiableMap(out);
+            return Collections.unmodifiableList(out);
         }
         for (Object item : (List<?>) list) {
-            if (!(item instanceof Map)) {
+            if (!(item instanceof Map) || !verifiesSignatures((Map<?, ?>) item)) {
                 continue;
             }
             try {
@@ -75,12 +96,27 @@ final class JwksProvider {
                 if (key == null) {
                     continue;
                 }
-                out.put(jwk.getKeyId(), new Entry(key, jwk.getAlgorithm()));
+                out.add(new Entry(jwk.getKeyId(), key, jwk.getAlgorithm()));
             } catch (JoseException | RuntimeException e) {
                 // an unreadable key is skipped, the rest still count
             }
         }
-        return Collections.unmodifiableMap(out);
+        return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * Whether a JWK may verify a signature: not when its {@code use} is present and not {@code sig}, its
+     * {@code key_ops} is present and lacks {@code verify}, or it carries private members.
+     */
+    static boolean verifiesSignatures(Map<?, ?> jwk) {
+        if (jwk.containsKey("use") && !"sig".equals(jwk.get("use"))) {
+            return false;
+        }
+        Object ops = jwk.get("key_ops");
+        if (jwk.containsKey("key_ops") && !(ops instanceof List && ((List<?>) ops).contains("verify"))) {
+            return false;
+        }
+        return PRIVATE_MEMBERS.stream().noneMatch(jwk::containsKey);
     }
 
     /**
@@ -89,18 +125,14 @@ final class JwksProvider {
      * that alg. Never throws: a failed fetch leaves its reason in {@link #lastError()}.
      */
     Key resolve(String kid, String alg) {
-        if (!this.isStatic && this.jwksUri != null && !this.jwksUri.isEmpty()
-                && (lookup(kid) == null || stale())) {
-            refresh(kid);
+        if (!this.isStatic && this.jwksUri != null && !this.jwksUri.isEmpty()) {
+            Entry held = lookup(kid, alg);
+            if (held == null || stale()) {
+                refresh(kid, alg, held != null);
+            }
         }
-        Entry entry = lookup(kid);
-        if (entry == null) {
-            return null;
-        }
-        if (alg != null && entry.alg() != null && !entry.alg().equals(alg)) {
-            return null;
-        }
-        return entry.key();
+        Entry entry = lookup(kid, alg);
+        return entry == null ? null : entry.key();
     }
 
     /** Why the last fetch failed, or null after a successful one (or before any). */
@@ -108,20 +140,41 @@ final class JwksProvider {
         return this.lastError;
     }
 
-    private synchronized Entry lookup(String kid) {
-        if (kid != null) {
-            return this.keys.get(kid);
+    /**
+     * For a kid, the first key with that kid that may be used for {@code alg} (duplicate kids: document order);
+     * without one, the sole key when the set holds exactly one. An empty kid names no key.
+     */
+    private synchronized Entry lookup(String kid, String alg) {
+        if (kid == null) {
+            return this.keys.size() == 1 && this.keys.get(0).allows(alg) ? this.keys.get(0) : null;
         }
-        return this.keys.size() == 1 ? this.keys.values().iterator().next() : null;
+        if (kid.isEmpty()) {
+            return null;
+        }
+        for (Entry entry : this.keys) {
+            if (kid.equals(entry.kid()) && entry.allows(alg)) {
+                return entry;
+            }
+        }
+        return null;
     }
 
     private synchronized boolean stale() {
         return this.loadedAt == null || this.clock.getAsLong() - this.loadedAt >= this.maxAgeMillis;
     }
 
-    private void refresh(String kid) {
-        synchronized (this.refreshLock) {
-            if (lookup(kid) != null && !stale()) {
+    private void refresh(String kid, String alg, boolean haveKey) {
+        // A caller that already holds a usable (if stale) key never waits for another thread's fetch: it goes on
+        // with the key it has. One without a key waits for a fetch in flight, which may bring its key.
+        if (haveKey) {
+            if (!this.refreshLock.tryLock()) {
+                return;
+            }
+        } else {
+            this.refreshLock.lock();
+        }
+        try {
+            if (lookup(kid, alg) != null && !stale()) {
                 return;   // another caller refreshed while this one waited
             }
             synchronized (this) {
@@ -132,7 +185,7 @@ final class JwksProvider {
                 }
                 this.lastAttempt = now;
             }
-            Map<String, Entry> fetched;
+            List<Entry> fetched;
             try {
                 fetched = fetch();
             } catch (FetchFailure e) {
@@ -149,10 +202,12 @@ final class JwksProvider {
                 this.lastError = null;
             }
             this.log.debug("jwks.fetched", "host", SdkLog.host(this.jwksUri), "keys", fetched.size());
+        } finally {
+            this.refreshLock.unlock();
         }
     }
 
-    private Map<String, Entry> fetch() throws FetchFailure {
+    private List<Entry> fetch() throws FetchFailure {
         String body;
         try {
             body = this.get.get(this.jwksUri);

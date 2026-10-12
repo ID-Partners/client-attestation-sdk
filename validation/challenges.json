@@ -186,6 +186,24 @@
       "expect": null
     },
     {
+      "name": "rest_params_of_a_later_challenge_are_not_bearers",
+      "input": {
+        "status": 401,
+        "headers": {"WWW-Authenticate": "Bearer realm=\"api\", DPoP error=\"insufficient_scope\", scope=\"admin\""},
+        "body": ""
+      },
+      "expect": null
+    },
+    {
+      "name": "rest_non_string_scope_is_dropped",
+      "input": {
+        "status": 401,
+        "headers": {},
+        "body": {"error": "insufficient_scope", "scope": {"x": ["payments:*"]}}
+      },
+      "expect": {"type": "resource_authorisation", "error": "insufficient_scope", "source": "rest"}
+    },
+    {
       "name": "empty_inputs",
       "input": {"status": null, "headers": null, "body": null},
       "expect": null

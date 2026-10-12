@@ -5,8 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import org.jose4j.json.JsonUtil;
@@ -44,6 +46,31 @@ class ProtectedResourceTest {
         assertNull(ProtectedResource.bearerToken(""));
         assertNull(ProtectedResource.bearerToken("Bearer "));
         assertNull(ProtectedResource.bearerToken(null));
+    }
+
+    @Test
+    void bearerTokenSharedCases() {
+        // validation/bearer.json: the Go, Python and TypeScript tests read the same cases (Go's "" is null).
+        List<Map<String, Object>> cases = Fixtures.bearerCases();
+        assertFalse(cases.isEmpty());
+        for (Map<String, Object> c : cases) {
+            assertEquals(c.get("token"), ProtectedResource.bearerToken((String) c.get("header")), JsonUtil.toJson(c));
+        }
+    }
+
+    @Test
+    void bearerTokenIsLinearOnHostileHeaders() {
+        // A servlet container decodes header byte 0x85 as U+0085, which java.util.regex's '.' refuses: the old
+        // pattern backtracked cubically over the spaces (about a minute of CPU per request).
+        String nel = "Bearer" + " ".repeat(8000) + "!\u0085";
+        String spaces = "Bearer a" + " ".repeat(64000) + "b";
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
+            assertEquals("!\u0085", ProtectedResource.bearerToken(nel));
+            assertEquals("a" + " ".repeat(64000) + "b", ProtectedResource.bearerToken(spaces));
+            AuthDecision d = fixture().authenticate(nel);
+            assertEquals(401, d.status());
+            assertEquals("invalid_token", d.error());
+        });
     }
 
     @Test
@@ -209,5 +236,40 @@ class ProtectedResourceTest {
         assertEquals("algorithm not accepted", d.errorDescription());
         assertFalse(d.wwwAuthenticate().contains("EVIL"));
         assertFalse(hasControl(d.wwwAuthenticate()));
+    }
+
+    private static ProtectedResource introspecting(Map<String, Object> response) {
+        ValidatorConfig config = ValidatorConfig.builder()
+                .issuer("https://issuer.test").audiences("https://api.test", "https://other.test")
+                .jwks(Map.of("keys", List.of()))
+                .introspection(new IntrospectionConfig("https://issuer.test/introspect", "rs", "secret"))
+                .build();
+        AccessTokenValidator validator = AccessTokenValidator.builder(config).httpPost((url, body, headers) -> {
+            if (response == null) {
+                throw new IllegalStateException("introspection endpoint returned HTTP 503");
+            }
+            return response;
+        }).build();
+        return new ProtectedResource("https://api.test", List.of("https://issuer.test"), validator);
+    }
+
+    @Test
+    void authenticateActiveBindsThisResourceAndRefusesConfirmation() {
+        Map<String, Object> active = Map.of("active", true, "sub", "agent-1", "aud", "https://api.test");
+        assertTrue(introspecting(active).authenticateActive("Bearer opaque", null).authorized());
+        List<Map.Entry<Map<String, Object>, String>> refused = List.of(
+                Map.entry(Map.of("active", true, "sub", "agent-1", "aud", "https://other.test"), ErrorCodes.INVALID_AUDIENCE),
+                Map.entry(Map.of("active", true, "sub", "agent-1"), ErrorCodes.INVALID_AUDIENCE),
+                Map.entry(Map.of("active", true, "sub", "agent-1", "aud", "https://api.test",
+                        "cnf", Map.of("jkt", "bound-key")), ErrorCodes.INVALID_TOKEN),
+                Map.entry(Map.of("active", false), ErrorCodes.INACTIVE));
+        for (Map.Entry<Map<String, Object>, String> c : refused) {
+            AuthDecision d = introspecting(c.getKey()).authenticateActive("Bearer opaque", null);
+            assertFalse(d.authorized(), c.getKey().toString());
+            assertEquals(401, d.status());
+            assertEquals(c.getValue(), d.result().error());
+        }
+        assertEquals(401, introspecting(active).authenticateActive(null, null).status());
+        assertThrows(IllegalStateException.class, () -> introspecting(null).authenticateActive("Bearer opaque", null));
     }
 }

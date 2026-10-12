@@ -1,36 +1,41 @@
 # client-attestation-sdk
 
-Agent-side OAuth SDKs in **Java, Python, TypeScript, and Go** — for authenticating agents and workloads on
-common runtimes (LangChain, ADK, Node 20+ and edge runtimes, JVM and Go services, and Bedrock AgentCore
-from Python). Three capabilities:
+OAuth SDKs for Java, Python, TypeScript and Go. They authenticate workloads with
+OAuth Attestation-Based Client Authentication. A workload is an application or service
+that calls a protected API.
 
-For a visual tour — architecture diagrams, the full feature-support matrix across all four languages, and
-the standards this SDK implements — open [`docs/explainer.html`](docs/explainer.html), one offline page.
+A JSON Web Token (JWT) carries claims signed by its issuer. A Client Attestation is a JWT
+that identifies the client and binds its instance public key.
 
-1. **Get a token, in one call** *(all four languages)* — point it at a PingFederate host and get an access
-   token. It runs the whole flow (discover → get the workload's platform identity → mint the attestation →
-   call the token endpoint) and caches the result. The workload sends no client secret and no client_id;
-   its only credential is the attestation. See "Get a token in one call" below.
-2. **Client attestation builder** *(all four languages)* — the lower-level pieces, if you want to build the
-   credential yourself ([draft-ietf-oauth-attestation-based-client-auth](https://datatracker.ietf.org/doc/draft-ietf-oauth-attestation-based-client-auth/)):
-   the Client Attestation JWT plus the proof of possession for auth method `attest_jwt_client_auth` —
-   a dedicated PoP JWT (PoP method `attestation_pop_jwt`) or a DPoP proof (PoP method `dpop_combined`,
-   draft -10 naming; formerly the separate `attest_jwt_client_auth_dpop` method) — and the request
-   headers. Any of them can sign with a key held in a vault (`OpenBaoTransitSigner`). The attestation can
-   also name an `operator` — the human or org accountable for running the client, distinct from `sub` and
-   from the principal it acts for — an RFC 8693 `may_act`-shaped assertion, not proof of authorisation.
-3. **Token validator + MCP/A2A resource helper** *(all four ports)* — the resource-server side:
-   *validate* a token it receives — JWT signature via the issuer's JWKS, `iss`/`exp`/`nbf`, audience and
-   scope — with optional RFC 7662 introspection, AS-metadata discovery, and RFC 9728 protected-resource
-   metadata.
-4. **Authorization-challenge handling** *(Python; parser vectors shared for the other ports)* — what an
-   agent does when a policy enforcement point will not let a call proceed *as presented*. `parse_challenge`
-   turns whatever the PEP said (a REST 401 + `WWW-Authenticate` + body, a JSON-RPC error from an MCP edge,
-   an MCP tool result) into one typed challenge — **authn**, **resource authorisation** (RFC 9470 step-up),
-   **consent**, **identity proofing**, **intent** — and `CibaResolver` runs the ceremony that resolves it:
-   an OpenID CIBA push to the human's paired authenticator, polled at the AS's cadence, so the *same call,
-   re-sent, is permitted*. `WebConsentResolver` is the no-device fallback (a URL the human completes behind
-   the AS's login). See "Handling a challenge" below.
+The SDK runs inside your application. Your deployment supplies an attester, an authorisation
+server and a workload identity that the attester accepts.
+
+| Capability | What it does | Languages |
+| --- | --- | --- |
+| Obtain a token | Discovers the attester, presents workload identity, obtains a Client Attestation and requests an access token. Caches the token. | All four. |
+| Build a credential | Builds a Client Attestation JWT and a proof of possession (PoP) for the client's instance key. Produces token-request headers. | All four. |
+| Validate a token | Checks JWT signatures and claims, or uses RFC 7662 introspection. Provides a Bearer resource guard and protected-resource metadata. | All four. |
+| Handle an authorisation challenge | Parses challenges and supports CIBA or web consent through application-supplied integrations. | Python only. |
+
+The authentication method is `attest_jwt_client_auth`. The PoP methods are
+`attestation_pop_jwt` and `dpop_combined`. DPoP binds a token to a client key and requires a
+signed proof for each request. Resource-side DPoP proof verification is separate from the
+SDK's Bearer guard.
+
+## Documentation
+
+| Task | Guide |
+| --- | --- |
+| Install and call an API | [Python](python/README.md), [TypeScript](typescript/README.md), [Go](go/README.md), [Java](java/README.md). Each includes a complete offline builder example. |
+| Configure the client and validator | [Configuration](docs/configuration.md). Includes a reference for each component, defaults, per-call overrides and port differences. |
+| Build and test from a clone | [Build and test](docs/building.md). Includes toolchains, package outputs and cross-language checks. |
+| Run a supplied example | [Examples](docs/examples.md). Includes commands, external dependencies and expected results. |
+| Deploy an application or protected resource | [Deployment](docs/deployment.md). Includes a Kubernetes projected token example and the package release process. |
+| Diagnose a failure | [Troubleshooting](docs/troubleshooting.md) and [Logging](docs/logging.md). |
+| Use another attester | [Attester profiles](docs/attester-profiles.md). |
+| Check API support and validation rules | [Public API](docs/api.md) and [Validation semantics](validation/SEMANTICS.md). |
+
+The [offline explainer](docs/explainer.html) contains architecture diagrams and the feature table.
 
 ## Status and versioning
 
@@ -39,6 +44,10 @@ together. Every public name is in one of three tiers, listed port by port in [`d
 
 - **Stable** API follows semver. A breaking change needs a major release. Anything Stable that is to be
   removed or renamed is deprecated for at least one minor release first, and goes in the next major.
+  The one exception is security: a minor or patch release may make the SDK refuse something it used to
+  accept (a setting it now requires, a token or request it now rejects), with no deprecation period, when
+  accepting it lets a credential or token reach a party it shouldn't. Each such change opens its CHANGELOG
+  section under "check these before you upgrade", with what to set or change.
 - **Experimental** API may change or go in any minor release, with a CHANGELOG entry but no deprecation
   period. Each Experimental item says so in its doc comment, and `docs/api.md` gives the reason: mostly
   it exists in one port only, depends on someone else's API, or is an interface you implement.
@@ -60,14 +69,17 @@ The rest of the versioning:
   `oauth-attestation-instance-proof+jwt`. Neither is in the draft. For another attester, give its
   endpoints directly (no discovery) or plug in your own profile – see
   [`docs/attester-profiles.md`](docs/attester-profiles.md).
-- Install:
+## Install
 
-  | Language | Package | Install |
-  |---|---|---|
-  | Python | [PyPI](https://pypi.org/project/client-attestation-sdk/) | `pip install client-attestation-sdk` |
-  | TypeScript | [npm](https://www.npmjs.com/package/@idpartners/client-attestation-sdk) | `npm install @idpartners/client-attestation-sdk` |
-  | Go | [pkg.go.dev](https://pkg.go.dev/github.com/id-partners/client-attestation-sdk/go) | `go get github.com/id-partners/client-attestation-sdk/go` |
-  | Java | [Maven Central](https://central.sonatype.com/artifact/global.idpartners/client-attestation-sdk) | `global.idpartners:client-attestation-sdk` – see the [Java README](java/README.md) |
+Install the SDK in the application that will use it. Runtime requirements are Python 3.11+,
+Node.js 20+, Go 1.25+ or JDK 17+, according to the port.
+
+| Language | Package | Install |
+| --- | --- | --- |
+| Python | [PyPI](https://pypi.org/project/client-attestation-sdk/) | `python -m pip install client-attestation-sdk` |
+| TypeScript | [npm](https://www.npmjs.com/package/@idpartners/client-attestation-sdk) | `npm install @idpartners/client-attestation-sdk` |
+| Go | [pkg.go.dev](https://pkg.go.dev/github.com/id-partners/client-attestation-sdk/go) | `go get github.com/id-partners/client-attestation-sdk/go` |
+| Java | [Maven Central](https://central.sonatype.com/artifact/global.idpartners/client-attestation-sdk) | Add `global.idpartners:client-attestation-sdk` to Maven. See the [Java README](java/README.md#install). |
 
 See [CHANGELOG.md](CHANGELOG.md), [SECURITY.md](SECURITY.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -112,38 +124,52 @@ or the explainer drifts from it. A dash means the port doesn't have the feature 
 
 ## Get a token in one call
 
-Give it the attester's host (PingFederate by default; for another attester, see
-[`docs/attester-profiles.md`](docs/attester-profiles.md)). It finds the workload's platform identity by
-itself (a projected token file, a SPIRE socket, the GCP metadata server, or an env token — override with
-`evidence=`), runs the attestation flow, and returns an access token. Use the token, or hand the SDK to your
-HTTP client so every call carries it.
+The attester must already trust the workload's identity issuer and map that identity to a client.
+Pass the attester's base URL to the SDK. It discovers endpoints, obtains evidence and requests a
+token. It finds the workload's platform identity itself, in this order: a token in
+`CLIENT_ATTESTATION_SVID`, a projected token file, a SPIRE socket, the GCP metadata server (and, in Python
+only, Azure IMDS and AWS web identity). The Python example below uses the `requests` extra. Replace the hosts and provide an
+identity source from [Configuration](docs/configuration.md#workload-identity).
+
+```bash
+python -m pip install 'client-attestation-sdk[requests]'
+export CLIENT_ATTESTATION_TOKEN_FILE=/absolute/path/to/identity-token.jwt
+```
 
 ```python
 from client_attestation_sdk import ClientAttestation
 
-ca = ClientAttestation("pf.example.com")          # auto-detects the platform identity
+AUD = "https://attester.example.com"   # the audience your attester expects the identity token for
+
+ca = ClientAttestation("pf.example.com", evidence_audience=AUD)   # auto-detects the platform identity
 token = ca.token()                                # access token, cached until it nears expiry
 
 import requests
-requests.get("https://api.example.com/x", auth=ca.requests_auth())   # attaches: Authorization: Bearer <token>
+response = requests.get("https://api.example.com/x", auth=ca.requests_auth(), timeout=20)
+response.raise_for_status()
 
 # Ask for a specific entitlement (RFC 9396); the attester grants at most what the workload is allowed:
-ca = ClientAttestation("pf.example.com",
+ca = ClientAttestation("pf.example.com", evidence_audience=AUD,
                        authorization_details=[{"type": "sales_agent", "sales_regions": ["EMEA"]}])
 
 # Present a DPoP proof instead of a dedicated PoP JWT (PoP method dpop_combined):
-ca = ClientAttestation("pf.example.com", pop_method="dpop_combined")
+ca = ClientAttestation("pf.example.com", evidence_audience=AUD, pop_method="dpop_combined")
 ```
 
-The PF host is enough because the attester's `/.well-known/client-attester` advertises the token endpoint
-and the PoP audience. Nothing else is configured. Inside an agent (ADK, LangChain, Bedrock AgentCore), get
-`ca.authorization_header()` and attach it in a tool's request or an ADK `header_provider` /
-`before_tool_callback`. The same class exists in all four languages, `pop_method` included (Go/Java/TS:
+Discovery supplies the endpoints and the PoP audience. You configure the host and `evidence_audience`: the
+audience the workload's platform identity token is requested for. The discovery document must name the same
+one, so the attester can't choose which service the workload mints an identity token for (Go
+`WithEvidenceAudience`, Java `.evidenceAudience(...)`, TypeScript `evidenceAudience`). It is required unless
+you give the endpoints yourself as static `metadata`. The workload still needs trusted identity evidence.
+Use `ca.request_headers(method, url)` when an agent or HTTP client needs a header map.
+This method includes the proof required for a DPoP-bound token.
+The same class exists in all four languages, `pop_method` included (Go/Java/TS:
 `WithPopMethod("dpop_combined")` / `.popMethod("dpop_combined")` / `popMethod: "dpop_combined"`).
 
 Either way, if the attester advertises a `challenge_endpoint`, the SDK fetches a fresh challenge and carries
-it through automatically — as the PoP JWT's `challenge` claim in the default mode, or as the DPoP proof's
-`nonce` claim in `dpop_combined` mode. You never have to plumb it through yourself.
+it through automatically - as the PoP JWT's `challenge` claim in the default mode, or as the DPoP proof's
+`nonce` claim in `dpop_combined` mode. For an attester that consumes the challenge at mint and refuses to
+see it again, `challenge_at_token=False` keeps it out of the token request.
 
 To see what the flow is doing, turn on logging. It is off until you configure it, uses each language's own
 logging (Python `logging`, Go `log/slog`, Java `System.Logger`, a `logger` option in TypeScript), and
@@ -156,11 +182,19 @@ verifier** that accepts these credentials is separate:
 
 ## Handling a challenge
 
-An agent that calls a tool through a gateway will sometimes get, instead of a result, a *challenge*: the
-policy needs something more before this call may proceed — a step-up authorisation for THIS payment, a
-verified credential, an authenticated user. The status code alone cannot tell you which (this repo's
-reference PEPs answer 401 both for "no user at all" and "user present, scope missing"), so the SDK
-normalises first and resolves second:
+An authorisation challenge tells the caller what is required before the request can proceed.
+The Python parser classifies the response using its headers and body. The status code alone
+does not identify the requirement.
+
+Client Initiated Backchannel Authentication (CIBA) requests human approval through an
+authorisation server. `CibaResolver` runs that exchange and polls for its result. The
+application supplies the device registry, consent records and approval interface through `Hooks`.
+This package is Experimental and exists only in Python.
+
+The integration fragment below requires an HTTP response `resp`, the PingFederate base URL
+`PF` and issuer `PF_ISSUER`, the registered CIBA `AGENT_ID`, and its signing key `PEM` and `KID`.
+`directory` and `approver` are application services implementing the hooks. `principal` identifies
+the human. The payment fields come from the request being approved.
 
 ```python
 from client_attestation_sdk.authz_challenge import (
@@ -172,11 +206,13 @@ if ch and ch.type == "resource_authorisation":
     resolver = CibaResolver(
         CibaClient(bc_auth_endpoint=PF + "/as/bc-auth.ciba", token_endpoint=PF + "/as/token.oauth2",
                    client_id=AGENT_ID, issuer=PF_ISSUER,
-                   client_auth=PrivateKeyJwtAuth(client_id=AGENT_ID, private_key_pem=PEM, kid=KID,
-                                                 extra_audiences=(PF_ISSUER + "/as/token.oauth2", PF_ISSUER)),
+                   # the client assertion's aud is PF_ISSUER, one string (CIBA Core §7.1). For an AS that
+                   # accepts only its endpoint URL: audience_mode=AUDIENCE_ENDPOINT; for an array of
+                   # audiences: extra_audiences=(...)
+                   client_auth=PrivateKeyJwtAuth(client_id=AGENT_ID, private_key_pem=PEM, kid=KID),
                    request_signing_key_pem=PEM, request_signing_kid=KID),
         Hooks(channel_for=directory.channel_for,            # "device" | "web_consent" | "local"
-              already_covered=directory.consent_covers,     # the PDP's own question — a stale challenge?
+              already_covered=directory.consent_covers,     # the PDP's own question - a stale challenge?
               register_for_device=approver.publish,         # the phone looks the ceremony up by its reference
               persist=directory.save, rehydrate=directory.load,   # survive a restart mid-approval
               on_outcome=directory.record))                 # approved/denied/expired -> where the PDP looks
@@ -185,7 +221,7 @@ if ch and ch.type == "resource_authorisation":
     # Pending  -> return {code, poll_url, interval, expires_in} to whoever called you; they poll
     #             resolver.poll(code) until approved/denied/expired, then RE-SEND the same call.
     # Resolved -> an authorisation already covers this instruction: just re-send.
-    # Unavailable -> no channel to the human from here (fallback: "bubble_up" | "web_consent" | "enrol").
+    # Unavailable -> no channel to the human from here (fallback: "bubble_up" | "web_consent").
 ```
 
 What the SDK owns: the challenge vocabulary, the CIBA wire protocol **and its pacing rules** (poll faster
@@ -194,29 +230,44 @@ grant*, which looks exactly like "expired on device"), dedupe so one instruction
 twice, a settle window so a stronger out-of-band verdict from the device is not overwritten by the poll,
 and `verify_resume` — the re-sent call must hash to the instruction the human approved, byte for byte.
 What the deployment owns, via `Hooks`: its device registry, its consent directory, its approver app.
+An approval resumes once: `verify_resume` reads the record back through `rehydrate`, records the use through
+`persist` (or `consume`, a compare-and-set, if the store has one), and refuses the resume if it can't, so
+replicas sharing a store don't each accept the same code.
 
-The approval is a **signal, not a credential**: on PingFederate the CIBA grant's subject is fixed by a
-default mapping, so the minted token is discarded and the *record* the deployment writes is what turns
-the PDP's next answer into a permit. Client authentication is pluggable (`ClientAuth`); `private_key_jwt`
-ships because that is what the deployed CIBA clients use — an attestation-based authenticator (capability
-2) slots in behind the same interface once the AS accepts it on the backchannel endpoint.
+Use `resolver.poll(code)` at the returned interval. An approved outcome must be written to
+the application's authorisation records through `on_outcome`. Before resending the request,
+call `verify_resume(code, subject=principal, instruction=instruction)` to check that the subject
+and instruction match the approval. Encode decimal amounts as strings so the instruction's
+canonical JSON has consistent numeric values.
 
-**Ports.** The parser is pinned by [`validation/challenges.json`](validation/challenges.json) — 18 cases
-mirroring the real PEP responses (Kong `authzen-pdp`, `coaz-pep`, the MCP servers' tool results) — and
-only the Python parser runs them today. They are language-neutral on purpose: a port that adds a parser
-must return the identical classification for every case. The resolvers are stateful, long-lived and
-networked, which is exactly where a four-language SDK drifts, so they are Python-only for now and the
-feature matrix says so.
+`Pending` means approval is outstanding. `Resolved` means an existing authorisation covers the
+instruction. `Unavailable` means the resolver has no channel that can complete it.
+The resolver discards the CIBA access token. The application uses the recorded approval to
+decide whether to permit the retried call. The application must provide persistence hooks
+when approvals need to survive a process restart.
+
+**Ports.** The parser is pinned by [`validation/challenges.json`](validation/challenges.json) — 20 cases
+mirroring the real PEP responses (Kong `authzen-pdp`, `coaz-pep`, the MCP servers' tool results) and two
+malformed ones — and only the Python parser runs them today. They are language-neutral on purpose: a port
+that adds a parser must return the identical classification for every case. The resolvers are stateful,
+long-lived and networked, which is exactly where a four-language SDK drifts, so they are Python-only for
+now and the feature matrix says so.
+The hook signatures are in
+[`Hooks`](python/src/client_attestation_sdk/authz_challenge/resolver.py).
 
 ## Proven interoperable
 
-Every port is checked against the **real Java AS-side verifier**. Each builds credentials from the shared
-[`vectors/inputs.json`](vectors/inputs.json) (fixed throwaway test keys) into `vectors/out/<lang>.json`, and
-[`interop/VerifyInterop.java`](interop/VerifyInterop.java) runs each through `ClientAttestationVerifier` in
-both PoP and DPoP modes. A Python-, TypeScript-, or Go-built credential is accepted by exactly the same AS
-as a Java-built one. Reproduce with [`./verify-interop.sh`](verify-interop.sh).
+Every port is checked against the **real Java AS-side verifier**. Go, Python and TypeScript each build
+credentials from the shared [`vectors/inputs.json`](vectors/inputs.json) (fixed throwaway test keys) into
+`vectors/out/<lang>.json`, and [`interop/VerifyInterop.java`](interop/VerifyInterop.java) runs each through
+`ClientAttestationVerifier` in both PoP and DPoP modes. Reproduce with
+[`./verify-interop.sh`](verify-interop.sh). Java's own credentials go through the same verifier in
+`RoundTripTest`, run by `./mvnw verify -Pinterop` in `java/`. A Python-, TypeScript-, or Go-built credential
+is accepted by exactly the same AS as a Java-built one. Every port's tests also
+run [`vectors/htu.json`](vectors/htu.json), so all four sign the same DPoP `htu` for a URL, or refuse it
+with the same message ([the rule](vectors/README.md#the-htu-rule)).
 
-**Validator** — every port validates the shared [`validation/tokens.json`](validation/tokens.json)
+**Validator** - every port validates the shared [`validation/tokens.json`](validation/tokens.json)
 (pre-signed tokens, each with one defect: expiry and leeway, issuer, audience, scope, signature, `alg: none`
 and HMAC key confusion, malformed and duplicate-keyed JSON, out-of-range dates, wrongly typed claims) and
 [`validation/introspection.json`](validation/introspection.json) (canned RFC 7662 responses), and must
@@ -228,21 +279,26 @@ rule. Reproduce with [`./verify-validation.sh`](verify-validation.sh).
 
 Two layers, deliberately different in scope:
 
-- **Cross-language agreement** (`./verify-interop.sh`, `./verify-validation.sh`, above) proves the four
-  ports produce/accept byte-compatible artifacts against one shared verifier — but only for the
-  **low-level builder/credential API** (`ClientAttestationBuilder`, `ClientAttestationCredential`,
+- **Cross-language agreement** (above) checks that the ports' artifacts are accepted by one shared
+  verifier and that their validators agree. `./verify-interop.sh` covers the Go, Python and TypeScript
+  credentials (Java's go through `RoundTripTest` under `./mvnw verify -Pinterop`), and
+  `./verify-validation.sh` covers all four validators. The artifacts are not byte-identical (signatures,
+  `jti` and `iat` differ); each is accepted by the same verifier. Both cover only the **low-level
+  builder/credential API** (`ClientAttestationBuilder`, `ClientAttestationCredential`,
   `AccessTokenValidator`) against fixed vectors. It does not exercise the one-call `ClientAttestation`
   orchestration class's own decisions (evidence auto-detection, discovery, challenge fetching, caching).
-- **Per-language unit suites** (`go test ./...`, `mvn test`, `pytest`, `npm test` — see each language's
+- **Per-language unit suites** (`go test ./...`, `./mvnw test`, `pytest`, `npm test` — see each language's
   README) cover that orchestration layer directly, including edge cases the shared vectors don't reach:
   malformed/expired tokens, unaccepted algorithms, signer/network failures, evidence auto-detect
-  precedence, and — since the fixes described above — that a fetched challenge actually reaches the
+  precedence, and that a fetched challenge actually reaches the
   token-endpoint PoP JWT's `challenge` claim in the default mode, and the DPoP proof's `nonce` claim in
   `dpop_combined` mode, in both the one-call flow and the SPIFFE issuance-bootstrap flow.
 
 Run everything before relying on a change: each language's own suite, then both `verify-*.sh` scripts.
-CI runs all of it on every push and pull request except `verify-interop.sh` (see
-[CONTRIBUTING.md](CONTRIBUTING.md)).
+CI runs all of it except `verify-interop.sh` on pull requests and pushes to `main`, but only the jobs a
+change touches: a port's suite when its files change, the validator agreement when a validator changes,
+and every job when shared files change (see [CONTRIBUTING.md](CONTRIBUTING.md#running-everything)).
+See [Build and test](docs/building.md).
 
 ## Layout
 
@@ -259,22 +315,26 @@ interop/      Java cross-language verifier (builder side)
 See each subdirectory's README for language-specific install and usage. Representative flow (Python):
 
 ```python
+from client_attestation_sdk import SigningKeyPair, ClientAttestationBuilder, ClientAttestationCredential
+
 attester = SigningKeyPair.generate("ES256")
+instance = SigningKeyPair.generate("ES256")
 attestation = (ClientAttestationBuilder(attester, "https://attester.example.com")
-               .client_id("https://rp.example.com").confirmation_jwk(instance_pub).expires_in(300).build())
+               .client_id("https://rp.example.com").confirmation_key(instance).expires_in(300).build())
 headers = ClientAttestationCredential(attestation, instance).pop_headers(
     "https://rp.example.com", "https://as.example.com")
 ```
 
 ## Contract
 
-All ports emit the same shapes (ES256; `kid` = RFC 7638 thumbprint; `iat`/`exp` integer epoch seconds):
+All ports emit the same shapes (ES256 by default, and ES, RS or PS at 256, 384 or 512 on request; `kid` =
+RFC 7638 thumbprint; `iat`/`exp` integer epoch seconds):
 
 | Artifact | `typ` | key in header | key claims |
 |---|---|---|---|
 | Attestation | `oauth-client-attestation+jwt` | `kid` (attester) | `iss, sub, iat, exp, cnf.jwk` (instance pub, +kid) |
 | PoP | `oauth-client-attestation-pop+jwt` | `kid` (instance) | `aud, jti, iat` (+ optional `iss`, `challenge`) |
-| DPoP | `dpop+jwt` | `jwk` (instance pub, −kid) | `htm, htu, jti, iat` (+ optional `nonce`) |
+| DPoP | `dpop+jwt` | `jwk` (instance pub, −kid) | `htm, htu, jti, iat` (+ optional `nonce`, `ath`) |
 
 ## Bootstrapping from SPIFFE (attestation issuance)
 
@@ -282,10 +342,14 @@ The inverse of the builder: instead of holding an attester key and building an a
 workload proves its **SPIFFE identity** (a JWT-SVID) and the Authorization Server (PingFederate's
 `/federation/attestation` servlet) **mints** a Client Attestation bound to the workload's own instance
 key. A client credential bootstrapped from infra identity — no pre-shared secret. All four ports ship an
-`AttestationIssuanceClient` + a pluggable `SvidSource` (default: a real SPIRE agent's Workload API;
-`Static`/`Http` for tests + the demo harness).
+`AttestationIssuanceClient`, which takes the `SvidSource` to use: the SPIRE Workload API source for a real
+SPIRE agent (it runs the `spire-agent` CLI; `SpireWorkloadApiSvidSource` in Python and TypeScript,
+`SpireWorkloadAPISvidSource` in Go, `SvidSource.SpireWorkloadApi` in Java), or `Static`/`Http` for tests
+and the demo harness.
 
 ```python
+from client_attestation_sdk import AttestationIssuanceClient, SpireWorkloadApiSvidSource
+
 client = AttestationIssuanceClient(
     endpoint="https://pf/federation/attestation", client_id="https://agent.example",
     attester_issuer="https://attester.example", svid_source=SpireWorkloadApiSvidSource())
@@ -295,33 +359,42 @@ headers = {"OAuth-Client-Attestation": issued.attestation,           # minted by
 
 # ...or DPoP combined mode instead of the dedicated PoP JWT:
 headers = {"OAuth-Client-Attestation": issued.attestation,
-           "DPoP": issued.dpop("POST", token_endpoint_url)}
+           "DPoP": issued.dpop("POST", "https://pf/as/token.oauth2")}
 ```
 
-Both `pop(...)` and `dpop(...)` take an optional trailing `challenge` — pass one through if the AS gave you
+Both `pop(...)` and `dpop(...)` take an optional trailing `challenge` - pass one through if the AS gave you
 one; it lands as the PoP JWT's `challenge` claim or the DPoP proof's `nonce` claim, matching whichever mode
 you built.
 
-Runnable examples per language (`examples/attestation_issuance_bootstrap.*`, and Go
-`cmd/issuance-bootstrap`), each verified end-to-end against the demo issuance servlet
-(`pf-oidf-modules/demo/spiffe-bootstrap`): SVID → minted attestation → token.
+Python, TypeScript and Go supply bootstrap executables. Java supplies the issuance API and
+interop tests. The [example guide](docs/examples.md#spiffe-issuance-bootstrap) lists commands
+and the external demo servlet they require.
 
 ## Signing keys outside the process (Vault / HSM)
 
 The attester's issuing key doesn't have to live in the client. `OpenBaoTransitSigner` signs the attestation
 inside an OpenBao / HashiCorp Vault transit engine (`marshaling_algorithm=jws`), so the private key never
-leaves the vault — pass it to the builder in place of a local key:
+leaves the vault - pass it to the builder in place of a local key:
 
 ```python
-signer = OpenBaoTransitSigner("http://openbao:8200", vault_token, "attestation-es256")
+from client_attestation_sdk import OpenBaoTransitSigner, ClientAttestationBuilder
+
+# Integration fragment: vault_token and instance come from the attester's configuration.
+signer = OpenBaoTransitSigner("https://openbao.example.com", vault_token, "attestation-es256")
 attestation = (ClientAttestationBuilder(signer, "https://attester.example.com")
                .client_id("https://rp.example.com").confirmation_key(instance).expires_in(300).build())
 # a verifier registers signer.public_jwk() (kid = the key's RFC 7638 thumbprint)
 ```
 
-Same in every language — TS: `await OpenBaoTransitSigner.create(addr, token, key)`; Go:
-`NewClientAttestationBuilderWithSigner(signer, issuer)`. Any key store fits the `JwsSigner` interface:
-implement `sign(signingInput) → raw r‖s` and plug it in.
+Same in every language - TS: `await OpenBaoTransitSigner.create(addr, token, key)`; Go:
+`NewClientAttestationBuilderWithSigner(signer, issuer)`. The vault token goes on every call, so the vault
+address must be https unless it is loopback (`allow_insecure=True` / `allowInsecure` /
+`WithOpenBaoAllowInsecure()` lifts that), and the key name may contain only letters, digits, `_`, `.` and
+`-`. Any key store fits the `JwsSigner` interface: it names the algorithm, the key id and the public JWK,
+and signs a JWS signing input, returning the raw signature (`r‖s` for EC). Implement it and plug it in.
+The builder accepts only ES256/384/512, RS256/384/512 and PS256/384/512 from a signer, and refuses an
+empty signature or an ES signature that isn't the fixed-width `r‖s`. The signer is for the attestation
+builder; the PoP and DPoP proofs are always signed by the instance key the client holds.
 
 ## Token validation (resource server)
 
@@ -335,27 +408,38 @@ validator = AccessTokenValidator(ValidatorConfig(
     jwks_uri="https://issuer.example.com/jwks", required_scopes=["read"]))
 
 result = validator.validate(access_token)          # local: signature + iss/exp/nbf + audience + scope
-if result.valid:
+if result.valid and result.claims.get("cnf") is None:   # see below for sender-constrained tokens
     print(result.subject, result.scopes)
-# optional RFC 7662 revocation / opaque-token check:
-result = validator.validate_active(access_token)   # introspection
 ```
 
-Java has the same shape (`global.idpartners.clientattestation.tokenvalidator`, see the
+This fragment expects `access_token` from a request. To use RFC 7662 introspection, configure
+`IntrospectionConfig` and call `validate_active`. That method validates the introspection
+response. It does not first run local JWT validation. See the
+[Python example](python/README.md#token-validator).
+
+Every port has the same shape (TypeScript `@idpartners/client-attestation-sdk/validator`, Go
+`tokenvalidator`, Java `global.idpartners.clientattestation.tokenvalidator`, see the
 [Java README](java/README.md#resource-server-validate-an-access-token)). `validate` runs a fixed
-error-precedence order — identical across all ports so their verdicts match:
+error-precedence order - identical across all ports so their verdicts match:
 structure → algorithm → key → signature → payload → `typ` → `iss` → `exp` / `nbf` / `iat` → audience →
 scope → `sub`, returning the first failure's stable code (`invalid_signature`, `invalid_issuer`, `expired`,
 `not_yet_valid`, `invalid_audience`, `insufficient_scope`, …). `alg: none` and the `HS*` algorithms are
 refused even if configured, and a failed introspection call raises (Go: returns an error) rather than
 returning a verdict. [`validation/SEMANTICS.md`](validation/SEMANTICS.md) is the precise contract.
 
+`validate` (and `validate_active`) is token validation, not an authorization decision. It doesn't look at
+`cnf`, so a DPoP- or mTLS-bound token is `valid` without its sender proof. Refuse a token with a `cnf`
+claim unless you verify that proof, or use `ProtectedResource.authenticate` (below; `authenticate_active`
+for introspected tokens) as the request guard.
+
 ## Resource server for MCP / A2A
 
 The validator is protocol-neutral OAuth resource-server validation, so it already does what an **MCP server**
-or **A2A agent** must — verify the token and enforce audience + scope. `ProtectedResource` adds the HTTP
+or **A2A agent** must - verify the token and enforce audience + scope. `ProtectedResource` adds the HTTP
 conventions on top: RFC 9728 protected-resource metadata, RFC 6750 bearer extraction + `WWW-Authenticate`
 challenges, and a request guard that binds the token to this resource (RFC 8707) and maps failures to 401/403.
+The guard is for Bearer tokens: it refuses a token carrying a `cnf` claim (DPoP- or mTLS-bound), because
+it never sees the sender proof. To accept those, verify the proof yourself and call `validate`.
 
 ```python
 from client_attestation_sdk.token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig
@@ -365,7 +449,8 @@ validator = AccessTokenValidator(ValidatorConfig(
     jwks_uri="https://as.example.com/jwks", required_scopes=["mcp:call"]))
 resource = ProtectedResource("https://mcp.example.com/mcp", ["https://as.example.com"], validator)
 
-# serve resource.metadata() at resource.metadata_path()  →  /.well-known/oauth-protected-resource
+# Integration fragment: your HTTP server supplies authorization_header, handle and reply.
+# serve resource.metadata() at resource.metadata_path() -> /.well-known/oauth-protected-resource/mcp
 decision = resource.authenticate(authorization_header)          # or .authenticate(hdr, ["extra:scope"])
 if decision.authorized:
     handle(decision.result.subject, decision.result.scopes)
@@ -373,14 +458,17 @@ else:
     reply(decision.status, {"WWW-Authenticate": decision.www_authenticate})   # 401 or 403
 ```
 
-Per the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)
-that's the entire resource-server duty (OAuth 2.1 + RFC 9728 / 8414 / 8707); only the last-mile middleware
-wiring into a given server framework is platform-specific — a runnable, dependency-free example ships in each
-language's `examples/`. The same `ProtectedResource` serves A2A agents, whose Agent Cards just declare an
-OAuth2/bearer scheme.
+`ProtectedResource` handles Bearer requests. Since 1.0.1 it requires this resource in the token's
+audience, even when the validator accepts several, and it refuses a token whose `cnf` claim is non-null (DPoP-bound, mTLS-bound or malformed) with 401, because
+it receives no sender proof. To accept sender-constrained tokens, verify the proof in the resource's
+authentication layer and call `validate` directly. See the
+[resource reference](docs/configuration/resource.md).
+The [example guide](docs/examples.md#protected-resource-examples) lists the Python, TypeScript and
+Go demonstration servers. Java provides the integration API. These programs demonstrate metadata
+and authentication. They implement no MCP tools or A2A methods.
 
 ## Not production keys
 
 The fixed keys in `vectors/inputs.json` and `validation/tokens.json` exist **only** so the ports produce
-identical, comparable artifacts for the interop checks. They are throwaway test-vector keys — never use them
+identical, comparable artifacts for the interop checks. They are throwaway test-vector keys - never use them
 for anything real.

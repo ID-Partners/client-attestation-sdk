@@ -42,9 +42,14 @@ export class ClientAttestationBuilder {
     return this;
   }
 
-  /** Binds the client instance key as `cnf.jwk`. Must be a public JWK. */
+  /**
+   * Binds the client instance key as `cnf.jwk`: an EC (`crv` P-256, P-384 or P-521, `x`, `y`) or RSA
+   * (`n`, `e`) public key. Throws for one carrying private or secret members (`d`, `p`, `q`, `dp`, `dq`,
+   * `qi`, `oth`, `k`) or another `kty`. Only those members and an optional `kid` are copied into the
+   * attestation.
+   */
   confirmationJwk(publicInstanceJwk: JWK): this {
-    this.#cnfJwk = publicInstanceJwk;
+    this.#cnfJwk = confirmationJwkMembers(publicInstanceJwk);
     return this;
   }
 
@@ -138,14 +143,62 @@ export class ClientAttestationBuilder {
   }
 
   #resolveExpiry(iat: number): number {
+    let exp: number;
     if (this.#expiresAt !== null) {
-      return this.#expiresAt;
+      exp = this.#expiresAt;
+    } else if (this.#ttl !== null) {
+      exp = iat + this.#ttl;
+    } else {
+      throw new Error("expiry is required: call expiresAt(...) or expiresIn(...)");
     }
-    if (this.#ttl !== null) {
-      return iat + this.#ttl;
+    if (!(exp > iat)) {
+      throw new Error(`attestation exp (${exp}) must be after iat (${iat})`);
     }
-    throw new Error("expiry is required: call expiresAt(...) or expiresIn(...)");
+    return exp;
   }
+}
+
+/** JWK members that carry private or secret key material (RFC 7518 section 6). */
+const PRIVATE_JWK_MEMBERS = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+/** The public members a `cnf.jwk` of each key type must carry. */
+const CONFIRMATION_JWK_MEMBERS: Record<string, readonly string[]> = { EC: ["crv", "x", "y"], RSA: ["n", "e"] };
+
+/**
+ * The public key to bind as `cnf.jwk`: `kty`, the key type's public members and an optional `kid`, in the
+ * order the input has them. Refuses private or secret members, another `kty` or curve, or a missing member,
+ * so a private key is never signed into an attestation.
+ */
+function confirmationJwkMembers(jwk: JWK): JWK {
+  if (jwk === null || typeof jwk !== "object" || Array.isArray(jwk)) {
+    throw new Error("cnf.jwk must be a JWK object");
+  }
+  const members = jwk as Record<string, unknown>;
+  for (const member of PRIVATE_JWK_MEMBERS) {
+    if (member in members) {
+      throw new Error(`cnf.jwk must be a public key: it carries the private member '${member}'`);
+    }
+  }
+  const kty = members.kty;
+  const required = typeof kty === "string" && Object.hasOwn(CONFIRMATION_JWK_MEMBERS, kty)
+    ? CONFIRMATION_JWK_MEMBERS[kty]
+    : undefined;
+  if (!required) {
+    throw new Error(`cnf.jwk must be an EC or RSA public key, not kty ${JSON.stringify(kty)}`);
+  }
+  for (const member of required) {
+    if (typeof members[member] !== "string" || members[member] === "") {
+      throw new Error(`cnf.jwk (kty ${kty}) is missing '${member}'`);
+    }
+  }
+  if (kty === "EC" && !["P-256", "P-384", "P-521"].includes(members.crv as string)) {
+    throw new Error(`cnf.jwk curve must be P-256, P-384 or P-521, not ${JSON.stringify(members.crv)}`);
+  }
+  if ("kid" in members && (typeof members.kid !== "string" || members.kid === "")) {
+    throw new Error("cnf.jwk kid must be a non-empty string");
+  }
+  const keep = new Set(["kty", "kid", ...required]);
+  return Object.fromEntries(Object.entries(members).filter(([k]) => keep.has(k))) as JWK;
 }
 
 /**
@@ -236,8 +289,11 @@ export class DpopProofBuilder {
   }
 
   /**
-   * The target URL (`htu`) — required. Normalised when built: query and fragment are dropped, and
-   * scheme and host lower-cased (RFC 9449 section 4.2).
+   * The target URL (`htu`) — required. Normalised when built (RFC 9449 section 4.2) by the rule in
+   * vectors/README.md: userinfo, query, fragment and a default port are dropped, and scheme and host
+   * lower-cased. `build` refuses a URL that is not an absolute http(s) URL with a valid ASCII host, port
+   * and path, or that has a backslash, ASCII whitespace or a control character before its query or
+   * fragment.
    */
   uri(htu: string): this {
     this.#htu = htu;
@@ -300,19 +356,108 @@ export async function accessTokenHash(accessToken: string): Promise<string> {
 }
 
 /**
- * The DPoP `htu` for a URL: scheme, host, port and path, with no query and no fragment. Scheme and host
- * are lower-cased and a default port dropped; a URL with no path keeps none (no slash is invented).
+ * Throws unless `url` is free of backslashes, ASCII whitespace and control characters before its query or
+ * fragment (the part that becomes `htu`). URL parsers disagree on where such a URL goes - WHATWG reads
+ * `https://evil.example\@as.example/t` as a request to evil.example, `urllib.parse` as one to
+ * as.example - so a proof's `htu` could name a different server from the one the request reaches.
+ *
+ * @internal
+ */
+export function checkHtu(url: string): void {
+  const head = url.split(/[?#]/, 1)[0];
+  if (/[\x00-\x20\x7f\\]/.test(head)) {
+    throw new Error("uri (htu) must not contain a backslash, whitespace or control character");
+  }
+}
+
+/** The schemes an `htu` may have, with their default ports. */
+const HTU_DEFAULT_PORTS: Record<string, string> = { http: "80", https: "443" };
+const HTU_NOT_ABSOLUTE = "uri (htu) must be an absolute http or https URL with a host";
+const HTU_HOST = "uri (htu) has an invalid host";
+const HTU_PORT = "uri (htu) has an invalid port";
+const HTU_PATH = "uri (htu) has an invalid path";
+
+/**
+ * `[origin, path]` of a request URL's `htu`, by the rule in vectors/README.md that every port applies
+ * alike: an absolute http(s) URL with a host; scheme and host lower-cased (ASCII only, an IPv6 literal as
+ * written); no userinfo; the port as a plain number and dropped when it is the scheme's default; the path
+ * as written with non-ASCII characters percent-encoded (UTF-8); no query or fragment. It
+ * is read from the string itself, not through WHATWG `URL`, which would also resolve dot-segments,
+ * compress IPv6 and convert IDN hosts. Anything else throws.
+ *
+ * @internal
+ */
+export function htuParts(url: string): [origin: string, path: string] {
+  checkHtu(url);
+  const bare = url.split(/[?#]/, 1)[0];
+  const sep = bare.indexOf("://");
+  const scheme = sep < 0 ? "" : bare.slice(0, sep).toLowerCase();
+  if (!Object.hasOwn(HTU_DEFAULT_PORTS, scheme)) {
+    throw new Error(HTU_NOT_ABSOLUTE);
+  }
+  const rest = bare.slice(sep + 3);
+  const slash = rest.indexOf("/");
+  const authority = slash < 0 ? rest : rest.slice(0, slash);
+  const path = slash < 0 ? "" : rest.slice(slash);
+  const hostport = authority.slice(authority.lastIndexOf("@") + 1);
+  let host: string;
+  let port = "";
+  if (hostport.startsWith("[")) {
+    const close = hostport.indexOf("]");
+    const literal = close < 0 ? "" : hostport.slice(1, close);
+    const after = close < 0 ? "" : hostport.slice(close + 1);
+    if (!literal.includes(":") || !/^[0-9A-Fa-f:.]*$/.test(literal) || (after !== "" && after[0] !== ":")) {
+      throw new Error(HTU_HOST);
+    }
+    host = `[${literal.toLowerCase()}]`;
+    port = after.slice(1);
+  } else {
+    const colon = hostport.indexOf(":");
+    host = colon < 0 ? hostport : hostport.slice(0, colon);
+    port = colon < 0 ? "" : hostport.slice(colon + 1);
+    if (host === "") {
+      throw new Error(HTU_NOT_ABSOLUTE);
+    }
+    if (!/^[A-Za-z0-9\-._~]+$/.test(host)) {
+      throw new Error(HTU_HOST);
+    }
+    host = host.toLowerCase();
+  }
+  if (port !== "") {
+    const digits = port.replace(/^0+/, "");
+    if (!/^[0-9]+$/.test(port) || digits.length > 5 || Number(digits) > 65535) {
+      throw new Error(HTU_PORT);
+    }
+    const n = String(Number(digits));
+    if (n !== HTU_DEFAULT_PORTS[scheme]) {
+      host += `:${n}`;
+    }
+  }
+  return [`${scheme}://${host}`, encodeHtuPath(path)];
+}
+
+/**
+ * `path` with every non-ASCII character percent-encoded as UTF-8 (upper-case hex) and every ASCII
+ * character kept as written, `%XX` escapes, a lone `%` and characters outside RFC 3986 `pchar` included:
+ * those are what the HTTP client sends, and a server compares `htu` after RFC 3986 section 6.2.2
+ * normalisation, which decodes only unreserved characters. (`checkHtu` has already refused controls,
+ * whitespace and backslash.) A lone surrogate is refused.
+ */
+function encodeHtuPath(path: string): string {
+  try {
+    return path.replace(/[^\x00-\x7f]+/g, (run) => encodeURIComponent(run)); // throws on a lone surrogate
+  } catch {
+    throw new Error(HTU_PATH);
+  }
+}
+
+/**
+ * The DPoP `htu` for a URL (RFC 9449 section 4.2): the origin and path {@link htuParts} gives. A URL
+ * with no path keeps none (no slash is invented).
  *
  * @internal
  */
 export function normalizeHtu(url: string): string {
-  const bare = url.split(/[?#]/, 1)[0];
-  let parsed: URL;
-  try {
-    parsed = new URL(bare);
-  } catch {
-    return bare;
-  }
-  const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]*\//i.test(bare);
-  return `${parsed.protocol}//${parsed.host}${hasPath ? parsed.pathname : ""}`;
+  const [origin, path] = htuParts(url);
+  return origin + path;
 }

@@ -8,17 +8,26 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/id-partners/client-attestation-sdk/go/internal/netpolicy"
 )
 
 // Every outbound HTTP call the SDK makes goes through doRequest so that it behaves the same way
 // everywhere: it always has a timeout, never follows a redirect (requests carry credentials —
 // Authorization, DPoP, OAuth-Client-Attestation, X-Vault-Token headers and SVIDs in bodies), and reads
-// at most a bounded response body.
+// at most a bounded response body. It refuses a URL with userinfo, and errors name a URL without its
+// userinfo or query. A client the SDK builds, or a caller's client without a Transport, uses
+// netpolicy.Transport: an environment proxy only for https to a remote host (see package netpolicy).
+
+// fallbackTimeout is safeClient's timeout when its caller passes none: an SDK request is never unbounded.
+const fallbackTimeout = 20 * time.Second
 
 // defaultMaxResponseBytes caps every response body the SDK reads (1 MiB).
 const defaultMaxResponseBytes int64 = 1 << 20
 
-// maxErrorBodyBytes caps how much of a non-2xx response body is carried in an error.
+// maxErrorBodyBytes caps how much of a non-2xx response body is carried in an error. A 2xx body is never
+// carried: that is where access tokens, attestations and SVIDs travel, so an error about a 2xx response
+// that could not be read (malformed, or missing a member) leaves Body empty.
 const maxErrorBodyBytes = 512
 
 // httpResult is a fully read (and size-capped) HTTP response.
@@ -45,13 +54,23 @@ func refuseRedirect(req *http.Request, _ []*http.Request) error {
 
 // safeClient returns the client to use for SDK requests. A nil client yields a fresh one with
 // defaultTimeout. A caller-supplied client is copied without mutation. SDK calls always refuse
-// redirects, including when the caller's client has a redirect policy that permits them.
+// redirects, including when the caller's client has a redirect policy that permits them. A client
+// without a Transport gets netpolicy.Transport rather than http.DefaultTransport, whose
+// ProxyFromEnvironment would send plain http (a vault token, say) to HTTP_PROXY. The result always has a
+// positive Timeout: a client whose Timeout is zero or negative gets defaultTimeout, and a defaultTimeout
+// that isn't positive is replaced by fallbackTimeout.
 func safeClient(client *http.Client, defaultTimeout time.Duration) *http.Client {
+	if defaultTimeout <= 0 {
+		defaultTimeout = fallbackTimeout
+	}
 	if client == nil {
-		return &http.Client{Timeout: defaultTimeout, CheckRedirect: refuseRedirect}
+		return &http.Client{Timeout: defaultTimeout, CheckRedirect: refuseRedirect, Transport: netpolicy.Transport}
 	}
 	cp := *client
 	cp.CheckRedirect = refuseRedirect
+	if cp.Transport == nil {
+		cp.Transport = netpolicy.Transport
+	}
 	if cp.Timeout <= 0 {
 		cp.Timeout = defaultTimeout
 	}
@@ -68,29 +87,33 @@ func doRequest(ctx context.Context, client *http.Client, method, target string, 
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxResponseBytes
 	}
+	shown := netpolicy.Display(target)
+	if netpolicy.HasUserinfo(target) {
+		return nil, &ClientAttestationError{Message: fmt.Sprintf("%s %s: %v", method, shown, netpolicy.ErrUserinfo)}
+	}
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, reader)
 	if err != nil {
-		return nil, err
+		return nil, netpolicy.RedactError(err)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, netpolicy.RedactError(err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
-		return nil, &ClientAttestationError{Message: fmt.Sprintf("reading response from %s %s: %v", method, target, err), Status: resp.StatusCode}
+		return nil, &ClientAttestationError{Message: fmt.Sprintf("reading response from %s %s: %v", method, shown, err), Status: resp.StatusCode}
 	}
 	if int64(len(raw)) > maxBytes {
 		return nil, &ClientAttestationError{
-			Message: fmt.Sprintf("response from %s %s exceeds %d bytes", method, target, maxBytes),
+			Message: fmt.Sprintf("response from %s %s exceeds %d bytes", method, shown, maxBytes),
 			Status:  resp.StatusCode,
 		}
 	}
@@ -99,7 +122,8 @@ func doRequest(ctx context.Context, client *http.Client, method, target string, 
 
 // decodeJSONOK fails with a *ClientAttestationError on a non-2xx status (carrying the status and at most
 // maxErrorBodyBytes of the body), otherwise decodes the body into v (skipped when v is nil). A body that
-// is not valid JSON is a *ClientAttestationError too. what names the call in messages ("GET https://…").
+// is not valid JSON is a *ClientAttestationError too, without the body. what names the call in messages
+// ("GET https://…").
 func decodeJSONOK(res *httpResult, what string, v any) error {
 	if !res.ok() {
 		return &ClientAttestationError{
@@ -112,7 +136,7 @@ func decodeJSONOK(res *httpResult, what string, v any) error {
 		return nil
 	}
 	if err := json.Unmarshal(res.Body, v); err != nil {
-		return &ClientAttestationError{Message: fmt.Sprintf("%s returned unparseable JSON: %v", what, err), Body: truncateBody(res.Body)}
+		return &ClientAttestationError{Message: fmt.Sprintf("%s returned unparseable JSON: %v", what, err)}
 	}
 	return nil
 }

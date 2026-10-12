@@ -12,6 +12,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.regex.Pattern;
 import org.jose4j.json.JsonUtil;
 
 /**
@@ -24,6 +25,10 @@ import org.jose4j.json.JsonUtil;
  * derive the public JWK and compute its RFC 7638 thumbprint {@code kid}; signatures then always request
  * that pinned version so a concurrent key rotation cannot make the emitted {@code kid} lie.
  *
+ * <p>The vault address must be https unless its host is loopback ({@code localhost}, {@code 127.0.0.1},
+ * {@code ::1}) or {@code allowInsecure} is set: the vault token rides on every call, and the public key read
+ * from the vault becomes the attester's published JWK.
+ *
  * <p>Dependency-free (JDK {@link HttpClient}). Instances are immutable after initialization and safe to
  * share. Vault errors surface as {@link IllegalStateException} with the HTTP status.
  *
@@ -33,6 +38,8 @@ import org.jose4j.json.JsonUtil;
 public final class OpenBaoTransitSigner implements JwsSigner {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
+    /** The key name goes into the request path, so "/", "?", "#", "%" and dot segments are refused. */
+    private static final Pattern KEY_NAME = Pattern.compile("[A-Za-z0-9_.-]+");
 
     private final HttpClient http;
     private final String baseUrl;
@@ -45,15 +52,37 @@ public final class OpenBaoTransitSigner implements JwsSigner {
     private final Map<String, Object> publicJwk;
 
     /**
-     * @param baoAddr address of the vault, e.g. {@code http://openbao.railway.internal:8200}
+     * @param baoAddr address of the vault, e.g. {@code https://openbao.example:8200}; https unless loopback
      * @param token   a token permitted to read {@code transit/keys/<keyName>} and write {@code transit/sign/<keyName>}
      * @param keyName the transit key name, e.g. {@code attestation-es256}
+     * @throws ClientAttestation.ClientAttestationException if {@code baoAddr} is not https and not loopback
+     * @throws IllegalArgumentException if {@code keyName} has characters other than letters, digits,
+     *                                  {@code _}, {@code .} and {@code -}, or is {@code .} or {@code ..}
      */
     public OpenBaoTransitSigner(String baoAddr, String token, String keyName) {
-        this.http = HttpTransport.client(TIMEOUT);
+        this(baoAddr, token, keyName, false);
+    }
+
+    /**
+     * A signer that, with {@code allowInsecure}, also accepts a plain-http {@code baoAddr} on a host that is
+     * not loopback. The vault token then travels in cleartext.
+     *
+     * @param baoAddr       address of the vault
+     * @param token         a token permitted to read {@code transit/keys/<keyName>} and write
+     *                      {@code transit/sign/<keyName>}
+     * @param keyName       the transit key name
+     * @param allowInsecure allow plain http to a host that is not loopback (default {@code false})
+     */
+    public OpenBaoTransitSigner(String baoAddr, String token, String keyName, boolean allowInsecure) {
         this.baseUrl = Objects.requireNonNull(baoAddr, "baoAddr").replaceAll("/+$", "");
         this.token = Objects.requireNonNull(token, "token");
         this.keyName = Objects.requireNonNull(keyName, "keyName");
+        ClientAttestation.requireSecure(this.baseUrl, "baoAddr", allowInsecure);
+        if (!KEY_NAME.matcher(keyName).matches() || keyName.equals(".") || keyName.equals("..")) {
+            throw new IllegalArgumentException("Invalid transit key name '" + keyName
+                    + "': use only letters, digits, '_', '.' and '-'");
+        }
+        this.http = HttpTransport.client(TIMEOUT);
 
         Map<String, Object> data = data(this.get("/v1/transit/keys/" + keyName));
         String keyType = data.get("type") instanceof String t ? t : null;
@@ -78,6 +107,15 @@ public final class OpenBaoTransitSigner implements JwsSigner {
             throw new IllegalStateException("Transit key metadata carried no keys entry for version " + this.keyVersion);
         }
         this.publicJwk = toEcJwk(latest.get("public_key") instanceof String pem ? pem : null);
+        String expectedCurve = switch (this.algorithm) {
+            case "ES256" -> "P-256";
+            case "ES384" -> "P-384";
+            default -> "P-521";
+        };
+        if (!expectedCurve.equals(this.publicJwk.get("crv"))) {
+            throw new IllegalStateException("Transit key '" + keyName + "' is type " + keyType
+                    + " but its public key is on " + this.publicJwk.get("crv"));
+        }
         try {
             this.keyId = Jwks.thumbprint(this.publicJwk);
         } catch (Exception e) {

@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
@@ -84,7 +85,8 @@ func TestFromJWKAcceptsBytesAndString(t *testing.T) {
 	}
 }
 
-func TestFromJWKAcceptsOKPPrivateKey(t *testing.T) {
+func TestFromJWKRefusesOKPPrivateKey(t *testing.T) {
+	// The SDK signs with ES*, RS* and PS* only, as every port does; an Ed25519 key is refused.
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -97,16 +99,11 @@ func TestFromJWKAcceptsOKPPrivateKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kp, err := FromJWK(b, "EdDSA")
-	if err != nil {
-		t.Fatalf("FromJWK(OKP): %v", err)
+	if _, err := FromJWK(b, "EdDSA"); err == nil || !strings.Contains(err.Error(), "unsupported signing algorithm") {
+		t.Errorf("FromJWK(OKP, EdDSA): err = %v", err)
 	}
-	pub := kp.PublicJWK()
-	if pub["kty"] != "OKP" || pub["crv"] != "Ed25519" {
-		t.Errorf("public JWK = %v", pub)
-	}
-	if _, hasD := pub["d"]; hasD {
-		t.Error("public JWK leaks private component d")
+	if _, err := FromJWK(b, "ES256"); err == nil || !strings.Contains(err.Error(), "EC or RSA") {
+		t.Errorf("FromJWK(OKP, ES256): err = %v", err)
 	}
 }
 
@@ -175,15 +172,8 @@ func TestSignCompactErrors(t *testing.T) {
 		t.Error("unmarshalable claims: expected an error")
 	}
 
-	// An EC key declared as RS256 must fail inside jws.Sign.
-	privJSON, err := json.Marshal(kp.privateKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mismatched, err := FromJWK(privJSON, "RS256")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// An EC key declared as RS256 (which FromJWK refuses) must fail inside jws.Sign.
+	mismatched := &SigningKeyPair{privateKey: kp.privateKey, algorithm: "RS256", keyID: kp.KeyID(), publicJWK: kp.PublicJWK()}
 	if _, err := mismatched.signCompact(map[string]any{"a": 1}, "t", false); err == nil {
 		t.Error("alg/key mismatch: expected a signing error")
 	}

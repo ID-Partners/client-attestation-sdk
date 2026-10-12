@@ -12,10 +12,12 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	tv "github.com/id-partners/client-attestation-sdk/go/tokenvalidator"
 )
 
+// A local demo: in production serve over TLS, with an https resource URI.
 const (
 	resourceURI = "http://localhost:8770" // this server's canonical URI (RFC 8707) — the token audience
 	issuer      = "https://issuer.example.com"
@@ -51,7 +53,15 @@ func main() {
 	})
 
 	log.Println("protected resource on", resourceURI)
-	log.Fatal(http.ListenAndServe(":8770", nil))
+	server := &http.Server{
+		Addr:              "127.0.0.1:8770", // loopback only
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	log.Fatal(server.ListenAndServe())
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

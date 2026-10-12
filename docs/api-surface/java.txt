@@ -5,6 +5,7 @@ public final class AttestationIssuanceClient {
   public AttestationIssuanceClient(String, String, String, SvidSource);
   public AttestationIssuanceClient(String, String, String, SvidSource, SigningKeyPair);
   public AttestationIssuanceClient(String, String, String, SvidSource, SigningKeyPair, AttesterProfile);
+  public AttestationIssuanceClient(String, String, String, SvidSource, SigningKeyPair, AttesterProfile, boolean);
   public SigningKeyPair instanceKey();
   public static final String INSTANCE_PROOF_TYP;
 }
@@ -65,6 +66,7 @@ public final class ClientAttestation$Builder {
   public ClientAttestation$Builder authorizationDetails(java.util.List<java.util.Map<String, Object>>);
   public ClientAttestation$Builder challengeAtToken(boolean);
   public ClientAttestation$Builder evidence(SvidSource);
+  public ClientAttestation$Builder evidenceAudience(String);
   public ClientAttestation$Builder expirySkewSeconds(int);
   public ClientAttestation$Builder logger(System$Logger);
   public ClientAttestation$Builder metadata(AttesterMetadata);
@@ -140,7 +142,7 @@ public final class MintRequest extends Record {
   public String evidence();
   public String instanceProof(String, String);
   public String sign(java.util.Map<String, Object>, String);
-  public final String toString();
+  public String toString();
   public final boolean equals(Object);
   public final int hashCode();
   public java.util.List<java.util.Map<String, Object>> authorizationDetails();
@@ -150,12 +152,13 @@ public final class MintResult extends Record {
   public Long expiresIn();
   public MintResult(String, Long);
   public String attestation();
-  public final String toString();
+  public String toString();
   public final boolean equals(Object);
   public final int hashCode();
 }
 public final class OpenBaoTransitSigner implements JwsSigner {
   public OpenBaoTransitSigner(String, String, String);
+  public OpenBaoTransitSigner(String, String, String, boolean);
   public String algorithm();
   public String keyId();
   public byte[] sign(byte[]);
@@ -262,6 +265,8 @@ public final class tokenvalidator.AuthDecision {
 }
 public final class tokenvalidator.Discovery {
   public static java.util.Map<String, Object> discover(String);
+  public static java.util.Map<String, Object> discover(String, String, tokenvalidator.AccessTokenValidator$HttpGet);
+  public static java.util.Map<String, Object> discover(String, String, tokenvalidator.AccessTokenValidator$HttpGet, boolean);
   public static java.util.Map<String, Object> discover(String, tokenvalidator.AccessTokenValidator$HttpGet);
 }
 public final class tokenvalidator.ErrorCodes {
@@ -303,6 +308,7 @@ public final class tokenvalidator.ProtectedResource {
   public static String bearerToken(String);
   public tokenvalidator.AuthDecision authenticate(String);
   public tokenvalidator.AuthDecision authenticate(String, java.util.List<String>);
+  public tokenvalidator.AuthDecision authenticateActive(String, java.util.List<String>);
   public tokenvalidator.ProtectedResource(String, java.util.List<String>, tokenvalidator.AccessTokenValidator);
   public tokenvalidator.ProtectedResource(String, java.util.List<String>, tokenvalidator.AccessTokenValidator, java.util.List<String>);
 }
@@ -320,6 +326,7 @@ public final class tokenvalidator.ValidationResult {
 public final class tokenvalidator.ValidatorConfig {
   public String issuer();
   public String jwksUri();
+  public boolean allowInsecure();
   public int leewaySeconds();
   public java.util.List<String> acceptedAlgorithms();
   public java.util.List<String> acceptedTokenTypes();
@@ -338,6 +345,7 @@ public final class tokenvalidator.ValidatorConfig$Builder {
   public tokenvalidator.ValidatorConfig$Builder acceptedAlgorithms(java.util.List<String>);
   public tokenvalidator.ValidatorConfig$Builder acceptedTokenTypes(String...);
   public tokenvalidator.ValidatorConfig$Builder acceptedTokenTypes(java.util.List<String>);
+  public tokenvalidator.ValidatorConfig$Builder allowInsecure(boolean);
   public tokenvalidator.ValidatorConfig$Builder audiences(String...);
   public tokenvalidator.ValidatorConfig$Builder audiences(java.util.List<String>);
   public tokenvalidator.ValidatorConfig$Builder disableTokenTypeCheck();

@@ -3,10 +3,18 @@
  * and the DPoP-combined proof (`.dpop`) — both signed by the instance key the issuance endpoint
  * bound into the minted attestation.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { decodeJwt, decodeProtectedHeader } from "jose";
 
-import { IssuedAttestation, SigningKeyPair } from "../src/index.js";
+import {
+  AttestationIssuanceClient,
+  type AttesterProfile,
+  ClientAttestationError,
+  IssuedAttestation,
+  type MintResult,
+  SigningKeyPair,
+  StaticSvidSource,
+} from "../src/index.js";
 
 const AUDIENCE = "https://as.example.com";
 const TOKEN_ENDPOINT = "https://as.example.com/as/token.oauth2";
@@ -51,5 +59,82 @@ describe("IssuedAttestation.dpop", () => {
     const dpop = await issued.dpop("POST", TOKEN_ENDPOINT);
     const claims = decodeJwt(dpop);
     expect(claims.nonce).toBeUndefined();
+  });
+});
+
+describe("AttestationIssuanceClient https rule", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Answers every request with a minted attestation and records where it went, with no network. */
+  function recordFetch(): string[] {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        urls.push(String(url));
+        return new Response(JSON.stringify({ attestation: "h.p.s", client_attestation: "h.p.s" }), { status: 200 });
+      }),
+    );
+    return urls;
+  }
+
+  /** Mints through the transport at a URL of its own choosing, as a custom profile may. */
+  const offsite = (target: string): AttesterProfile => ({
+    discover: async () => {
+      throw new Error("not used");
+    },
+    mint: async (transport, _metadata, request) => {
+      const res = await transport.requestJson("mint", "POST", target, { evidence: request.evidence });
+      return { attestation: res.client_attestation as string };
+    },
+  });
+
+  const client = (endpoint: string, opts?: Parameters<typeof AttestationIssuanceClient.create>[4]) =>
+    AttestationIssuanceClient.create(endpoint, "client-1", "https://attester.example", new StaticSvidSource("svid"), opts);
+
+  it("refuses a plain-http endpoint at construction", async () => {
+    const urls = recordFetch();
+    const err = await client("http://pf.example/federation/attestation").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClientAttestationError);
+    expect((err as Error).message).toContain("endpoint must use https");
+    expect(urls).toEqual([]);
+  });
+
+  it("allows https and loopback endpoints", async () => {
+    const urls = recordFetch();
+    expect((await (await client("https://pf.example/federation/attestation")).bootstrap()).attestation).toBe("h.p.s");
+    expect((await (await client("http://127.0.0.1:9031/federation/attestation")).bootstrap()).attestation).toBe("h.p.s");
+    expect(urls).toEqual(["https://pf.example/federation/attestation", "http://127.0.0.1:9031/federation/attestation"]);
+  });
+
+  it("keeps the https rule for a custom profile's calls", async () => {
+    const urls = recordFetch();
+    const c = await client("https://pf.example/federation/attestation", { profile: offsite("http://attester.example/mint") });
+    await expect(c.bootstrap()).rejects.toThrow("must use https");
+    expect(urls).toEqual([]);
+  });
+
+  it("lifts the https rule with allowInsecure", async () => {
+    const urls = recordFetch();
+    await (await client("http://pf.example/federation/attestation", { allowInsecure: true })).bootstrap();
+    const c = await client("http://pf.example/federation/attestation", {
+      allowInsecure: true,
+      profile: offsite("http://attester.example/mint"),
+    });
+    expect((await c.bootstrap()).attestation).toBe("h.p.s");
+    expect(urls).toEqual(["http://pf.example/federation/attestation", "http://attester.example/mint"]);
+  });
+
+  it.each([undefined, null, { attestation: "" }])("rejects a profile that mints %j", async (result) => {
+    const empty: AttesterProfile = {
+      discover: async () => {
+        throw new Error("not used");
+      },
+      mint: async () => result as unknown as MintResult,
+    };
+    const c = await client("https://pf.example/federation/attestation", { profile: empty });
+    const err = await c.bootstrap().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClientAttestationError);
+    expect((err as Error).message).toBe("attester response contained no attestation");
   });
 });

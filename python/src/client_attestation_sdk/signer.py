@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Protocol, runtime_checkable
 
 from . import _http
 from .errors import TransportError
-from .keys import _b64url, _thumbprint
+from .keys import _SIGNING_ALGORITHMS, _b64url, _thumbprint
 
 
 @runtime_checkable
@@ -25,22 +26,42 @@ class JwsSigner(Protocol):
     def sign(self, signing_input: bytes) -> bytes: ...
 
 
+# The length of a raw r||s JWS signature for each ECDSA algorithm.
+_EC_SIGNATURE_BYTES = {"ES256": 64, "ES384": 96, "ES512": 132}
+
+
 def _sign_external(claims: dict, signer: "JwsSigner", typ: str) -> str:
     """Assemble a compact JWS whose signature is produced by an external signer. The header carries the
-    signer's ``kid`` (external signers hold issuing keys, referenced by id, never an embedded jwk)."""
-    header = {"alg": signer.algorithm, "typ": typ, "kid": signer.key_id}
+    signer's ``kid`` (external signers hold issuing keys, referenced by id, never an embedded jwk). The
+    signer's algorithm must be one the SDK signs with (never ``none``), and its signature must not be empty
+    and, for ES*, must be the fixed-width ``r||s`` (not DER, not truncated)."""
+    alg = signer.algorithm
+    if alg not in _SIGNING_ALGORITHMS:
+        raise ValueError(f"external signer algorithm {alg!r} is not allowed: "
+                         "use ES256/384/512, RS256/384/512 or PS256/384/512")
+    header = {"alg": alg, "typ": typ, "kid": signer.key_id}
     signing_input = (
         _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
         + "."
         + _b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
     )
     signature = signer.sign(signing_input.encode("ascii"))
+    if not signature:
+        raise ValueError("external signer returned an empty signature")
+    want = _EC_SIGNATURE_BYTES.get(alg)
+    if want is not None and len(signature) != want:
+        raise ValueError(f"external signer returned a {len(signature)}-byte {alg} signature; "
+                         f"want the {want}-byte raw r||s")
     return signing_input + "." + _b64url(signature)
 
 
 _KEY_TYPE_ALG = {"ecdsa-p256": "ES256", "ecdsa-p384": "ES384", "ecdsa-p521": "ES512"}
 _ALG_HASH = {"ES256": "sha2-256", "ES384": "sha2-384", "ES512": "sha2-512"}
+_ALG_CURVE = {"ES256": "P-256", "ES384": "P-384", "ES512": "P-521"}
 _CURVE = {"secp256r1": ("P-256", 32), "secp384r1": ("P-384", 48), "secp521r1": ("P-521", 66)}
+# The key name goes into the request path, so "/", "?", "#", "%" and dot segments are refused.
+_KEY_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class OpenBaoTransitSigner:
@@ -52,14 +73,22 @@ class OpenBaoTransitSigner:
     derive the public JWK, and compute its RFC 7638 thumbprint ``kid`` — so a concurrent rotation cannot
     make the emitted ``kid`` lie. Dependency-free (stdlib ``urllib``); fail-closed (vault errors raise).
 
+    ``bao_addr`` must be https unless its host is loopback (``localhost``, ``127.0.0.1``, ``::1``) or
+    ``allow_insecure=True`` is passed: the vault token rides on every call, and the public key read from the
+    vault becomes the attester's published JWK. ``key_name`` may contain only letters, digits, ``_``, ``.``
+    and ``-`` (and is not ``.`` or ``..``).
+
     **Experimental** (see docs/api.md): it is a client for a third-party API and authenticates with a
     static token only; its constructor will change when other auth methods are added.
     """
 
     _TIMEOUT = 5
 
-    def __init__(self, bao_addr: str, token: str, key_name: str):
+    def __init__(self, bao_addr: str, token: str, key_name: str, *, allow_insecure: bool = False):
         self._base = bao_addr.rstrip("/")
+        _http.require_https(self._base, "bao_addr", allow_insecure)
+        if not isinstance(key_name, str) or not _KEY_NAME.fullmatch(key_name) or key_name in (".", ".."):
+            raise ValueError(f"invalid transit key name {key_name!r}: use only letters, digits, '_', '.' and '-'")
         self._token = token
         self._key_name = key_name
         data = self._data(self._request("GET", "/v1/transit/keys/" + key_name))
@@ -74,6 +103,9 @@ class OpenBaoTransitSigner:
         except (KeyError, TypeError, ValueError) as exc:
             raise TransportError(f"OpenBao key metadata for '{key_name}' is malformed") from exc
         self._public_jwk = _ec_jwk_from_pem(public_key_pem)
+        if self._public_jwk["crv"] != _ALG_CURVE[self.algorithm]:
+            raise ValueError(f"transit key '{key_name}' is type {key_type} but its public key is on "
+                             f"{self._public_jwk['crv']}")
         self.key_id = _thumbprint(self._public_jwk)
         self._public_jwk["kid"] = self.key_id
         self._public_jwk["alg"] = self.algorithm
@@ -93,7 +125,9 @@ class OpenBaoTransitSigner:
         if not signature or not isinstance(signature, str):
             raise TransportError("transit sign response carried no signature")
         raw = signature.rsplit(":", 1)[-1]  # envelope: vault:v<n>:<base64url(r||s)>
-        try:
+        if not _BASE64URL.fullmatch(raw):  # urlsafe_b64decode would skip stray characters
+            raise TransportError("transit sign response carried a malformed signature")
+        try:  # still refuses an impossible length (len % 4 == 1)
             return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
         except ValueError as exc:
             raise TransportError("transit sign response carried a malformed signature") from exc

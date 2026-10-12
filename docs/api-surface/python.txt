@@ -2,7 +2,7 @@
 == client_attestation_sdk
 ATTESTATION_HEADER = 'OAuth-Client-Attestation'
 class AttestationIssuanceClient
-  __init__(endpoint, client_id, attester_issuer, svid_source, *, instance_key=None, algorithm='ES256', profile=None)
+  __init__(endpoint, client_id, attester_issuer, svid_source, *, instance_key=None, algorithm='ES256', profile=None, allow_insecure=False)
   def bootstrap(authorization_details=None, challenge=None)
 class AttesterMetadata
   __init__(evidence_audience=None, attestation_endpoint=None, token_endpoint=None, challenge_endpoint=None, pop_audience=None, document=None)
@@ -17,10 +17,10 @@ class AwsWebIdentitySvidSource
   __init__(region=None)
   def fetch(audience)
 class AzureImdsSvidSource
-  __init__(timeout=5.0, client_id=None)
+  __init__(timeout=5.0, client_id=None, *, resource=None)
   def fetch(audience)
 class ClientAttestation
-  __init__(attester_url=None, *, evidence=None, authorization_details=None, operator=None, algorithm='ES256', expiry_skew_seconds=30, timeout=20.0, pop_method='attestation_pop_jwt', challenge_at_token=True, trace=None, trace_redact=True, require_challenge=True, allow_insecure=False, profile=None, metadata=None)
+  __init__(attester_url=None, *, evidence=None, authorization_details=None, operator=None, algorithm='ES256', expiry_skew_seconds=30, timeout=20.0, pop_method='attestation_pop_jwt', challenge_at_token=True, trace=None, trace_redact=True, require_challenge=True, allow_insecure=False, profile=None, metadata=None, evidence_audience=None)
   def attester_metadata()
   def authorization_header(*, force_refresh=False)
   def discovery()
@@ -90,7 +90,7 @@ class MintResult
   __init__(attestation, expires_in=None)
   dataclass fields: attestation, expires_in
 class OpenBaoTransitSigner
-  __init__(bao_addr, token, key_name)
+  __init__(bao_addr, token, key_name, *, allow_insecure=False)
   def public_jwk()
   def sign(signing_input)
 POP_HEADER = 'OAuth-Client-Attestation-PoP'
@@ -154,6 +154,7 @@ class IntrospectionConfig
 class ProtectedResource
   __init__(resource, authorization_servers, validator, scopes_supported=None)
   def authenticate(authorization_header, required_scopes=None)
+  def authenticate_active(authorization_header, required_scopes=None)
   def challenge(error=None, error_description=None)
   def metadata()
   def metadata_path()
@@ -161,9 +162,9 @@ class ProtectedResource
 class ValidationResult
   __init__(valid, *, error=None, error_description=None, subject=None, scopes=None, audience=None, claims=None, expires_at=None)
 class ValidatorConfig
-  __init__(issuer, audiences, *, jwks=None, jwks_uri=None, required_scopes=None, accepted_algorithms=('ES256', 'ES384', 'ES512', 'RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512'), leeway_seconds=60, introspection=None, accepted_token_types=('at+jwt',))
+  __init__(issuer, audiences, *, jwks=None, jwks_uri=None, required_scopes=None, accepted_algorithms=('ES256', 'ES384', 'ES512', 'RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512'), leeway_seconds=60, introspection=None, accepted_token_types=('at+jwt',), allow_insecure=False)
 def bearer_token(authorization_header)
-def discover(metadata_url, http_get=None)
+def discover(metadata_url, http_get=None, *, issuer=None, allow_insecure=False)
 module errors
   EXPIRED = 'expired'
   INACTIVE = 'inactive'
@@ -183,6 +184,8 @@ module errors
 APPROVED = 'approved'
 ASSURANCE_DEVICE_APPROVED = 'device-approved'
 ASSURANCE_WEB_CONSENT = 'app-asserted'
+AUDIENCE_ENDPOINT = 'endpoint'
+AUDIENCE_ISSUER = 'issuer'
 AUTHN = 'authn'
 CHALLENGE_TYPES = ('authn', 'resource_authorisation', 'consent', 'identity_proofing', 'intent')
 CHANNEL_DEVICE = 'device'
@@ -191,9 +194,9 @@ CHANNEL_WEB = 'web_consent'
 CIBA_GRANT = 'urn:openid:params:grant-type:ciba'
 CONSENT = 'consent'
 class Ceremony
-  __init__(code, kind, channel, subject, txn_hash, instruction, initiator, created_at=<factory>, status='pending', assurance=None, attempt=1, ciba=None, consent_url=None, approved_at=None, settle_until=0.0, extra=<factory>, reference=None, consumed_at=None)
+  __init__(code, kind, channel, subject, txn_hash, instruction, initiator, created_at=<factory>, status='pending', assurance=None, attempt=1, ciba=None, consent_url=None, approved_at=None, settle_until=0.0, extra=<factory>, reference=None, consumed_at=None, resolver=None, approved_via=None)
   classmethod from_dict(d)
-  dataclass fields: code, kind, channel, subject, txn_hash, instruction, initiator, created_at, status, assurance, attempt, ciba, consent_url, approved_at, settle_until, extra, reference, consumed_at
+  dataclass fields: code, kind, channel, subject, txn_hash, instruction, initiator, created_at, status, assurance, attempt, ciba, consent_url, approved_at, settle_until, extra, reference, consumed_at, resolver, approved_via
   def is_live(now=None)
   def to_dict()
   property expires_in
@@ -210,7 +213,7 @@ class ChallengeResolver(Protocol)
   def poll(code)
   def resolve(challenge, *, subject, instruction, initiator, binding_message=None)
 class CibaClient
-  __init__(*, bc_auth_endpoint, token_endpoint, client_id, client_auth, issuer, request_signing_key_pem=None, request_signing_kid=None, request_signing_alg='ES256', http=None, clock=<built-in function time>)
+  __init__(*, bc_auth_endpoint, token_endpoint, client_id, client_auth, issuer, request_signing_key_pem=None, request_signing_kid=None, request_signing_alg='ES256', http=None, clock=<built-in function time>, allow_insecure=False)
   def poll(req)
   def request(*, login_hint, binding_message=None, scope='openid', authorization_details=None, extra=None, request_ttl=300)
 class CibaError(Exception)
@@ -233,8 +236,8 @@ class ClientAuth(Protocol)
 DENIED = 'denied'
 EXPIRED = 'expired'
 class Hooks
-  __init__(channel_for=None, already_covered=None, persist=None, rehydrate=None, find_live_persisted=None, register_for_device=None, consent_url_for=None, on_outcome=None, web_status=None, proofing_start=None, proofing_status=None, settle_seconds=3.0, log=Hooks.<lambda>)
-  dataclass fields: channel_for, already_covered, persist, rehydrate, find_live_persisted, register_for_device, consent_url_for, on_outcome, web_status, proofing_start, proofing_status, settle_seconds, log
+  __init__(channel_for=None, already_covered=None, persist=None, rehydrate=None, find_live_persisted=None, register_for_device=None, consent_url_for=None, on_outcome=None, web_status=None, proofing_start=None, proofing_status=None, settle_seconds=3.0, log=Hooks.<lambda>, consume=None)
+  dataclass fields: channel_for, already_covered, persist, rehydrate, find_live_persisted, register_for_device, consent_url_for, on_outcome, web_status, proofing_start, proofing_status, settle_seconds, log, consume
 IDENTITY_PROOFING = 'identity_proofing'
 INTENT = 'intent'
 class MemoryStore
@@ -250,15 +253,15 @@ class Pending
   dataclass fields: code, kind, channel, interval, expires_in, txn_hash, consent_url, detail, attempt, reused, reference
   def to_dict()
 class PollResult
-  __init__(code, status, kind, assurance=None, elapsed=0.0, interval=3, detail=<factory>)
-  dataclass fields: code, status, kind, assurance, elapsed, interval, detail
+  __init__(code, status, kind, assurance=None, elapsed=0.0, interval=3, detail=<factory>, consent_url=None)
+  dataclass fields: code, status, kind, assurance, elapsed, interval, detail, consent_url
   def to_dict()
 class PrivateKeyJwtAuth
-  __init__(client_id, private_key_pem, kid, extra_audiences=(), algorithm='ES256')
-  dataclass fields: client_id, private_key_pem, kid, extra_audiences, algorithm
-  def apply(endpoint, form)
+  __init__(client_id, private_key_pem, kid, extra_audiences=(), algorithm='ES256', issuer=None, audience_mode='issuer')
+  dataclass fields: client_id, private_key_pem, kid, extra_audiences, algorithm, issuer, audience_mode
+  def apply(endpoint, form, *, issuer=None)
 class ProofingResolver
-  __init__(hooks, client=None, store=None, *, code_prefix='MDL', ttl_seconds=300, interval=3, max_attempts=1, attempt_window=600.0, clock=<built-in function time>, max_approval_age=300.0)
+  __init__(hooks, client=None, store=None, *, code_prefix='MDL', ttl_seconds=300, interval=3, max_attempts=1, attempt_window=600.0, clock=<built-in function time>, max_approval_age=300.0, doctypes=())
   def poll(code)
   def resolve(challenge, *, subject, instruction, initiator, binding_message=None, scope='openid')
   def verify_resume(code, *, subject, instruction)
@@ -275,11 +278,12 @@ class Unavailable
   dataclass fields: kind, reason, fallback, detail
   def to_dict()
 class WebConsentResolver
-  __init__(hooks, store=None, *, code_prefix='WEB', ttl_seconds=300, interval=3, clock=<built-in function time>)
+  __init__(hooks, store=None, *, code_prefix='WEB', ttl_seconds=300, interval=3, clock=<built-in function time>, max_approval_age=300.0)
   def poll(code)
   def resolve(challenge, *, subject, instruction, initiator, binding_message=None)
+  def verify_resume(code, *, subject, instruction)
   kinds = ('resource_authorisation', 'identity_proofing')
 def parse_challenge(status=None, headers=None, body=None)
 def parse_www_authenticate(value)
-def private_key_jwt_assertion(*, client_id, endpoint, private_key_pem, kid, extra_audiences=(), ttl=120, algorithm='ES256')
+def private_key_jwt_assertion(*, client_id, endpoint, private_key_pem, kid, extra_audiences=(), ttl=120, algorithm='ES256', issuer=None, audience_mode='issuer')
 def transaction_hash(fields)

@@ -95,7 +95,7 @@ class EvidenceTest {
     void missingEnvSpiffeSocketFailsClosedNamingTheVariable() throws Exception {
         this.env.put(Evidence.ENV_SPIFFE_SOCKET, "unix://" + this.dir.resolve("gone.sock"));
         // A reachable metadata server must not be used as a silent fallback.
-        this.metadata.respond("/computeMetadata/v1/", 200, "");
+        this.metadata.metadata("/computeMetadata/v1/", 200, "");
         Evidence.EvidenceNotFoundException e = assertThrows(Evidence.EvidenceNotFoundException.class,
                 () -> detect(this.metadata.url("/computeMetadata/v1/")));
         assertTrue(e.getMessage().contains(Evidence.ENV_SPIFFE_SOCKET), e.getMessage());
@@ -128,7 +128,7 @@ class EvidenceTest {
 
     @Test
     void reachableMetadataServerSelectsGoogleMetadata() throws Exception {
-        this.metadata.respond("/computeMetadata/v1/", 200, "");
+        this.metadata.metadata("/computeMetadata/v1/", 200, "");
         assertInstanceOf(SvidSource.GoogleMetadata.class, detect(this.metadata.url("/computeMetadata/v1/")));
         assertEquals("Google", this.metadata.lastHeaders.get("/computeMetadata/v1/").getFirst("Metadata-Flavor"));
     }
@@ -139,7 +139,7 @@ class EvidenceTest {
         Path socket = Files.createFile(this.dir.resolve("agent.sock"));
         this.env.put(Evidence.ENV_TOKEN_FILE, file.toString());
         this.env.put(Evidence.ENV_SPIFFE_SOCKET, "unix://" + socket);
-        this.metadata.respond("/computeMetadata/v1/", 200, "");
+        this.metadata.metadata("/computeMetadata/v1/", 200, "");
         SvidSource source = Evidence.autoDetect(this.env::get, this.missingFile, socket.toString(),
                 this.metadata.url("/computeMetadata/v1/"));
         assertInstanceOf(SvidSource.File.class, source);
@@ -152,7 +152,7 @@ class EvidenceTest {
         Path dflt = Files.writeString(this.dir.resolve("default-token"), "default-token");
         Path socket = Files.createFile(this.dir.resolve("agent.sock"));
         this.env.put(Evidence.ENV_SPIFFE_SOCKET, socket.toString());
-        this.metadata.respond("/computeMetadata/v1/", 200, "");
+        this.metadata.metadata("/computeMetadata/v1/", 200, "");
         SvidSource source = Evidence.autoDetect(this.env::get, dflt.toString(), socket.toString(),
                 this.metadata.url("/computeMetadata/v1/"));
         assertInstanceOf(SvidSource.File.class, source);
@@ -163,7 +163,7 @@ class EvidenceTest {
     @Test
     void spireSocketBeatsMetadata() throws Exception {
         Path socket = Files.createFile(this.dir.resolve("default.sock"));
-        this.metadata.respond("/computeMetadata/v1/", 200, "");
+        this.metadata.metadata("/computeMetadata/v1/", 200, "");
         SvidSource source = Evidence.autoDetect(this.env::get, this.missingFile, socket.toString(),
                 this.metadata.url("/computeMetadata/v1/"));
         assertInstanceOf(SvidSource.SpireWorkloadApi.class, source);
@@ -177,7 +177,7 @@ class EvidenceTest {
         this.env.put(Evidence.ENV_SVID, "env-token");
         this.env.put(Evidence.ENV_TOKEN_FILE, file.toString());
         this.env.put(Evidence.ENV_SPIFFE_SOCKET, socket.toString());
-        this.metadata.respond("/computeMetadata/v1/", 200, "");
+        this.metadata.metadata("/computeMetadata/v1/", 200, "");
         SvidSource source = Evidence.autoDetect(this.env::get, file.toString(), socket.toString(),
                 this.metadata.url("/computeMetadata/v1/"));
         assertEquals("env-token", source.fetch("aud"));
@@ -195,17 +195,39 @@ class EvidenceTest {
     @Test
     void metadataProbeTreatsServerErrorsRedirectsAndTimeoutsAsAbsent() {
         Duration t = Duration.ofMillis(300);
-        this.metadata.respond("/err/", 500, "{}");
-        this.metadata.respond("/notfound/", 404, "{}");
-        this.metadata.respond("/target/", 200, "{}");
+        this.metadata.metadata("/err/", 500, "{}");
+        this.metadata.metadata("/notfound/", 404, "{}");
+        this.metadata.metadata("/target/", 200, "{}");
         this.metadata.redirect("/hop/", this.metadata.url("/target/"));
         this.metadata.slow("/slow/", 3000);
 
         assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/err/"), t));
-        assertTrue(Evidence.gcpMetadataAvailable(this.metadata.url("/notfound/"), t));   // a 4xx still means "a server answered"
+        assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/notfound/"), t));
         assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/hop/"), t));
         assertEquals(0, this.metadata.hits("/target/"));
         assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/slow/"), t));
         assertFalse(Evidence.gcpMetadataAvailable("not a url", t));
+    }
+
+    @Test
+    void metadataProbeNeeds200AndTheFlavorHeader() {
+        Duration t = Duration.ofSeconds(2);
+        this.metadata.metadata("/google/", 200, "");
+        this.metadata.respond("/plain/", 200, "");                         // some other host answering the name
+        this.metadata.route("/other/", exchange -> {
+            exchange.getResponseHeaders().set("Metadata-Flavor", "Other");
+            StubHttpServer.send(exchange, 200, "");
+        });
+        this.metadata.metadata("/accepted/", 202, "");
+        assertTrue(Evidence.gcpMetadataAvailable(this.metadata.url("/google/"), t));
+        assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/plain/"), t));
+        assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/other/"), t));
+        assertFalse(Evidence.gcpMetadataAvailable(this.metadata.url("/accepted/"), t));
+    }
+
+    @Test
+    void metadataRequestsNeverUseAProxy() {
+        assertEquals(java.util.Optional.of(java.net.http.HttpClient.Builder.NO_PROXY),
+                Evidence.metadataClient(Duration.ofSeconds(1)).proxy());
     }
 }

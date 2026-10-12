@@ -114,11 +114,32 @@ func (p *ProtectedResource) Challenge(errCode, errDescription string) string {
 // plus any requiredScopes), and return an AuthDecision. Missing/invalid/expired/wrong-audience → 401;
 // insufficient scope → 403.
 func (p *ProtectedResource) Authenticate(authorizationHeader string, requiredScopes []string) AuthDecision {
+	decision, _ := p.guard(authorizationHeader, func(token string) (Result, error) {
+		return p.validator.Validate(token, requiredScopes), nil
+	})
+	return decision
+}
+
+// AuthenticateActive is Authenticate for tokens checked by RFC 7662 introspection (ValidateActive), such
+// as opaque tokens, with the same rules: the response's aud must name this resource, so a response without
+// one is refused (401), and a sender-constrained token (cnf) is refused (401). A failed introspection call
+// is not a verdict: it returns ValidateActive's error, with a zero AuthDecision, and the caller answers it
+// (503, say).
+func (p *ProtectedResource) AuthenticateActive(authorizationHeader string, requiredScopes []string) (AuthDecision, error) {
+	return p.guard(authorizationHeader, func(token string) (Result, error) {
+		return p.validator.ValidateActive(token, requiredScopes)
+	})
+}
+
+func (p *ProtectedResource) guard(authorizationHeader string, validate func(string) (Result, error)) (AuthDecision, error) {
 	token := BearerToken(authorizationHeader)
 	if token == "" {
-		return AuthDecision{Status: 401, WWWAuthenticate: p.Challenge("", ""), ErrorDescription: "authentication required"}
+		return AuthDecision{Status: 401, WWWAuthenticate: p.Challenge("", ""), ErrorDescription: "authentication required"}, nil
 	}
-	result := p.validator.Validate(token, requiredScopes)
+	result, err := validate(token)
+	if err != nil {
+		return AuthDecision{}, err
+	}
 	if result.Valid && !contains(result.Audience, p.Resource) {
 		result = failure(ErrInvalidAudience, "token audience is not this resource")
 	}
@@ -126,7 +147,7 @@ func (p *ProtectedResource) Authenticate(authorizationHeader string, requiredSco
 		result = failure(ErrInvalidToken, "sender-constrained token requires proof verification")
 	}
 	if result.Valid {
-		return AuthDecision{Authorized: true, Result: result, Status: 200}
+		return AuthDecision{Authorized: true, Result: result, Status: 200}, nil
 	}
 	status, oauthErr := resourceHTTPError(result.Error)
 	return AuthDecision{
@@ -135,7 +156,7 @@ func (p *ProtectedResource) Authenticate(authorizationHeader string, requiredSco
 		Error:            oauthErr,
 		ErrorDescription: result.ErrorDescription,
 		WWWAuthenticate:  p.Challenge(oauthErr, result.ErrorDescription),
-	}
+	}, nil
 }
 
 func resourceHTTPError(errCode string) (int, string) {

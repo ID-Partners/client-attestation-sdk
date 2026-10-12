@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +27,16 @@ const DraftRevision = "10"
 // DefaultExpirySkew is how long before actual expiry a cached token is refreshed, so a token is never
 // used at the edge.
 const DefaultExpirySkew = 30 * time.Second
+
+// maxTokenLifetime caps how long a token is cached, whatever expires_in the token endpoint gives.
+const maxTokenLifetime = 24 * time.Hour
+
+// errPinRequired is the error when neither WithEvidenceAudience nor WithAttesterMetadata is given.
+const errPinRequired = "evidence audience is required: set it with WithEvidenceAudience to the audience your " +
+	"attester expects the workload's identity token for, so the attester's discovery document can't choose it"
+
+// numericString is the form of an expires_in sent as a JSON string that is still read as a number.
+var numericString = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 
 // ClientAttestation gets and caches an access token using client attestation.
 //
@@ -45,6 +58,8 @@ type ClientAttestation struct {
 	httpClient           *http.Client
 	requireChallenge     bool
 	allowInsecure        bool
+	evidenceAudience     string // the WithEvidenceAudience pin
+	staticMetadata       bool   // WithAttesterMetadata was given
 	logger               *slog.Logger
 
 	// lock is a 1-buffered channel semaphore guarding the cache and the network flow (single-flight).
@@ -57,9 +72,10 @@ type ClientAttestation struct {
 	expiresAt   time.Time
 	metadata    *AttesterMetadata
 
-	// nonceMu guards nonces: the last DPoP-Nonce each origin returned.
-	nonceMu sync.Mutex
-	nonces  map[string]string
+	// nonceMu guards nonces: the last DPoP-Nonce each origin returned, at most maxDpopNonceOrigins of them.
+	nonceMu  sync.Mutex
+	nonces   map[string]rememberedNonce
+	nonceSeq uint64
 }
 
 // Token types the SDK distinguishes (token_type in the token response, compared case-insensitively).
@@ -124,19 +140,21 @@ func WithPopMethod(method string) Option {
 	}
 }
 
-// WithExpirySkew refreshes the cached token this long before it expires (default 30s).
+// WithExpirySkew refreshes the cached token this long before it expires (default 30s). A negative skew is
+// an error from NewClientAttestation.
 func WithExpirySkew(skew time.Duration) Option {
 	return func(c *ClientAttestation) { c.skew = skew }
 }
 
-// WithTimeout sets the per-request HTTP timeout.
+// WithTimeout sets the per-request HTTP timeout (default 20s). A zero or negative timeout means the default:
+// every SDK request has a timeout.
 func WithTimeout(timeout time.Duration) Option {
 	return func(c *ClientAttestation) { c.timeout = timeout }
 }
 
-// WithHTTPClient supplies a custom *http.Client. It is never mutated: when it has no CheckRedirect the
-// SDK uses a shallow copy that refuses redirects, and when it has no Timeout the copy gets the
-// WithTimeout value (default 20s). A non-zero Timeout is honored as-is.
+// WithHTTPClient supplies a custom *http.Client. It is never mutated: the SDK uses a shallow copy whose
+// CheckRedirect always refuses redirects (whatever the client's own policy), and when it has no positive
+// Timeout the copy gets the WithTimeout value (default 20s). A positive Timeout is honored as-is.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *ClientAttestation) { c.httpClient = client }
 }
@@ -163,6 +181,17 @@ func WithAttesterMetadata(metadata AttesterMetadata) Option {
 	return func(c *ClientAttestation) { c.metadata = &metadata }
 }
 
+// WithEvidenceAudience pins the audience the workload's platform identity token is requested for, which
+// the attester's discovery document must name. It is required unless WithAttesterMetadata is given: every
+// evidence source (GCP, AWS, Azure, SPIRE) fetches a token for whatever audience it is asked for, so
+// without a pin an attester could have the workload mint a token for another service that trusts it. A
+// missing pin or a different discovered audience is a *ClientAttestationError before any evidence is
+// fetched. With WithAttesterMetadata the pin is optional and, when given, must match the metadata's
+// EvidenceAudience.
+func WithEvidenceAudience(audience string) Option {
+	return func(c *ClientAttestation) { c.evidenceAudience = audience }
+}
+
 // WithAllowInsecure permits plain-http attesterURL and discovery endpoints on non-loopback hosts. Without it
 // every such URL must be https (localhost, 127.0.0.1 and ::1 are always allowed).
 func WithAllowInsecure() Option {
@@ -172,7 +201,7 @@ func WithAllowInsecure() Option {
 // NewClientAttestation builds a token source aimed at attesterURL — "pf.example.com", or a full base URL
 // "https://pf.example.com". Plain hostnames default to https. An http:// host is refused unless it is
 // loopback or WithAllowInsecure() is given. attesterURL may be "" when WithAttesterMetadata or
-// WithAttesterProfile is given.
+// WithAttesterProfile is given. A client that discovers its attester also needs WithEvidenceAudience.
 func NewClientAttestation(attesterURL string, opts ...Option) (*ClientAttestation, error) {
 	c := &ClientAttestation{
 		algorithm:        "ES256",
@@ -185,6 +214,13 @@ func NewClientAttestation(attesterURL string, opts ...Option) (*ClientAttestatio
 	customProfile := false
 	for _, opt := range opts {
 		opt(c)
+	}
+	c.staticMetadata = c.metadata != nil
+	if c.skew < 0 {
+		return nil, fmt.Errorf("expiry skew must not be negative, got %v", c.skew)
+	}
+	if c.timeout <= 0 {
+		c.timeout = 20 * time.Second // zero or negative means the default, never "no timeout"
 	}
 	if c.profile == nil {
 		c.profile = PingFederateProfile{}
@@ -292,8 +328,8 @@ func (c *ClientAttestation) tokenState(ctx context.Context, opts ...TokenOption)
 	c.cachedToken = response.AccessToken
 	c.boundKey = instanceKey
 	c.tokenType = normalizeTokenType(response.TokenType)
-	if response.ExpiresIn > 0 {
-		c.expiresAt = time.Now().Add(time.Duration(response.ExpiresIn)*time.Second - c.skew)
+	if lifetime, ok := response.lifetime(); ok {
+		c.expiresAt = time.Now().Add(lifetime - c.skew)
 	} else {
 		c.expiresAt = time.Time{}
 	}
@@ -308,15 +344,37 @@ func (c *ClientAttestation) tokenState(ctx context.Context, opts ...TokenOption)
 //     key the token is bound to, with htm = method, htu = url (no query/fragment), a fresh jti and iat,
 //     ath = hash of the token, and nonce = the last DPoP-Nonce that url's origin returned, if any.
 //
-// Build headers per request: a DPoP proof is single-use. RoundTripper does this for you, including the
-// one retry on a use_dpop_nonce challenge.
+// url must be https, as for every other URL the client sends a credential to (loopback hosts and
+// WithAllowInsecure() excepted). Build headers per request: a DPoP proof is single-use. RoundTripper does
+// this for you, including the one retry on a use_dpop_nonce challenge. Pass the exact URL the HTTP client
+// will send: a url with a backslash, ASCII whitespace or a control character before its query or fragment
+// is refused with a *ClientAttestationError, since URL parsers disagree on where such a URL goes. For a
+// DPoP-bound token, so is a url that is not an absolute http(s) URL with a valid ASCII host, port and path;
+// a client configured with PopMethodDpopCombined checks that before fetching the token. The path is
+// signed as written, so build the request first and pass req.URL.String(): net/http may escape characters
+// (a "{", say) that a hand-written url leaves as they are.
 func (c *ClientAttestation) RequestHeaders(ctx context.Context, method, url string) (map[string]string, error) {
-	headers, _, err := c.requestHeaders(ctx, method, url)
+	headers, _, err := c.requestHeaders(ctx, method, url, nil)
 	return headers, err
 }
 
-func (c *ClientAttestation) requestHeaders(ctx context.Context, method, target string, opts ...TokenOption) (map[string]string, bool, error) {
-	state, err := c.tokenState(ctx, opts...)
+// requestHeaders is RequestHeaders, also reporting whether the token is DPoP-bound. The proof carries
+// *nonce when it is given (the nonce of the challenge being answered), else the origin's remembered one.
+func (c *ClientAttestation) requestHeaders(ctx context.Context, method, target string, nonce *string) (map[string]string, bool, error) {
+	if err := c.checkSecure(target); err != nil {
+		return nil, false, err
+	}
+	// A client configured for DPoP checks the whole htu before fetching the token, so a URL with no htu
+	// never costs a mint and token request on a cold cache. Otherwise only what parsers disagree on is
+	// refused up front: a Bearer token carries no htu.
+	check := checkHTU
+	if c.popMethod == PopMethodDpopCombined {
+		check = func(target string) error { _, err := normalizeHTU(target); return err }
+	}
+	if err := check(target); err != nil {
+		return nil, false, &ClientAttestationError{Message: err.Error()}
+	}
+	state, err := c.tokenState(ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -326,11 +384,19 @@ func (c *ClientAttestation) requestHeaders(ctx context.Context, method, target s
 	if state.key == nil {
 		return nil, true, &ClientAttestationError{Message: "DPoP-bound token has no bound instance key"}
 	}
+	// Also for a DPoP token from a client not configured for DPoP (the AS chose the token type).
+	if _, err := normalizeHTU(target); err != nil {
+		return nil, true, &ClientAttestationError{Message: err.Error()}
+	}
+	if nonce == nil {
+		remembered := c.nonceFor(target)
+		nonce = &remembered
+	}
 	proof, err := NewDpopProofBuilder(state.key).
 		Method(method).
 		URI(target).
 		AccessToken(state.token).
-		Nonce(c.nonceFor(target)).
+		Nonce(*nonce).
 		Build()
 	if err != nil {
 		return nil, true, err
@@ -363,7 +429,12 @@ func (c *ClientAttestation) AuthorizationHeaderWithOptions(ctx context.Context, 
 // use_dpop_nonce challenge (401 WWW-Authenticate: DPoP error="use_dpop_nonce", or a 400 JSON error, with
 // a DPoP-Nonce header) it remembers the nonce for the origin and resends once with a new proof. A request
 // body is rewound with req.GetBody; with no GetBody and a non-empty body the challenge is returned as-is.
-// Use RoundTripperOver to supply a base.
+// A request to a non-https URL fails, as for RequestHeaders. Credentials are never sent on a redirect:
+// when an http.Client follows a 3xx, the hop fails with a *ClientAttestationError and the target is not
+// contacted. To see the 3xx instead, set the client's CheckRedirect to return http.ErrUseLastResponse. For a
+// DPoP-bound token, a request whose URL RequestHeaders refuses (one with a non-ASCII host, for instance:
+// give the xn-- form) fails with a *ClientAttestationError without being sent. Use RoundTripperOver to
+// supply a base.
 func (c *ClientAttestation) RoundTripper() http.RoundTripper {
 	return &authRoundTripper{source: c}
 }
@@ -388,9 +459,34 @@ func (c *ClientAttestation) AttesterMetadata(ctx context.Context) (*AttesterMeta
 // ── the flow ────────────────────────────────────────────────────────────────────────────────────────
 
 type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int64  `json:"expires_in"`
-	TokenType   string `json:"token_type"`
+	AccessToken string          `json:"access_token"`
+	ExpiresIn   json.RawMessage `json:"expires_in"`
+	TokenType   string          `json:"token_type"`
+}
+
+// lifetime is how long to cache the token: expires_in as a JSON number, or a string of decimal digits,
+// capped at maxTokenLifetime. Anything else — missing, null, not a number, not finite, zero or negative
+// — reports false, and the token is not cached, as with no expires_in at all.
+func (r *tokenResponse) lifetime() (time.Duration, bool) {
+	raw := strings.TrimSpace(string(r.ExpiresIn))
+	if raw == "" || raw == "null" {
+		return 0, false
+	}
+	if strings.HasPrefix(raw, `"`) {
+		var text string
+		if json.Unmarshal(r.ExpiresIn, &text) != nil || !numericString.MatchString(text) {
+			return 0, false
+		}
+		raw = text
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsInf(seconds, 0) || math.IsNaN(seconds) || seconds <= 0 {
+		return 0, false
+	}
+	if seconds >= maxTokenLifetime.Seconds() {
+		return maxTokenLifetime, true
+	}
+	return time.Duration(seconds * float64(time.Second)), true
 }
 
 // getDiscovery returns the static metadata, or asks the profile to discover it and caches the result.
@@ -426,12 +522,19 @@ func (t clientTransport) RequestJSON(ctx context.Context, step, method, target s
 // runFlow runs the full attestation exchange and returns the token endpoint response together with the
 // instance key the attestation (and so the token) is bound to. Caller holds c.lock.
 func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *SigningKeyPair, error) {
+	if c.evidenceAudience == "" && !c.staticMetadata {
+		return nil, nil, &ClientAttestationError{Message: errPinRequired}
+	}
 	doc, err := c.getDiscovery(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	if doc.EvidenceAudience == "" {
 		return nil, nil, &ClientAttestationError{Message: "attester discovery document has no evidence_audience"}
+	}
+	if c.evidenceAudience != "" && doc.EvidenceAudience != c.evidenceAudience {
+		return nil, nil, &ClientAttestationError{Message: fmt.Sprintf(
+			"the attester asks for evidence for %q, but the evidence audience is %q", doc.EvidenceAudience, c.evidenceAudience)}
 	}
 
 	source := c.evidence
@@ -558,8 +661,14 @@ func (c *ClientAttestation) tokenResult(ctx context.Context, endpoint, clientID 
 	c.log(ctx, slog.LevelInfo, "token.obtained",
 		"host", sdklog.Host(endpoint), "client_id", clientID,
 		"token_type", normalizeTokenType(response.TokenType),
-		"expires_in", sdklog.NonZero(response.ExpiresIn), "pop_method", c.popMethod)
+		"expires_in", sdklog.NonZero(lifetimeSeconds(response)), "pop_method", c.popMethod)
 	return response, nil
+}
+
+// lifetimeSeconds is the cached lifetime in whole seconds, or 0 when the token is not cached.
+func lifetimeSeconds(r *tokenResponse) int64 {
+	lifetime, _ := r.lifetime()
+	return int64(lifetime / time.Second)
 }
 
 // normalizeTokenType maps a token response's token_type to TokenTypeDPoP or TokenTypeBearer.
@@ -666,20 +775,21 @@ func compactSortedJSON(v any) (string, error) {
 // parseTokenResponse turns a token endpoint response into a tokenResponse, or a *ClientAttestationError.
 func parseTokenResponse(res *httpResult) (*tokenResponse, error) {
 	raw := res.Body
-	// The token endpoint's error body (RFC 6749 §5.2 JSON) is carried in full — callers read Body.
+	// The token endpoint's error body (RFC 6749 §5.2 JSON) is carried up to maxErrorBodyBytes. A 2xx body
+	// that can't be used is not carried at all: it may hold the access token.
 	if !res.ok() {
 		return nil, &ClientAttestationError{
 			Message: fmt.Sprintf("token endpoint returned HTTP %d", res.Status),
 			Status:  res.Status,
-			Body:    string(raw),
+			Body:    truncateBody(raw),
 		}
 	}
 	var parsed tokenResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, &ClientAttestationError{Message: "unparseable token endpoint response", Body: string(raw)}
+		return nil, &ClientAttestationError{Message: "unparseable token endpoint response"}
 	}
 	if parsed.AccessToken == "" {
-		return nil, &ClientAttestationError{Message: "token endpoint returned no access_token", Body: string(raw)}
+		return nil, &ClientAttestationError{Message: "token endpoint returned no access_token"}
 	}
 	return &parsed, nil
 }
@@ -717,7 +827,8 @@ func (c *ClientAttestation) getJSON(ctx context.Context, step, method, target st
 }
 
 // ClientAttestationError is returned when a step in the flow fails. Status and Body are set for HTTP
-// failures.
+// failures: Body is at most the first 512 bytes of a non-2xx response, and empty for a 2xx response that
+// could not be used, since that body may hold a credential.
 type ClientAttestationError struct {
 	Message string
 	Status  int
@@ -750,6 +861,13 @@ func (c *ClientAttestation) checkSecure(target string) error {
 	if c.allowInsecure {
 		return nil
 	}
+	return requireSecureURL(target, "WithAllowInsecure()")
+}
+
+// requireSecureURL refuses a non-https URL unless its host is loopback; override names the option that
+// lifts the rule. Shared by every SDK client that sends credentials (see also OpenBaoTransitSigner and
+// AttestationIssuanceClient).
+func requireSecureURL(target, override string) error {
 	u, err := url.Parse(target)
 	if err != nil {
 		return &ClientAttestationError{Message: fmt.Sprintf("invalid URL %q: %v", target, err)}
@@ -758,7 +876,7 @@ func (c *ClientAttestation) checkSecure(target string) error {
 		return nil
 	}
 	return &ClientAttestationError{Message: fmt.Sprintf(
-		"refusing insecure URL %s: https is required for non-loopback hosts (use WithAllowInsecure() to override)", target)}
+		"refusing insecure URL %s: https is required for non-loopback hosts (use %s to override)", target, override)}
 }
 
 func isLoopbackHost(host string) bool {

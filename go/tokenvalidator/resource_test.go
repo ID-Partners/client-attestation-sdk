@@ -2,6 +2,9 @@ package tokenvalidator
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,16 +28,30 @@ func resourceFixture(t *testing.T) *ProtectedResource {
 }
 
 func TestBearerToken(t *testing.T) {
-	cases := map[string]string{
-		"Bearer abc.def": "abc.def",
-		"bearer abc":     "abc",
-		"Basic abc":      "",
-		"":               "",
-		"Bearer ":        "",
+	// validation/bearer.json is shared: the Java, Python and TypeScript tests read the same cases.
+	raw, err := os.ReadFile(filepath.Join("..", "..", "validation", "bearer.json"))
+	if err != nil {
+		t.Fatalf("read bearer cases: %v", err)
 	}
-	for in, want := range cases {
-		if got := BearerToken(in); got != want {
-			t.Errorf("BearerToken(%q) = %q, want %q", in, got, want)
+	var file struct {
+		Cases []struct {
+			Header string  `json:"header"`
+			Token  *string `json:"token"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatalf("parse bearer cases: %v", err)
+	}
+	if len(file.Cases) == 0 {
+		t.Fatal("no bearer cases")
+	}
+	for _, c := range file.Cases {
+		want := ""
+		if c.Token != nil {
+			want = *c.Token
+		}
+		if got := BearerToken(c.Header); got != want {
+			t.Errorf("BearerToken(%q) = %q, want %q", c.Header, got, want)
 		}
 	}
 }
@@ -186,5 +203,63 @@ func TestBearerGuardRefusesConfirmationWithoutProof(t *testing.T) {
 		if !resource.Authenticate("Bearer "+signClaims(t, key, claims), nil).Authorized {
 			t.Fatal("null confirmation must remain a Bearer token")
 		}
+	}
+}
+
+func TestAuthenticateActiveBindsThisResourceAndRefusesConfirmation(t *testing.T) {
+	guard := func(response map[string]any) *ProtectedResource {
+		_, jwks := newTestKey(t, "key")
+		post := func(string, string, map[string]string) (map[string]any, error) {
+			if response == nil {
+				return nil, errors.New("introspection: HTTP 503")
+			}
+			return response, nil
+		}
+		validator, err := New(&Config{
+			Issuer: testIssuer, Audiences: []string{testAudience, "https://other.test"}, JWKS: jwks,
+			Introspection: &IntrospectionConfig{Endpoint: testIssuer + "/introspect", ClientID: "rs", ClientSecret: "secret"},
+		}, WithHTTPPost(post))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resource, err := NewProtectedResource(testAudience, []string{testIssuer}, validator, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resource
+	}
+	active := func(extra map[string]any) map[string]any {
+		m := map[string]any{"active": true, "sub": "agent-1", "aud": testAudience}
+		for k, v := range extra {
+			if v == nil {
+				delete(m, k)
+			} else {
+				m[k] = v
+			}
+		}
+		return m
+	}
+	if d, err := guard(active(nil)).AuthenticateActive("Bearer opaque", nil); err != nil || !d.Authorized {
+		t.Fatalf("active token for this resource refused: %+v %v", d, err)
+	}
+	for _, tc := range []struct {
+		response map[string]any
+		want     string
+	}{
+		{active(map[string]any{"aud": "https://other.test"}), ErrInvalidAudience},
+		{active(map[string]any{"aud": nil}), ErrInvalidAudience},
+		{active(map[string]any{"cnf": map[string]any{"jkt": "bound-key"}}), ErrInvalidToken},
+		{map[string]any{"active": false}, ErrInactive},
+	} {
+		d, err := guard(tc.response).AuthenticateActive("Bearer opaque", nil)
+		if err != nil || d.Authorized || d.Status != 401 || d.Result.Error != tc.want {
+			t.Fatalf("%v: got %+v %v, want 401 %s", tc.response, d, err, tc.want)
+		}
+	}
+	if d, err := guard(active(nil)).AuthenticateActive("", nil); err != nil || d.Status != 401 {
+		t.Fatalf("missing header: %+v %v", d, err)
+	}
+	if _, err := guard(nil).AuthenticateActive("Bearer opaque", nil); err == nil {
+		t.Fatal("a failed introspection call must be an error, not a verdict")
 	}
 }

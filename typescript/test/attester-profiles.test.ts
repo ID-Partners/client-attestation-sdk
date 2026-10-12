@@ -101,7 +101,7 @@ const svid = new StaticSvidSource("svid");
 
 describe("attester profiles", () => {
   it("uses the PingFederate profile by default", async () => {
-    const ca = new ClientAttestation(base, { evidence: svid });
+    const ca = new ClientAttestation(base, { evidence: svid, evidenceAudience: base }); // the PF document names `base`
     expect(await ca.token()).toBe("at-1");
     expect(paths()).toEqual(["/.well-known/client-attester", "/pf/mint", "/token"]);
     const body = bodyOf("/pf/mint");
@@ -113,7 +113,7 @@ describe("attester profiles", () => {
   });
 
   it("gets a token end to end through a custom profile", async () => {
-    const ca = new ClientAttestation(base, { evidence: svid, profile: new AcmeProfile() });
+    const ca = new ClientAttestation(base, { evidence: svid, evidenceAudience: "acme-aud", profile: new AcmeProfile() });
     expect(await ca.token()).toBe("at-1");
     expect(paths()).toEqual(["/acme/config", "/acme/mint", "/token"]);
     const body = bodyOf("/acme/mint");
@@ -148,7 +148,7 @@ describe("attester profiles", () => {
   });
 
   it("takes the attester URL from the options object", async () => {
-    const ca = new ClientAttestation({ attesterUrl: base, evidence: svid });
+    const ca = new ClientAttestation({ attesterUrl: base, evidence: svid, evidenceAudience: base });
     expect(ca.baseUrl).toBe(base);
     expect(await ca.token()).toBe("at-1");
   });

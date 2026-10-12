@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "client-attestation-sdk"
-version = "1.0.1"
+version = "1.1.0"
 description = "Client-side builder SDK for OAuth Attestation-Based Client Authentication"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,8 +25,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "pyjwt>=2.10",  # older to_jwk can drop a leading zero byte from an EC x or y
-    "cryptography>=42",
+    "pyjwt>=2.10.1",  # older to_jwk can drop a leading zero byte from an EC x or y; 2.10.0 has CVE-2024-53861
+    "cryptography>=42.0.4",  # CVE-2024-26130
 ]
 
 [project.urls]
@@ -34,11 +34,11 @@ Homepage = "https://github.com/ID-Partners/client-attestation-sdk"
 Source = "https://github.com/ID-Partners/client-attestation-sdk/tree/main/python"
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-cov>=5"]
+test = ["pytest>=7", "pytest-cov>=5", "requests>=2.32.4", "httpx>=0.24"]  # the libraries the auth helpers plug into
 # Optional integrations. The core never imports these at module load; each is imported only by the
 # feature that needs it.
 httpx = ["httpx>=0.24"]          # ClientAttestation.httpx_auth()
-requests = ["requests>=2.28"]    # ClientAttestation.requests_auth() is a requests auth hook
+requests = ["requests>=2.32.4"]  # ClientAttestation.requests_auth() is a requests auth hook
 aws = ["boto3"]                  # AwsWebIdentitySvidSource (sts:GetWebIdentityToken)
 
 [tool.setuptools.packages.find]

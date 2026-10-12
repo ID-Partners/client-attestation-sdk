@@ -11,6 +11,7 @@ class AttestationIssuanceClient {
     static create(endpoint: string, clientId: string, attesterIssuer: string, source: SvidSource, opts?: {
         instanceKey?: SigningKeyPair;
         profile?: AttesterProfile;
+        allowInsecure?: boolean;
     }): Promise<AttestationIssuanceClient>;
     bootstrap(authorizationDetails?: Array<Record<string, unknown>>, challenge?: string): Promise<IssuedAttestation>;
 }
@@ -84,6 +85,7 @@ interface ClientAttestationOptions {
     attesterUrl?: string;
     profile?: AttesterProfile;
     metadata?: AttesterMetadata;
+    evidenceAudience?: string;
     evidence?: SvidSource;
     authorizationDetails?: Array<Record<string, unknown>>;
     operator?: Record<string, unknown>;
@@ -137,10 +139,10 @@ class IssuanceError extends Error {
     constructor(status: number, body: string);
 }
 class IssuedAttestation {
-    readonly attestation: string;
     readonly expiresIn: number | undefined;
     readonly instanceKey: SigningKeyPair;
     constructor(attestation: string, expiresIn: number | undefined, instanceKey: SigningKeyPair);
+    get attestation(): string;
     pop(audience: string, clientId?: string, challenge?: string): Promise<string>;
     dpop(method: string, uri: string, challenge?: string): Promise<string>;
 }
@@ -160,8 +162,6 @@ interface Logger {
 }
 class MintRequest {
     readonly instanceKey: SigningKeyPair;
-    readonly evidence: string;
-    readonly challenge?: string;
     readonly clientId?: string;
     readonly authorizationDetails?: Array<Record<string, unknown>>;
     readonly operator?: Record<string, unknown>;
@@ -173,6 +173,8 @@ class MintRequest {
         authorizationDetails?: Array<Record<string, unknown>>;
         operator?: Record<string, unknown>;
     });
+    get evidence(): string;
+    get challenge(): string | undefined;
     sign(claims: Record<string, unknown>, typ: string): Promise<string>;
     instanceProof(typ: string, audience: string | undefined): Promise<string>;
 }
@@ -184,7 +186,9 @@ const NOOP_LOGGER: Logger;
 class OpenBaoTransitSigner implements JwsSigner {
     readonly algorithm: string;
     readonly keyId: string;
-    static create(baoAddr: string, token: string, keyName: string): Promise<OpenBaoTransitSigner>;
+    static create(baoAddr: string, token: string, keyName: string, opts?: {
+        allowInsecure?: boolean;
+    }): Promise<OpenBaoTransitSigner>;
     publicJwk(): JWK;
     sign(signingInput: Uint8Array): Promise<Uint8Array>;
 }
@@ -285,6 +289,7 @@ class ProtectedResource {
     metadataUrl(): string;
     challenge(error?: string, errorDescription?: string | null): string;
     authenticate(authorizationHeader?: string | null, requiredScopes?: string[]): Promise<AuthDecision>;
+    authenticateActive(authorizationHeader?: string | null, requiredScopes?: string[]): Promise<AuthDecision>;
 }
 interface ProtectedResourceMetadata {
     resource: string;
@@ -325,6 +330,7 @@ interface ValidatorConfig {
     leewaySeconds?: number;
     introspection?: IntrospectionConfig;
     acceptedTokenTypes?: string[] | null;
+    allowInsecure?: boolean;
 }
 interface ValidatorOptions {
     httpPost?: HttpPost;

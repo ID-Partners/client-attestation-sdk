@@ -107,12 +107,10 @@ class DpopProofBuilderTest {
         assertEquals("http://h.example/r", DpopProofBuilder.normalizeHtu("http://h.example:80/r"));
         assertEquals("https://h.example:8443", DpopProofBuilder.normalizeHtu("https://user@h.example:8443"));
         assertEquals("http://[::1]:9/p", DpopProofBuilder.normalizeHtu("http://[::1]:9/p#f"));
-        assertEquals("ftp://h.example:21/f", DpopProofBuilder.normalizeHtu("ftp://h.example:21/f"));
-        // Not an absolute URL: just cut query / fragment.
-        assertEquals("/relative", DpopProofBuilder.normalizeHtu("/relative?x#y"));
-        assertEquals("/relative", DpopProofBuilder.normalizeHtu("/relative#y?x"));
-        assertEquals("not a url", DpopProofBuilder.normalizeHtu("not a url?q"));
-        assertEquals("plain", DpopProofBuilder.normalizeHtu("plain"));
+        // Not an absolute http(s) URL: refused (vectors/htu.json has the rest).
+        for (String url : new String[] {"ftp://h.example:21/f", "/relative?x#y", "not a url?q", "plain"}) {
+            assertThrows(IllegalArgumentException.class, () -> DpopProofBuilder.normalizeHtu(url), url);
+        }
     }
 
     @Test

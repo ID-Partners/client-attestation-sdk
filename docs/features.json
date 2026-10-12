@@ -6,63 +6,63 @@
     {
       "name": "Getting a token",
       "rows": [
-        {"label": "One-call token source", "sub": "Discover, find the identity, mint, call the token endpoint, cache, force refresh",
+        {"label": "One-call token source", "explainer_label": "Request and refresh access tokens automatically", "sub": "Discover, find the identity, mint, call the token endpoint, cache, force refresh",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "DPoP-combined mode", "sub": "In the one-call flow and the SPIFFE bootstrap",
+        {"label": "DPoP-combined mode", "explainer_label": "Use DPoP for client authentication (DPoP-combined mode)", "sub": "In the one-call flow and the SPIFFE bootstrap",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "DPoP-bound tokens at a resource", "sub": "Per-request proof with ath, nonce retry on use_dpop_nonce",
+        {"label": "DPoP-bound tokens at a resource", "explainer_label": "Use DPoP to prove key possession when calling a service", "sub": "Per-request proof with ath, nonce retry on use_dpop_nonce",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Fail-closed defaults", "sub": "Required challenge, explicit evidence paths, https only",
+        {"label": "Fail-closed defaults", "explainer_label": "Stop when required security checks fail (fail-closed defaults)", "sub": "Required challenge, explicit evidence paths, https only",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Name the operator on the one-call class",
+        {"label": "Name the operator on the one-call class", "explainer_label": "Name the responsible person or organisation when requesting access",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Drop the token-endpoint challenge", "sub": "For attesters that accept a challenge only once",
+        {"label": "Drop the token-endpoint challenge", "explainer_label": "Omit the token-request challenge where the identity service allows it", "sub": "For attesters that accept a challenge only once",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Logging hooks", "sub": "Off by default, one event vocabulary, never a credential (docs/logging.md)",
+        {"label": "Logging hooks", "explainer_label": "Record SDK events without logging credentials", "sub": "Off by default, one event vocabulary, never a credential (docs/logging.md)",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Attester profiles", "sub": "PingFederate by default, static endpoints, or your own (docs/attester-profiles.md)",
+        {"label": "Attester profiles", "explainer_label": "Configure the connection to an attestation issuer (attester profiles)", "sub": "PingFederate by default, static endpoints, or your own (docs/attester-profiles.md)",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Trace every call as curl", "sub": "Credentials redacted unless you turn it off",
+        {"label": "Trace every call as curl", "explainer_label": "Show requests as curl commands for troubleshooting", "sub": "Credentials redacted unless you turn it off",
          "ports": ["python"]},
-        {"label": "Asserted context at mint", "sub": "An unverified discriminator for an attester-side resolver",
+        {"label": "Asserted context at mint", "explainer_label": "Send extra context for the attestation issuer to check", "sub": "An unverified discriminator for an attester-side resolver",
          "ports": ["python"]}
       ]
     },
     {
       "name": "Building credentials",
       "rows": [
-        {"label": "Client Attestation builder", "ports": ["go", "java", "python", "typescript"]},
-        {"label": "PoP JWT and DPoP proof builders", "ports": ["go", "java", "python", "typescript"]},
-        {"label": "ES, RS and PS keys at 256, 384 and 512", "ports": ["go", "java", "python", "typescript"]},
-        {"label": "operator claim on the builder", "code": "operator", "ports": ["go", "java", "python", "typescript"]},
-        {"label": "workload and authorization_details claims", "code": ["workload", "authorization_details"],
+        {"label": "Client Attestation builder", "explainer_label": "Create a Client Attestation", "ports": ["go", "java", "python", "typescript"]},
+        {"label": "PoP JWT and DPoP proof builders", "explainer_label": "Create proof-of-possession JWTs and DPoP proofs", "ports": ["go", "java", "python", "typescript"]},
+        {"label": "ES, RS and PS keys at 256, 384 and 512", "explainer_label": "Choose the digital signature algorithm", "ports": ["go", "java", "python", "typescript"]},
+        {"label": "operator claim on the builder", "explainer_label": "Include the responsible person or organisation in a Client Attestation", "code": "operator", "ports": ["go", "java", "python", "typescript"]},
+        {"label": "workload and authorization_details claims", "explainer_label": "Include application details and requested permissions in a Client Attestation", "code": ["workload", "authorization_details"],
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "External signer", "sub": "OpenBao or Vault transit", "ports": ["go", "java", "python", "typescript"]}
+        {"label": "External signer", "explainer_label": "Sign with a key held in OpenBao or HashiCorp Vault", "sub": "OpenBao or Vault transit", "ports": ["go", "java", "python", "typescript"]}
       ]
     },
     {
       "name": "Evidence and bootstrap",
       "rows": [
-        {"label": "Evidence auto-detect", "sub": "Environment token, token file, SPIRE socket, GCP metadata",
+        {"label": "Evidence auto-detect", "explainer_label": "Find available platform identity evidence automatically", "sub": "Environment token, token file, SPIRE socket, GCP metadata",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Azure IMDS evidence", "ports": ["python"]},
-        {"label": "AWS web-identity evidence", "sub": "Lambda, ECS, EC2, AgentCore", "ports": ["python"]},
-        {"label": "SPIFFE issuance bootstrap", "ports": ["go", "java", "python", "typescript"]}
+        {"label": "Azure IMDS evidence", "explainer_label": "Use identity evidence from Microsoft Azure", "ports": ["python"]},
+        {"label": "AWS web-identity evidence", "explainer_label": "Use web-identity evidence from AWS", "sub": "Lambda, ECS, EC2, AgentCore", "ports": ["python"]},
+        {"label": "SPIFFE issuance bootstrap", "explainer_label": "Obtain a Client Attestation using SPIFFE platform identity", "ports": ["go", "java", "python", "typescript"]}
       ]
     },
     {
       "name": "Resource server",
       "rows": [
-        {"label": "Token validator", "sub": "Signature, typ, issuer, expiry, audience, scope, introspection",
+        {"label": "Token validator", "explainer_label": "Check incoming access tokens", "sub": "Signature, typ, issuer, expiry, audience, scope, introspection",
          "ports": ["go", "java", "python", "typescript"]},
-        {"label": "MCP and A2A protected-resource helper", "ports": ["go", "java", "python", "typescript"]},
-        {"label": "Authorization-server metadata discovery", "ports": ["java", "python"]}
+        {"label": "MCP and A2A protected-resource helper", "explainer_label": "Add access checks to Model Context Protocol (MCP) and Agent2Agent (A2A) services", "ports": ["go", "java", "python", "typescript"]},
+        {"label": "Authorization-server metadata discovery", "explainer_label": "Find the Authorization Server configuration automatically", "ports": ["java", "python"]}
       ]
     },
     {
       "name": "Step-up",
       "rows": [
-        {"label": "Challenge handling", "sub": "Parse a policy point's challenge, then resolve it with a CIBA push or a web consent link",
+        {"label": "Challenge handling", "explainer_label": "Handle requests for further authentication or human approval", "sub": "Parse a policy point's challenge, then resolve it with a CIBA push or a web consent link",
          "ports": ["python"]}
       ]
     }

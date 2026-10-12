@@ -37,7 +37,7 @@ import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Optional, Protocol
+from typing import Any, Callable, Dict, Iterable, Optional, Protocol
 
 from client_attestation_sdk import _log
 
@@ -70,6 +70,12 @@ SUBJECT_KEY = "subject"
 #: Default lifetime of an approval for :meth:`CibaResolver.verify_resume` (seconds after approval).
 DEFAULT_MAX_APPROVAL_AGE = 300.0
 
+# What observed an approval (:attr:`Ceremony.approved_via`). Each resolver's verify_resume accepts only
+# its own: a CIBA tap or a web click is not a verified credential presentation.
+_VIA_CIBA = "ciba_poll"
+_VIA_WEB = "web_status"
+_VIA_PROOFING = "proofing_status"
+
 
 def transaction_hash(fields: Dict[str, Any]) -> str:
     """Canonical SHA-256 over the INSTRUCTION — what a signing device would sign and what a dispute
@@ -91,9 +97,39 @@ def transaction_hash(fields: Dict[str, Any]) -> str:
     ``TypeError``. Both sides of a ceremony (the pusher and the approver surface) MUST pass the same
     keys and value types, or the hashes will not agree and a signature over one is worthless for the
     other.
+
+    Every object key, at every level, must be a ``str``, and every array a ``list``: JSON would print
+    ``{1: x}`` and ``{"1": x}``, ``{True: x}`` and ``{"true": x}``, or a tuple and a list the same way, so
+    two different Python values would share a hash. A non-string key or a tuple raises ``ValueError``.
+
+    Strings are hashed as their exact code points, with no Unicode normalisation: ``"é"`` written as
+    one code point (NFC) and as ``e`` plus a combining accent (NFD) hash differently. If the two sides
+    may spell text differently, normalise it (``unicodedata.normalize("NFC", …)``) before calling.
     """
+    _check_hashable(fields)
     canon = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _check_hashable(value: Any) -> None:
+    """Raise ``ValueError`` if ``value`` holds a dict with a non-string key or a tuple anywhere (see
+    :func:`transaction_hash`). Walks iteratively, so depth alone can't exhaust the stack here."""
+    stack, seen = [value], set()
+    while stack:
+        item = stack.pop()
+        if isinstance(item, (dict, list, tuple)):
+            if id(item) in seen:
+                continue        # shared or circular: checked once (json.dumps refuses a cycle)
+            seen.add(id(item))
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"transaction_hash: object keys must be strings, not {type(key).__name__}")
+                stack.append(child)
+        elif isinstance(item, tuple):
+            raise ValueError("transaction_hash: arrays must be lists, not tuples")
+        elif isinstance(item, list):
+            stack.extend(item)
 
 
 def _bound_hash(subject: str, instruction: Dict[str, Any]) -> str:
@@ -132,7 +168,7 @@ class Pending:
     interval: int                   # suggested poll cadence (seconds)
     expires_in: int                 # seconds until the ceremony dies on its own
     txn_hash: str = ""
-    consent_url: Optional[str] = None       # CHANNEL_WEB only
+    consent_url: Optional[str] = field(default=None, repr=False)   # CHANNEL_WEB only; may embed a one-time token
     detail: Dict[str, Any] = field(default_factory=dict)   # what the human is being asked
     attempt: int = 1
     reused: bool = False            # True when an identical live ceremony was found and returned
@@ -158,7 +194,8 @@ class Resolved:
 class Unavailable:
     """This resolver cannot run a ceremony for this challenge on the channels it has.
     ``fallback`` tells the caller what to do instead (``bubble_up`` = surface the original challenge
-    to whatever UI exists; ``enrol`` = the human has no authenticator at all)."""
+    to whatever UI exists; otherwise the non-device channel ``Hooks.channel_for`` named, such as
+    ``web_consent``)."""
     kind: str
     reason: str
     fallback: str = "bubble_up"
@@ -177,6 +214,8 @@ class PollResult:
     elapsed: float = 0.0
     interval: int = 3
     detail: Dict[str, Any] = field(default_factory=dict)
+    # CHANNEL_WEB, while the ceremony is still pending only; may embed a one-time token
+    consent_url: Optional[str] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -188,7 +227,9 @@ class Ceremony:
     """One in-flight (or finished) ceremony. This is the unit the deployment persists.
 
     ``code`` is the unguessable handle (:func:`new_handle`) and is kept out of ``repr``;
-    ``reference`` is the short display code pushed to the device (:func:`new_code`)."""
+    ``reference`` is the short display code pushed to the device (:func:`new_code`). ``resolver`` names
+    the resolver that raised it (``ciba``, ``web_consent``, ``proofing``) and ``approved_via`` what
+    observed the approval; a resolver polls and resumes only its own ceremonies, so persist both."""
     code: str = field(repr=False)
     kind: str
     channel: str
@@ -207,6 +248,8 @@ class Ceremony:
     extra: Dict[str, Any] = field(default_factory=dict, repr=False)
     reference: Optional[str] = None     # short display code (the CIBA binding_message)
     consumed_at: Optional[float] = None  # set when verify_resume accepted it; never accepted again
+    resolver: Optional[str] = None      # which resolver raised it
+    approved_via: Optional[str] = None  # what observed the approval (the CIBA poll, web_status, proofing_status)
 
     @property
     def expires_in(self) -> int:
@@ -238,7 +281,8 @@ class Ceremony:
              "initiator": self.initiator, "created_at": self.created_at, "status": self.status,
              "assurance": self.assurance, "attempt": self.attempt,
              "consent_url": self.consent_url, "approved_at": self.approved_at,
-             "extra": dict(self.extra), "reference": self.reference, "consumed_at": self.consumed_at}
+             "extra": dict(self.extra), "reference": self.reference, "consumed_at": self.consumed_at,
+             "resolver": self.resolver, "approved_via": self.approved_via}
         if self.ciba:
             d["ciba"] = self.ciba.to_dict()
         return d
@@ -252,7 +296,8 @@ class Ceremony:
                 status=d.get("status", PENDING), assurance=d.get("assurance"),
                 attempt=int(d.get("attempt") or 1), consent_url=d.get("consent_url"),
                 approved_at=d.get("approved_at"), extra=dict(d.get("extra") or {}),
-                reference=d.get("reference"), consumed_at=d.get("consumed_at"))
+                reference=d.get("reference"), consumed_at=d.get("consumed_at"),
+                resolver=d.get("resolver"), approved_via=d.get("approved_via"))
         if d.get("ciba"):
             c.ciba = _ciba.CibaRequest.rehydrate(d["ciba"])
         return c
@@ -345,6 +390,108 @@ def _check_resume(cer: Ceremony, now: float, max_age: Optional[float], noun: str
     return None
 
 
+def _from_durable(hooks: "Hooks", code: str) -> Optional[Ceremony]:
+    """The record :attr:`Hooks.rehydrate` returns for ``code``. A record for another code is ignored."""
+    d = hooks.rehydrate(code) if hooks.rehydrate else None
+    if not d:
+        return None
+    if d.get("code") != code:
+        hooks.log("rehydrate returned a record for another ceremony; ignored")
+        return None
+    return Ceremony.from_dict(d)
+
+
+def _load(store: CeremonyStore, hooks: "Hooks", code: str, resolver: str) -> Optional[Ceremony]:
+    """The ceremony ``code`` names, from the in-process store or else durable state, if a resolver of
+    kind ``resolver`` raised it. Another resolver's ceremony is unknown here: its approval is other
+    evidence, and polling it here could approve it on the wrong signal."""
+    c = store.get(code)
+    if c is None:
+        c = _from_durable(hooks, code)
+        if c is None or c.resolver != resolver:
+            return None
+        store.put(c)
+        hooks.log(f"ceremony {_log_id(c)} rehydrated")
+    return c if c.resolver == resolver else None
+
+
+def _find_live(store: CeremonyStore, hooks: "Hooks", subject: str, txn_hash: str,
+               now: float) -> Optional[Ceremony]:
+    """A live ceremony for (subject, txn_hash): in-process, then :attr:`Hooks.find_live_persisted`. A
+    persisted record for another subject or instruction, or one no longer live, is ignored."""
+    live = store.find_live(subject, txn_hash, now)
+    if live is None and hooks.find_live_persisted:
+        try:
+            d = hooks.find_live_persisted(subject, txn_hash)
+        except Exception as exc:  # noqa: BLE001
+            d = None
+            hooks.log(f"find_live_persisted failed: {exc}")
+        if d:
+            c = Ceremony.from_dict(d)
+            if c.subject == subject and c.txn_hash == txn_hash and c.is_live(now):
+                store.put(c)
+                live = c
+            else:
+                hooks.log("find_live_persisted returned a ceremony for another instruction; ignored")
+    return live
+
+
+def _consume(store: CeremonyStore, hooks: "Hooks", cer: Ceremony, now: float, noun: str) -> Optional[str]:
+    """Mark an approval verify_resume is about to accept as used; a reason string when it may not be.
+
+    The durable record is read again first (another replica may have used it). Then
+    :attr:`Hooks.consume` claims it atomically when the deployment has one, or :attr:`Hooks.persist`
+    records it. Either failing refuses the resume: an approval whose use could not be recorded could be
+    used again elsewhere."""
+    if hooks.rehydrate:
+        try:
+            durable = _from_durable(hooks, cer.code)
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            hooks.log(f"{noun} {_log_id(cer)} rehydrate before use failed: {exc}")
+            return f"{noun} state could not be read"
+        if durable is not None and durable.consumed_at is not None:
+            cer.consumed_at = durable.consumed_at
+            return f"{noun} approval has already been used"
+    cer.consumed_at = now
+    try:
+        if hooks.consume:
+            if not hooks.consume(cer):
+                store.put(cer)
+                return f"{noun} approval has already been used"
+        elif hooks.persist:
+            hooks.persist(cer)
+    except Exception as exc:  # noqa: BLE001 — fail closed, and leave it usable once storage is back
+        cer.consumed_at = None
+        hooks.log(f"{noun} {_log_id(cer)} could not be recorded as used: {exc}")
+        return f"{noun} approval could not be recorded as used"
+    store.put(cer)
+    return None
+
+
+def _log_id(c: Ceremony) -> str:
+    """How a ceremony is named in :attr:`Hooks.log`: its display reference, never the handle (anyone
+    who reads the handle in a log can poll and resume the ceremony). A record without a reference
+    gets a short fingerprint of the handle instead."""
+    return c.reference or "#" + hashlib.sha256(c.code.encode("utf-8")).hexdigest()[:12]
+
+
+def _other_initiator(live: Ceremony, initiator: str, kind: str, resolver: str) -> Optional[Unavailable]:
+    """A live ceremony for this (subject, instruction) is reused only by the initiator that raised
+    it. Handing it to another agent would give that agent the first one's handle, so it could resume
+    the approval (and the audit would name the wrong initiator). Another initiator is refused until
+    the live ceremony ends; the handle is not disclosed. So is a ceremony another resolver raised:
+    this one could neither poll nor resume it."""
+    if live.resolver != resolver:
+        return Unavailable(kind=kind, fallback="bubble_up",
+                           reason="a live ceremony for this instruction was raised by another resolver",
+                           detail={"txn_hash": live.txn_hash})
+    if live.initiator == initiator:
+        return None
+    return Unavailable(kind=kind, fallback="bubble_up",
+                       reason="a live ceremony for this instruction was raised by another initiator",
+                       detail={"txn_hash": live.txn_hash})
+
+
 # ---- deployment hooks ---------------------------------------------------------------------------
 @dataclass
 class Hooks:
@@ -360,9 +507,21 @@ class Hooks:
         ceremony is needed. Return ``None`` otherwise.
     ``persist(ceremony)`` / ``rehydrate(code) -> Optional[dict]``
         Durable storage for the in-flight ceremony (a deploy mid-approval must not lose it). The
-        rehydrate hook returns a dict in :meth:`Ceremony.to_dict` shape, or ``None``.
+        rehydrate hook returns a dict in :meth:`Ceremony.to_dict` shape for that ``code``, or ``None``;
+        a dict for another code is ignored. ``verify_resume`` reads it again before accepting an
+        approval and refuses one whose stored ``consumed_at`` is set, then records the use through
+        ``consume`` or, without it, ``persist``. If that write raises, the resume is refused. So the
+        store must return what was last persisted (read-your-writes across replicas); single use
+        across replicas is as strong as that, and only atomic with ``consume``.
+    ``consume(ceremony) -> bool``
+        Optional, for stores that can compare-and-set: atomically record ``ceremony.consumed_at``
+        only if the stored record has none, and return ``True`` if this call did. ``False`` means
+        another replica used the approval first and the resume is refused. When set it replaces
+        ``persist`` for that write.
     ``find_live_persisted(subject, txn_hash) -> Optional[dict]``
-        Dedupe across replicas/restarts: a live ceremony for the same instruction. Same dict shape.
+        Dedupe across replicas/restarts: a live ceremony for the same instruction. Same dict shape,
+        including ``initiator`` and ``resolver``: a live ceremony is reused only by the initiator and
+        the kind of resolver that raised it. A dict for another subject or instruction is ignored.
     ``register_for_device(ceremony)``
         Publish the full instruction wherever the approver app resolves pushed codes. The push itself
         carries only the short code; without this the phone buzzes and shows nothing.
@@ -398,6 +557,7 @@ class Hooks:
     proofing_status: Optional[Callable[[Ceremony], str]] = None
     settle_seconds: float = 3.0
     log: Callable[[str], None] = lambda _m: None
+    consume: Optional[Callable[[Ceremony], bool]] = None
 
 
 class ChallengeResolver(Protocol):
@@ -476,9 +636,23 @@ class CibaResolver:
 
     The ``instruction`` dict may not carry a ``subject`` key (it is reserved for the subject the
     ceremony is bound to); :meth:`resolve` and :meth:`verify_resume` raise ``ValueError`` if it does.
+
+    A live ceremony is returned (``reused``) only to the ``initiator`` that raised it. Another
+    initiator resolving the same instruction for the same subject gets :class:`Unavailable` until that
+    ceremony ends, so one agent never holds another's handle. The same rule applies to
+    :class:`WebConsentResolver` and :class:`ProofingResolver`.
+
+    A push that fails (bc-auth refused, a transport error, any exception) releases the claimed slot and
+    does not count against ``max_attempts``: it never reached the human.
+
+    An ``identity_proofing`` challenge resolved here is approved by a TAP, not by a credential
+    presentation. :meth:`verify_resume` reports it as ``device-approved`` like any other approval, and
+    :meth:`ProofingResolver.verify_resume` never accepts it (each resolver polls and resumes only the
+    ceremonies it raised). Use :class:`ProofingResolver` when the policy needs a verified credential.
     """
 
     kinds = (RESOURCE_AUTHORISATION, IDENTITY_PROOFING)
+    _resolver = "ciba"
 
     def __init__(self, client: _ciba.CibaClient, hooks: Optional[Hooks] = None,
                  store: Optional[CeremonyStore] = None, *, code_prefix: Any = "PAY",
@@ -502,14 +676,7 @@ class CibaResolver:
         return str(self.code_prefix)
 
     def _load(self, code: str) -> Optional[Ceremony]:
-        c = self.store.get(code)
-        if c is None and self.hooks.rehydrate:
-            d = self.hooks.rehydrate(code)
-            if d:
-                c = Ceremony.from_dict(d)
-                self.store.put(c)
-                self.hooks.log(f"ceremony {code} rehydrated")
-        return c
+        return _load(self.store, self.hooks, code, self._resolver)
 
     def _persist(self, c: Ceremony) -> None:
         self.store.put(c)
@@ -517,7 +684,7 @@ class CibaResolver:
             try:
                 self.hooks.persist(c)
             except Exception as exc:  # noqa: BLE001 — persistence must never block the push
-                self.hooks.log(f"ceremony {c.code} persist failed: {exc}")
+                self.hooks.log(f"ceremony {_log_id(c)} persist failed: {exc}")
 
     def _pending(self, c: Ceremony, *, reused: bool = False) -> Pending:
         return Pending(code=c.code, kind=c.kind, channel=c.channel, interval=c.interval,
@@ -549,19 +716,11 @@ class CibaResolver:
                 return Resolved(code=None, kind=kind, assurance=str(assurance),
                                 detail={"note": "an authorisation covering this instruction already stands"})
 
-        # 2) Dedupe: an identical live ceremony (in-process, then persisted) is returned, not re-pushed.
-        live = self.store.find_live(subject, txn_hash, self.clock())
-        if live is None and self.hooks.find_live_persisted:
-            try:
-                d = self.hooks.find_live_persisted(subject, txn_hash)
-            except Exception as exc:  # noqa: BLE001
-                d = None
-                self.hooks.log(f"find_live_persisted failed: {exc}")
-            if d:
-                live = Ceremony.from_dict(d)
-                self.store.put(live)
+        # 2) Dedupe: an identical live ceremony (in-process, then persisted) is returned, not re-pushed,
+        #    but only to the initiator that raised it.
+        live = _find_live(self.store, self.hooks, subject, txn_hash, self.clock())
         if live is not None:
-            return self._pending(live, reused=True)
+            return _other_initiator(live, initiator, kind, self._resolver) or self._pending(live, reused=True)
 
         # 3) Attempt cap: how many ceremonies has this instruction already had?
         prior = self._prior_attempts(subject, txn_hash)
@@ -591,28 +750,32 @@ class CibaResolver:
                        txn_hash=txn_hash, instruction=dict(instruction), initiator=initiator,
                        created_at=self.clock(), attempt=prior + 1,
                        extra={"scope": challenge.scope, "doctype": challenge.doctype},
-                       reference=new_code(prefix))
+                       reference=new_code(prefix), resolver=self._resolver)
         live = _claim(self.store, self._lock, cer, self.clock())
         if live is not None:
-            return self._pending(live, reused=True)
-        if self.hooks.register_for_device:
-            try:
-                self.hooks.register_for_device(cer)     # BEFORE the push: the phone resolves the code on arrival
-            except Exception as exc:  # noqa: BLE001
-                self.hooks.log(f"register_for_device failed for {code}: {exc}")
+            return _other_initiator(live, initiator, kind, self._resolver) or self._pending(live, reused=True)
+        # From here until the push is accepted the slot is claimed: ANY failure must release it, or the
+        # claimed ceremony (no CIBA request, so no expiry) would be handed back as "reused" forever.
         try:
+            if self.hooks.register_for_device:
+                try:
+                    self.hooks.register_for_device(cer)     # BEFORE the push: the phone resolves the code on arrival
+                except Exception as exc:  # noqa: BLE001
+                    self.hooks.log(f"register_for_device failed for {_log_id(cer)}: {exc}")
             cer.ciba = self.client.request(login_hint=subject,
                                            binding_message=binding_message or cer.reference,
                                            scope=scope)
         except _ciba.CibaError as exc:
-            cer.status = EXPIRED
-            cer.extra["push_error"] = str(exc)
-            self._persist(cer)
+            _unclaim(self.store, cer)       # never reached the human: not an attempt
             return Unavailable(kind=kind, fallback="bubble_up", reason=f"push failed: {exc}",
-                               detail={"code": code, "txn_hash": txn_hash})
+                               detail={"reference": cer.reference, "txn_hash": txn_hash})
+        except BaseException:
+            _unclaim(self.store, cer)
+            raise
         self._persist(cer)
-        self.hooks.log(f"ceremony {cer.reference} pushed to {subject} (auth_req_id={cer.ciba.auth_req_id[:8]}…, "
-                       f"interval={cer.ciba.interval}s, expires_in={cer.ciba.expires_in}s)")
+        # Never any of the auth_req_id: it is what the token endpoint accepts for the grant.
+        self.hooks.log(f"ceremony {cer.reference} pushed to {subject} "
+                       f"(interval={cer.ciba.interval}s, expires_in={cer.ciba.expires_in}s)")
         return self._pending(cer)
 
     def _prior_attempts(self, subject: str, txn_hash: str) -> int:
@@ -654,9 +817,9 @@ class CibaResolver:
                 # Re-check durable state: the device surface may have written its verdict already.
                 if self.hooks.rehydrate:
                     try:
-                        d = self.hooks.rehydrate(code)
-                        if d and d.get("assurance"):
-                            cer.assurance = d["assurance"]
+                        durable = _from_durable(self.hooks, code)
+                        if durable is not None and durable.assurance:
+                            cer.assurance = durable.assurance
                     except Exception as exc:  # noqa: BLE001
                         self.hooks.log(f"rehydrate during settle failed: {exc}")
                 if not cer.assurance:
@@ -665,6 +828,7 @@ class CibaResolver:
                                       detail={"settling": True})
             cer.status = APPROVED
             cer.approved_at = now
+            cer.approved_via = _VIA_CIBA
             if not cer.assurance:
                 cer.assurance = ASSURANCE_DEVICE_APPROVED
             self._finish(cer, APPROVED)
@@ -681,8 +845,8 @@ class CibaResolver:
             try:
                 self.hooks.on_outcome(cer, status)
             except Exception as exc:  # noqa: BLE001
-                self.hooks.log(f"on_outcome({status}) failed for {cer.code}: {exc}")
-        self.hooks.log(f"ceremony {cer.code} -> {status} (assurance={cer.assurance})")
+                self.hooks.log(f"on_outcome({status}) failed for {_log_id(cer)}: {exc}")
+        self.hooks.log(f"ceremony {_log_id(cer)} -> {status} (assurance={cer.assurance})")
 
     # ---- verify a resumed call against the approved instruction ------------------------------
     @_logged_resume
@@ -691,11 +855,15 @@ class CibaResolver:
         instruction NOW presented hashes to what was approved. Closes the argument-tampering seam:
         the resumed call is the one the human approved, byte for byte.
 
-        An approval is SINGLE-USE: a successful call marks it consumed (and persists that through
-        :attr:`Hooks.persist`), so presenting the same code again is refused. It is also refused once
-        more than ``max_approval_age`` seconds have passed since approval. Single use is atomic
-        within this process; across replicas it is only as strong as the deployment's persist /
-        rehydrate store."""
+        Only a ceremony this kind of resolver raised, of one of its :attr:`kinds`, and approved by its
+        CIBA poll is accepted.
+
+        An approval is SINGLE-USE: a successful call marks it consumed, so presenting the same code
+        again is refused. With :attr:`Hooks.rehydrate` the durable record is read again first, and the
+        use is recorded through :attr:`Hooks.consume` (atomic) or :attr:`Hooks.persist`; if it cannot
+        be recorded the resume is refused. It is also refused once more than ``max_approval_age``
+        seconds have passed since approval. Single use is atomic within this process; across replicas
+        it is as strong as the deployment's store (see :class:`Hooks`)."""
         want = _bound_hash(subject, instruction)
         with self._lock:
             cer = self._load(code)
@@ -703,15 +871,17 @@ class CibaResolver:
                 return False, "unknown ceremony code"
             if cer.status != APPROVED:
                 return False, f"ceremony is {cer.status}, not approved"
+            if cer.kind not in self.kinds or cer.approved_via != _VIA_CIBA:
+                return False, "ceremony was not approved through this resolver"
             if cer.subject != subject:
                 return False, "ceremony subject does not match"
             if want != cer.txn_hash:
                 return False, "instruction does not match what was approved"
-            refused = _check_resume(cer, self.clock(), self.max_approval_age, "ceremony")
+            now = self.clock()
+            refused = (_check_resume(cer, now, self.max_approval_age, "ceremony")
+                       or _consume(self.store, self.hooks, cer, now, "ceremony"))
             if refused:
                 return False, refused
-            cer.consumed_at = self.clock()
-            self._persist(cer)
         return True, cer.assurance or ASSURANCE_DEVICE_APPROVED
 
 
@@ -723,19 +893,28 @@ class WebConsentResolver:
     :attr:`Hooks.web_status`.
 
     Assurance claimed on approval is :data:`ASSURANCE_WEB_CONSENT` — a browser interaction, not a
-    device-signed one. Never more."""
+    device-signed one. Never more. As with :class:`CibaResolver`, an ``identity_proofing`` challenge
+    approved here is a click, not a presentation, and :meth:`ProofingResolver.verify_resume` never
+    accepts it.
+
+    The consent URL may embed a one-time token: it is kept out of every ``repr`` and is returned only
+    while the ceremony is pending. :meth:`verify_resume` checks a resumed call exactly as
+    :meth:`CibaResolver.verify_resume` does (single use, ``max_approval_age``, the instruction hash)."""
 
     kinds = (RESOURCE_AUTHORISATION, IDENTITY_PROOFING)
+    _resolver = "web_consent"
 
     def __init__(self, hooks: Hooks, store: Optional[CeremonyStore] = None, *,
                  code_prefix: Any = "WEB", ttl_seconds: int = 300, interval: int = 3,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time,
+                 max_approval_age: Optional[float] = DEFAULT_MAX_APPROVAL_AGE):
         self.hooks = hooks
         self.store = store or MemoryStore()
         self.code_prefix = code_prefix
         self.ttl = ttl_seconds
         self.interval = interval
         self.clock = clock
+        self.max_approval_age = max_approval_age   # see CibaResolver
         self._lock = threading.Lock()
 
     @_logged_resolve
@@ -744,6 +923,8 @@ class WebConsentResolver:
         kind = challenge.type
         if kind not in self.kinds:
             return Unavailable(kind=kind, reason=f"WebConsentResolver does not resolve '{kind}'")
+        if not subject:
+            return Unavailable(kind=kind, reason="no subject to ask for consent")
         if not self.hooks.consent_url_for:
             return Unavailable(kind=kind, reason="no consent_url_for hook configured")
         txn_hash = _bound_hash(subject, instruction)
@@ -751,10 +932,13 @@ class WebConsentResolver:
         cer = Ceremony(code=new_handle(str(prefix)), kind=kind, channel=CHANNEL_WEB, subject=subject,
                        txn_hash=txn_hash, instruction=dict(instruction), initiator=initiator,
                        created_at=self.clock(), extra={"expires_in": self.ttl, "interval": self.interval},
-                       reference=new_code(str(prefix)))
+                       reference=new_code(str(prefix)), resolver=self._resolver)
         # Dedupe and insert as one step, so two concurrent resolves cannot both mint a URL.
         live = _claim(self.store, self._lock, cer, self.clock())
         if live is not None:
+            refused = _other_initiator(live, initiator, kind, self._resolver)
+            if refused:
+                return refused
             return Pending(code=live.code, kind=kind, channel=CHANNEL_WEB, interval=self.interval,
                            expires_in=live.expires_in, txn_hash=txn_hash, consent_url=live.consent_url,
                            detail=dict(instruction), attempt=live.attempt, reused=True,
@@ -769,19 +953,14 @@ class WebConsentResolver:
             try:
                 self.hooks.persist(cer)
             except Exception as exc:  # noqa: BLE001
-                self.hooks.log(f"persist failed for {cer.code}: {exc}")
+                self.hooks.log(f"persist failed for {_log_id(cer)}: {exc}")
         return Pending(code=cer.code, kind=kind, channel=CHANNEL_WEB, interval=self.interval,
                        expires_in=self.ttl, txn_hash=txn_hash, consent_url=cer.consent_url,
                        detail=dict(instruction), reference=cer.reference)
 
     @_logged_poll
     def poll(self, code: str) -> Optional[PollResult]:
-        cer = self.store.get(code)
-        if cer is None and self.hooks.rehydrate:
-            d = self.hooks.rehydrate(code)
-            if d:
-                cer = Ceremony.from_dict(d)
-                self.store.put(cer)
+        cer = _load(self.store, self.hooks, code, self._resolver)
         if cer is None:
             return None
         now = self.clock()
@@ -793,11 +972,12 @@ class WebConsentResolver:
                     st = self.hooks.web_status(cer)
                 except Exception as exc:  # noqa: BLE001
                     st = PENDING
-                    self.hooks.log(f"web_status failed for {code}: {exc}")
+                    self.hooks.log(f"web_status failed for {_log_id(cer)}: {exc}")
                 if st in TERMINAL:
                     cer.status = st
                     if st == APPROVED:
                         cer.approved_at = now
+                        cer.approved_via = _VIA_WEB
                         cer.assurance = cer.assurance or ASSURANCE_WEB_CONSENT
             if cer.status in TERMINAL:
                 self.store.put(cer)
@@ -805,10 +985,37 @@ class WebConsentResolver:
                     try:
                         self.hooks.on_outcome(cer, cer.status)
                     except Exception as exc:  # noqa: BLE001
-                        self.hooks.log(f"on_outcome failed for {code}: {exc}")
+                        self.hooks.log(f"on_outcome failed for {_log_id(cer)}: {exc}")
         return PollResult(code=code, status=cer.status, kind=cer.kind, assurance=cer.assurance,
                           elapsed=now - cer.created_at, interval=self.interval,
-                          detail={"txn_hash": cer.txn_hash, "consent_url": cer.consent_url})
+                          detail={"txn_hash": cer.txn_hash},
+                          consent_url=None if cer.status in TERMINAL else cer.consent_url)
+
+    @_logged_resume
+    def verify_resume(self, code: str, *, subject: str, instruction: Dict[str, Any]) -> "tuple[bool, str]":
+        """On a re-sent call carrying ``code``, confirm the web consent was APPROVED (by
+        :attr:`Hooks.web_status`, for a ceremony this kind of resolver raised) and that the instruction
+        now presented hashes to what was consented to. Single-use and age-limited exactly like
+        :meth:`CibaResolver.verify_resume`."""
+        want = _bound_hash(subject, instruction)
+        with self._lock:
+            cer = _load(self.store, self.hooks, code, self._resolver)
+            if cer is None:
+                return False, "unknown consent code"
+            if cer.status != APPROVED:
+                return False, f"consent is {cer.status}, not approved"
+            if cer.kind not in self.kinds or cer.approved_via != _VIA_WEB:
+                return False, "consent was not approved through this resolver"
+            if cer.subject != subject:
+                return False, "consent subject does not match"
+            if want != cer.txn_hash:
+                return False, "instruction does not match what was consented to"
+            now = self.clock()
+            refused = (_check_resume(cer, now, self.max_approval_age, "consent")
+                       or _consume(self.store, self.hooks, cer, now, "consent"))
+            if refused:
+                return False, refused
+        return True, cer.assurance or ASSURANCE_WEB_CONSENT
 
 
 # ---- the identity-proofing resolver ---------------------------------------------------------
@@ -835,6 +1042,16 @@ class ProofingResolver:
     account is never silently reused to satisfy another, and :meth:`verify_resume` can check that the
     resumed operation is the one that was proofed.
 
+    The PEP does not choose the credential. Pin it in ``instruction["doctype"]``, or list the doctypes
+    this deployment will ask for in ``doctypes``: the challenge's ``doctype`` is used only when it is in
+    that list, and a challenge that asks for a different doctype than the pinned one is refused.
+    :meth:`verify_resume` likewise needs the doctype in ``instruction`` unless the proofed one is in
+    ``doctypes``.
+
+    Only the verifier's verdict (:attr:`Hooks.proofing_status`) approves a proofing. A ceremony that
+    :class:`CibaResolver` or :class:`WebConsentResolver` raised, even for an ``identity_proofing``
+    challenge, is unknown here: a tap or a click is not a presentation.
+
     No assurance rung is claimed. The payment ladder (device-approved / device-signed /
     recognize-verified) describes *how a human authorised a transaction*; a proofing is a different
     kind of fact — a verified document — and its strength lives in the verifier's own record
@@ -842,12 +1059,17 @@ class ProofingResolver:
     """
 
     kinds = (IDENTITY_PROOFING,)
+    _resolver = "proofing"
 
     def __init__(self, hooks: Hooks, client: Optional[_ciba.CibaClient] = None,
                  store: Optional[CeremonyStore] = None, *, code_prefix: Any = "MDL",
                  ttl_seconds: int = 300, interval: int = 3, max_attempts: int = 1,
                  attempt_window: float = 600.0, clock: Callable[[], float] = time.time,
-                 max_approval_age: Optional[float] = DEFAULT_MAX_APPROVAL_AGE):
+                 max_approval_age: Optional[float] = DEFAULT_MAX_APPROVAL_AGE,
+                 doctypes: Iterable[str] = ()):
+        if isinstance(doctypes, str):
+            raise ValueError("doctypes must be a list of doctype strings, not one string")
+        self.doctypes = frozenset(doctypes)   # the challenge doctypes this resolver will ask for
         self.hooks = hooks
         self.client = client          # optional: without it, no push (local/DC-API paths only)
         self.store = store or MemoryStore()
@@ -862,13 +1084,7 @@ class ProofingResolver:
 
     # ---- helpers --------------------------------------------------------------------------
     def _load(self, code: str) -> Optional[Ceremony]:
-        c = self.store.get(code)
-        if c is None and self.hooks.rehydrate:
-            d = self.hooks.rehydrate(code)
-            if d:
-                c = Ceremony.from_dict(d)
-                self.store.put(c)
-        return c
+        return _load(self.store, self.hooks, code, self._resolver)
 
     def _persist(self, c: Ceremony) -> None:
         self.store.put(c)
@@ -876,7 +1092,7 @@ class ProofingResolver:
             try:
                 self.hooks.persist(c)
             except Exception as exc:  # noqa: BLE001 — never block the ceremony
-                self.hooks.log(f"proofing {c.code} persist failed: {exc}")
+                self.hooks.log(f"proofing {_log_id(c)} persist failed: {exc}")
 
     def _prior_failures(self, subject: str, txn_hash: str) -> int:
         n = 0
@@ -902,8 +1118,18 @@ class ProofingResolver:
         if not self.hooks.proofing_start:
             return Unavailable(kind=kind, reason="no proofing_start hook configured (no verifier)")
 
+        # The credential asked for is the caller's choice, never the (untrusted) PEP's alone.
         instruction = dict(instruction)
-        instruction.setdefault("doctype", challenge.doctype or "")
+        pinned = instruction.get("doctype")
+        if pinned:
+            if challenge.doctype and challenge.doctype != pinned:
+                return Unavailable(kind=kind, reason="the challenge asks for a different doctype than the "
+                                   "instruction pins", detail={"doctype": pinned})
+        elif challenge.doctype and challenge.doctype in self.doctypes:
+            instruction["doctype"] = challenge.doctype
+        else:
+            return Unavailable(kind=kind, reason="no doctype to ask for: pin instruction['doctype'], or "
+                               "list the challenge's doctype in doctypes", detail={"doctype": challenge.doctype})
         txn_hash = _bound_hash(subject, instruction)
 
         # 1) Is the challenge stale? Ask what the PDP asks: is a proofing already on record
@@ -920,18 +1146,9 @@ class ProofingResolver:
 
         # 2) Dedupe — one live presentation request per (subject, instruction). A second push
         #    would put two wallet links on the phone for the same thing.
-        live = self.store.find_live(subject, txn_hash, self.clock())
-        if live is None and self.hooks.find_live_persisted:
-            try:
-                d = self.hooks.find_live_persisted(subject, txn_hash)
-            except Exception as exc:  # noqa: BLE001
-                d = None
-                self.hooks.log(f"proofing find_live_persisted failed: {exc}")
-            if d:
-                live = Ceremony.from_dict(d)
-                self.store.put(live)
+        live = _find_live(self.store, self.hooks, subject, txn_hash, self.clock())
         if live is not None:
-            return self._reused(live, txn_hash)
+            return _other_initiator(live, initiator, kind, self._resolver) or self._reused(live, txn_hash)
 
         prior = self._prior_failures(subject, txn_hash)
         if prior >= self.max_attempts:
@@ -971,19 +1188,30 @@ class ProofingResolver:
                        created_at=self.clock(), attempt=prior + 1,
                        extra={"expires_in": self.ttl, "interval": self.interval,
                               "doctype": instruction.get("doctype")},
-                       reference=new_code(prefix))
+                       reference=new_code(prefix), resolver=self._resolver)
         live = _claim(self.store, self._lock, cer, self.clock())
         if live is not None:
-            return self._reused(live, txn_hash)
+            return _other_initiator(live, initiator, kind, self._resolver) or self._reused(live, txn_hash)
+        # Until the push is accepted the slot is claimed: any failure, or any exception, releases it.
+        try:
+            out = self._start_and_push(cer, binding_message, scope)
+        except BaseException:
+            _unclaim(self.store, cer)
+            raise
+        if isinstance(out, Unavailable):
+            _unclaim(self.store, cer)       # nothing reached the holder: not an attempt
+        return out
+
+    def _start_and_push(self, cer: Ceremony, binding_message: Optional[str],
+                        scope: str) -> "Pending | Unavailable":
+        kind, txn_hash, instruction = cer.kind, cer.txn_hash, cer.instruction
         try:
             session = self.hooks.proofing_start(cer) or {}
         except Exception as exc:  # noqa: BLE001
-            _unclaim(self.store, cer)
             return Unavailable(kind=kind, fallback="bubble_up",
                                reason=f"verifier could not open a presentation request: {exc}",
                                detail={"txn_hash": txn_hash})
         if not session.get("session_id"):
-            _unclaim(self.store, cer)
             return Unavailable(kind=kind, fallback="bubble_up",
                                reason="verifier returned no session_id", detail={"txn_hash": txn_hash})
         cer.extra.update({k: v for k, v in session.items() if v is not None})
@@ -993,22 +1221,19 @@ class ProofingResolver:
             try:
                 self.hooks.register_for_device(cer)
             except Exception as exc:  # noqa: BLE001
-                self.hooks.log(f"proofing register_for_device failed for {code}: {exc}")
+                self.hooks.log(f"proofing register_for_device failed for {_log_id(cer)}: {exc}")
         try:
             # Push channel ONLY: we never poll or redeem this grant (see the class docstring).
-            cer.ciba = self.client.request(login_hint=subject,
+            cer.ciba = self.client.request(login_hint=cer.subject,
                                           binding_message=binding_message or cer.reference,
                                           scope=scope)
         except _ciba.CibaError as exc:
-            cer.status = EXPIRED
-            cer.extra["push_error"] = str(exc)
-            self._persist(cer)
             return Unavailable(kind=kind, fallback="bubble_up", reason=f"push failed: {exc}",
-                               detail={"code": code, "txn_hash": txn_hash})
+                               detail={"reference": cer.reference, "txn_hash": txn_hash})
         self._persist(cer)
-        self.hooks.log(f"proofing {code} pushed to {subject} for {instruction.get('doctype')} "
+        self.hooks.log(f"proofing {_log_id(cer)} pushed to {cer.subject} for {instruction.get('doctype')} "
                        f"(verifier session {session.get('session_id')})")
-        return Pending(code=code, kind=kind, channel=CHANNEL_DEVICE, interval=self.interval,
+        return Pending(code=cer.code, kind=kind, channel=CHANNEL_DEVICE, interval=self.interval,
                        expires_in=self.ttl, txn_hash=txn_hash, detail=dict(instruction),
                        reference=cer.reference)
 
@@ -1041,13 +1266,14 @@ class ProofingResolver:
         try:
             status = self.hooks.proofing_status(cer)
         except Exception as exc:  # noqa: BLE001 — a blip is not a verdict
-            self.hooks.log(f"proofing_status failed for {code}: {exc}")
+            self.hooks.log(f"proofing_status failed for {_log_id(cer)}: {exc}")
             return PollResult(code=code, status=PENDING, kind=cer.kind,
                               elapsed=now - cer.created_at, interval=self.interval, detail=detail)
         if status in TERMINAL:
             cer.status = status
             if status == APPROVED:
                 cer.approved_at = now
+                cer.approved_via = _VIA_PROOFING    # the verifier's verdict, never a tap
             self._finish(cer, status)
         detail["claims"] = cer.extra.get("claims")
         return PollResult(code=code, status=cer.status, kind=cer.kind, assurance=cer.assurance,
@@ -1059,15 +1285,18 @@ class ProofingResolver:
             try:
                 self.hooks.on_outcome(cer, status)
             except Exception as exc:  # noqa: BLE001
-                self.hooks.log(f"proofing on_outcome({status}) failed for {cer.code}: {exc}")
-        self.hooks.log(f"proofing {cer.code} -> {status}")
+                self.hooks.log(f"proofing on_outcome({status}) failed for {_log_id(cer)}: {exc}")
+        self.hooks.log(f"proofing {_log_id(cer)} -> {status}")
 
     @_logged_resume
     def verify_resume(self, code: str, *, subject: str, instruction: Dict[str, Any]) -> "tuple[bool, str]":
         """On a re-sent operation carrying ``code``, confirm the presentation was verified and that
         it was for THIS operation — a proofing of one account must not wave through another.
 
-        Single-use and age-limited exactly like :meth:`CibaResolver.verify_resume`."""
+        Only a ceremony this kind of resolver raised and the verifier approved
+        (:attr:`Hooks.proofing_status`) is accepted. The doctype must be in ``instruction`` unless the
+        proofed doctype is in ``doctypes``. Single-use and age-limited exactly like
+        :meth:`CibaResolver.verify_resume`."""
         if SUBJECT_KEY in instruction:
             raise ValueError(f"instruction must not contain the reserved key {SUBJECT_KEY!r}")
         with self._lock:
@@ -1076,15 +1305,21 @@ class ProofingResolver:
                 return False, "unknown proofing code"
             if cer.status != APPROVED:
                 return False, f"proofing is {cer.status}, not verified"
+            if cer.kind not in self.kinds or cer.approved_via != _VIA_PROOFING:
+                return False, "proofing was not verified by the verifier"
             if cer.subject != subject:
                 return False, "proofing subject does not match"
             want = dict(instruction)
-            want.setdefault("doctype", cer.instruction.get("doctype", ""))
+            if not want.get("doctype"):
+                proofed = cer.instruction.get("doctype")
+                if proofed not in self.doctypes:
+                    return False, "the doctype is neither in the instruction nor in doctypes"
+                want["doctype"] = proofed
             if _bound_hash(subject, want) != cer.txn_hash:
                 return False, "this operation is not what was proofed"
-            refused = _check_resume(cer, self.clock(), self.max_approval_age, "proofing")
+            now = self.clock()
+            refused = (_check_resume(cer, now, self.max_approval_age, "proofing")
+                       or _consume(self.store, self.hooks, cer, now, "proofing"))
             if refused:
                 return False, refused
-            cer.consumed_at = self.clock()
-            self._persist(cer)
         return True, cer.instruction.get("doctype") or "verified"

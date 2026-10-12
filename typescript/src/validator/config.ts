@@ -46,6 +46,10 @@ export interface IntrospectionConfig {
  * An explicitly empty `acceptedAlgorithms` or `acceptedTokenTypes` accepts nothing, and `leewaySeconds: 0`
  * allows no clock skew: only an omitted field takes the default. `none` and the `HS*` algorithms are
  * refused even when listed (see validation/SEMANTICS.md).
+ *
+ * `jwksUri` and the introspection `endpoint` must use https unless their host is loopback (`localhost`,
+ * `127.0.0.1`, `::1`) or `allowInsecure` is set: over plain http anyone on the path could serve their own
+ * keys, or read the resource server's client secret.
  */
 export interface ValidatorConfig {
   issuer: string;
@@ -60,6 +64,8 @@ export interface ValidatorConfig {
   introspection?: IntrospectionConfig;
   /** Defaults to {@link DEFAULT_TOKEN_TYPES}; `null` disables the `typ` check. */
   acceptedTokenTypes?: string[] | null;
+  /** Allow a plain-http `jwksUri` and introspection `endpoint` on non-loopback hosts. Defaults to `false`. */
+  allowInsecure?: boolean;
 }
 
 /** A {@link ValidatorConfig} with every optional field defaulted. */
@@ -99,8 +105,36 @@ export function normaliseType(value: string): string {
   return lower.startsWith("application/") ? lower.slice("application/".length) : lower;
 }
 
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/** Refuse a non-https URL unless it is loopback or `allowInsecure` is set: the rule the client applies. */
+function checkSecure(url: string, what: string, allowInsecure: boolean): void {
+  if (allowInsecure) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${what} is not a valid URL: ${url}`);
+  }
+  if (parsed.protocol === "https:" || LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) return;
+  throw new Error(`${what} must use https: ${url} (loopback hosts are exempt; pass allowInsecure: true to override)`);
+}
+
 /**
- * Normalize a caller-supplied config, applying defaults (mirrors Python's `ValidatorConfig`).
+ * A list option as a copy, refusing anything but an array of strings. JavaScript callers aren't held to
+ * the types, and a bare string would otherwise spread into its characters.
+ */
+function stringList(value: unknown, what: string): string[] {
+  if (!Array.isArray(value) || !value.every((v) => typeof v === "string")) {
+    throw new Error(`${what} must be an array of strings`);
+  }
+  return [...value];
+}
+
+/**
+ * Normalize a caller-supplied config, applying defaults (mirrors Python's `ValidatorConfig`). The result
+ * shares nothing mutable with `config`: a caller reusing or changing its config object afterwards (its
+ * arrays, its JWKS, its introspection settings) can't change a live validator.
  *
  * @internal
  */
@@ -109,20 +143,36 @@ export function resolveConfig(config: ValidatorConfig): ResolvedConfig {
     throw new Error("issuer is required");
   }
   const audiences =
-    typeof config.audiences === "string" ? [config.audiences] : [...(config.audiences ?? [])];
+    typeof config.audiences === "string" ? [config.audiences] : stringList(config.audiences ?? [], "audiences");
   if (audiences.length === 0) {
     throw new Error("at least one audience is required");
+  }
+  // NaN would make every exp/nbf/iat comparison false (no time check at all), and "60" would concatenate
+  const leeway: unknown = config.leewaySeconds ?? 60;
+  if (typeof leeway !== "number" || !Number.isSafeInteger(leeway) || leeway < 0) {
+    throw new Error("leewaySeconds must be a non-negative integer");
+  }
+  const allowInsecure = config.allowInsecure ?? false;
+  if (typeof allowInsecure !== "boolean") {
+    throw new Error("allowInsecure must be a boolean");
+  }
+  if (config.jwksUri) {
+    checkSecure(config.jwksUri, "jwksUri", allowInsecure);
+  }
+  if (config.introspection?.endpoint) {
+    checkSecure(config.introspection.endpoint, "introspection endpoint", allowInsecure);
   }
   const types = config.acceptedTokenTypes === undefined ? DEFAULT_TOKEN_TYPES : config.acceptedTokenTypes;
   return {
     issuer: config.issuer,
     audiences,
-    jwks: config.jwks,
+    // the JWKS provider keeps each JWK and imports it again for each algorithm a token names
+    jwks: config.jwks == null ? undefined : structuredClone(config.jwks),
     jwksUri: config.jwksUri,
-    requiredScopes: [...(config.requiredScopes ?? [])],
-    acceptedAlgorithms: [...(config.acceptedAlgorithms ?? DEFAULT_ALGORITHMS)],
-    leewaySeconds: config.leewaySeconds ?? 60,
-    introspection: config.introspection,
-    acceptedTokenTypes: types === null ? null : types.map(normaliseType),
+    requiredScopes: stringList(config.requiredScopes ?? [], "requiredScopes"),
+    acceptedAlgorithms: stringList(config.acceptedAlgorithms ?? DEFAULT_ALGORITHMS, "acceptedAlgorithms"),
+    leewaySeconds: leeway,
+    introspection: config.introspection == null ? undefined : { ...config.introspection },
+    acceptedTokenTypes: types === null ? null : stringList(types, "acceptedTokenTypes").map(normaliseType),
   };
 }

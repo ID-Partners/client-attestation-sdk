@@ -124,7 +124,7 @@ def attester():
 
 
 def test_default_profile_is_pingfederate(attester):
-    ca = ClientAttestation(attester.url, evidence=StaticSvidSource("svid"))
+    ca = ClientAttestation(attester.url, evidence=StaticSvidSource("svid"), evidence_audience=attester.url)
     assert ca.token() == "at-1"
     assert attester.paths() == ["/.well-known/client-attester", "/pf/mint", "/token"]
     body = attester.body("/pf/mint")
@@ -135,7 +135,8 @@ def test_default_profile_is_pingfederate(attester):
 
 
 def test_custom_profile_gets_a_token_end_to_end(attester):
-    ca = ClientAttestation(attester.url, evidence=StaticSvidSource("svid"), profile=AcmeProfile())
+    ca = ClientAttestation(attester.url, evidence=StaticSvidSource("svid"), profile=AcmeProfile(),
+                           evidence_audience="acme-aud")
     assert ca.token() == "at-1"
     assert attester.paths() == ["/acme/config", "/acme/mint", "/token"]
     body = attester.body("/acme/mint")

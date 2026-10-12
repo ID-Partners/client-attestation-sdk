@@ -4,12 +4,25 @@
  * followed (requests carry credentials — Authorization, DPoP, attestation headers, X-Vault-Token, SVIDs in
  * bodies — that must not be replayed to wherever a Location header points), and a response-body cap that
  * is enforced while the body streams in rather than after buffering it.
+ *
+ * Proxies follow the rule every port shares: a request goes through a proxy only when it is https to a host
+ * that is not loopback, link-local or a cloud metadata server, and then only through the JVM's own proxy
+ * settings ({@code https.proxyHost}, or the system proxies with {@code java.net.useSystemProxies}), as a
+ * CONNECT tunnel that keeps TLS end to end. Plain http always goes direct: an OpenBao X-Vault-Token or a
+ * metadata identity token would cross a proxy in cleartext. A URL with userinfo ({@code user:password@}) is
+ * refused, and errors name a URL without its userinfo or query.
  */
 package global.idpartners.clientattestation.internal;
 
 import global.idpartners.clientattestation.TransportException;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.SocketAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
@@ -19,7 +32,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
@@ -39,7 +54,10 @@ public final class HttpTransport {
 
     /** Default response-body cap: 1 MiB. */
     public static final long DEFAULT_MAX_BYTES = 1L << 20;
-    /** At most this many characters of a response body are quoted in an error message. */
+    /**
+     * At most this many characters of a non-2xx response body are quoted in an error. A 2xx body is never
+     * quoted or kept: that is where access tokens, attestations and SVIDs travel.
+     */
     public static final int ERROR_BODY_CHARS = 512;
 
     private HttpTransport() {
@@ -63,8 +81,85 @@ public final class HttpTransport {
         }
     }
 
+    /** Cloud metadata servers that aren't link-local addresses (169.254.169.254 is caught as link-local). */
+    private static final Set<String> METADATA_HOSTS = Set.of("metadata.google.internal", "metadata", "fd00:ec2::254");
+
     /**
-     * A client with a connect timeout that never follows redirects.
+     * The SDK's proxy rule: the JVM's default selector for https to a host {@link #neverProxied} allows,
+     * and no proxy for anything else.
+     */
+    static final ProxySelector SDK_PROXIES = new ProxySelector() {
+        @Override
+        public List<Proxy> select(URI uri) {
+            ProxySelector base = ProxySelector.getDefault();
+            if (base == null || !"https".equalsIgnoreCase(uri.getScheme()) || neverProxied(uri.getHost())) {
+                return List.of(Proxy.NO_PROXY);
+            }
+            return base.select(uri);
+        }
+
+        @Override
+        public void connectFailed(URI uri, SocketAddress address, IOException e) {
+            ProxySelector base = ProxySelector.getDefault();
+            if (base != null) {
+                base.connectFailed(uri, address, e);
+            }
+        }
+    };
+
+    /**
+     * Whether {@code host} is loopback, link-local or a cloud metadata server: the SDK sends those hosts
+     * tokens it must not route anywhere else. Never resolves a name.
+     *
+     * @param host a host name or IP literal (IPv6 with or without brackets)
+     * @return true when the host must never be reached through a proxy
+     */
+    public static boolean neverProxied(String host) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.toLowerCase(Locale.ROOT);
+        if (h.startsWith("[") && h.endsWith("]")) {
+            h = h.substring(1, h.length() - 1);
+        }
+        if (h.endsWith(".")) {
+            h = h.substring(0, h.length() - 1);
+        }
+        if (h.equals("localhost") || h.endsWith(".localhost") || METADATA_HOSTS.contains(h)) {
+            return true;
+        }
+        int zone = h.indexOf('%');
+        if (zone >= 0) {
+            h = h.substring(0, zone);
+        }
+        // only literals: getByName would otherwise look the name up
+        if (!h.contains(":") && !h.matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
+            return false;
+        }
+        try {
+            InetAddress address = InetAddress.getByName(h);
+            return address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isAnyLocalAddress();
+        } catch (UnknownHostException e) {
+            return false;
+        }
+    }
+
+    /**
+     * {@code uri} without its userinfo, query or fragment, for error messages: a query can carry a secret,
+     * and userinfo is one.
+     *
+     * @param uri the URI
+     * @return the URI as shown in an error
+     */
+    public static String display(URI uri) {
+        String authority = uri.getRawAuthority();
+        String host = authority == null ? "" : authority.substring(authority.lastIndexOf('@') + 1);
+        String path = uri.getRawPath() == null ? "" : uri.getRawPath();
+        return uri.getScheme() + "://" + host + path;
+    }
+
+    /**
+     * A client with a connect timeout that never follows redirects, using the SDK's proxy rule.
      *
      * @param connectTimeout the connect timeout
      * @return the client
@@ -73,6 +168,7 @@ public final class HttpTransport {
         return HttpClient.newBuilder()
                 .connectTimeout(connectTimeout)
                 .followRedirects(HttpClient.Redirect.NEVER)
+                .proxy(SDK_PROXIES)
                 .build();
     }
 
@@ -94,7 +190,11 @@ public final class HttpTransport {
             throw new IllegalArgumentException("credential requests require HttpClient.Redirect.NEVER");
         }
         HttpRequest request = req.timeout(timeout).build();
-        String what = request.method() + " " + request.uri();
+        String what = request.method() + " " + display(request.uri());
+        String authority = request.uri().getRawAuthority();
+        if (authority != null && authority.contains("@")) {
+            throw new TransportException(what + ": URLs with userinfo (user:password@) are not supported", 0, null);
+        }
         CompletableFuture<HttpResponse<byte[]>> future =
                 client.sendAsync(request, info -> new CappedSubscriber(info, maxBytes));
         HttpResponse<byte[]> resp;
@@ -204,6 +304,7 @@ public final class HttpTransport {
 
     /**
      * Parse a JSON object, mapping any parse failure or non-object document to {@link TransportException}.
+     * The exception neither quotes nor keeps {@code text}, and has no cause.
      *
      * @param text   the document
      * @param status the HTTP status it came with, carried by the exception
@@ -215,13 +316,13 @@ public final class HttpTransport {
         try {
             parsed = JsonUtil.parseJson(text);
         } catch (Exception e) {
-            // JoseException for malformed JSON; ClassCastException when the document is not an object.
-            throw new TransportException("response is not a JSON object: " + truncate(text), status,
-                    truncate(text), e);
+            // JoseException for malformed JSON; ClassCastException when the document is not an object. The
+            // parser's message can quote the document (a whole token, for a trailing string), so it isn't
+            // chained: the body this parses is a 2xx one, which carries tokens, attestations and SVIDs.
+            throw new TransportException("response is not a JSON object", status, null);
         }
         if (parsed == null) {
-            throw new TransportException("response is not a JSON object: " + truncate(text), status,
-                    truncate(text));
+            throw new TransportException("response is not a JSON object", status, null);
         }
         return parsed;
     }
@@ -238,12 +339,15 @@ public final class HttpTransport {
         return new TransportException(message, status, null);
     }
 
-    /** At most {@link #ERROR_BODY_CHARS} characters of {@code s}. */
+    /**
+     * The first {@link #ERROR_BODY_CHARS} characters of {@code s} (all of it when shorter), with no marker
+     * appended: an exposed body is always a prefix of the response, as in the other ports.
+     */
     public static String truncate(String s) {
         if (s == null) {
             return "";
         }
-        return s.length() <= ERROR_BODY_CHARS ? s : s.substring(0, ERROR_BODY_CHARS) + "...";
+        return s.length() <= ERROR_BODY_CHARS ? s : s.substring(0, ERROR_BODY_CHARS);
     }
 
     /** Signals the cap was exceeded; never escapes this class. */

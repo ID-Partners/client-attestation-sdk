@@ -72,18 +72,20 @@ class JwksProviderTest {
         keys.add(Fixtures.publicJwk(newKey("ec")));
         keys.add(Fixtures.publicJwk(rsa));
         keys.add(octet);
-        Map<String, JwksProvider.Entry> parsed = JwksProvider.parse(Map.of("keys", keys));
-        assertEquals(List.of("ec", "rsa", "hs"), new ArrayList<>(parsed.keySet()));
+        List<String> kids = new ArrayList<>();
+        JwksProvider.parse(Map.of("keys", keys)).forEach(entry -> kids.add(entry.kid()));
+        // the symmetric key is skipped too: "k" is a private member
+        assertEquals(List.of("ec", "rsa"), kids);
     }
 
     @Test
-    void laterKeyWithTheSameKidWins() {
+    void firstKeyWithTheSameKidWins() {
         EllipticCurveJsonWebKey first = newKey("dup");
         EllipticCurveJsonWebKey second = newKey("dup");
         AccessTokenValidator v = new AccessTokenValidator(ValidatorConfig.builder().issuer(ISSUER).audiences(AUDIENCE)
                 .jwks(Fixtures.jwks(first, second)).build());
-        assertTrue(v.validate(sign(second, claims())).valid());
-        assertEquals(ErrorCodes.INVALID_SIGNATURE, v.validate(sign(first, claims())).error());
+        assertTrue(v.validate(sign(first, claims())).valid());
+        assertEquals(ErrorCodes.INVALID_SIGNATURE, v.validate(sign(second, claims())).error());
     }
 
     // ── jwks_uri ────────────────────────────────────────────────────────────────────────────────────
@@ -190,8 +192,99 @@ class JwksProviderTest {
                 }).build();
         ValidationResult r = v.validate(sign(key, claims()));
         assertEquals(ErrorCodes.KEY_NOT_FOUND, r.error());
-        assertTrue(r.errorDescription().startsWith("JWKS fetch failed"), r.errorDescription());
-        assertTrue(r.errorDescription().contains("boom"));
+        // the description reaches WWW-Authenticate: the fetch failure's detail stays in the log
+        assertEquals("signing keys unavailable", r.errorDescription());
+    }
+
+    @Test
+    void aCallerHoldingAStaleKeyNeverWaitsForAFetch() throws Exception {
+        String set = jwksJson(newKey("k"));
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Boolean> slow = new AtomicReference<>(false);
+        JwksProvider p = uriProvider(url -> {
+            if (slow.get()) {
+                started.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return set;
+        });
+        assertNotNull(p.resolve("k", "ES256"));
+        slow.set(true);
+        this.clock.addAndGet(AccessTokenValidator.DEFAULT_JWKS_MAX_AGE.toMillis());   // stale: the next caller refetches
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+        try {
+            Future<Object> fetcher = pool.submit(() -> p.resolve("k", "ES256"));
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            Future<Object> holder = pool.submit(() -> p.resolve("k", "ES256"));
+            Object stale;
+            try {
+                stale = holder.get(2, TimeUnit.SECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                stale = null;
+            }
+            // a caller without the key waits for the fetch in flight, which may bring it
+            Future<Object> misser = pool.submit(() -> p.resolve("other", "ES256"));
+            Thread.sleep(200);
+            boolean waited = !misser.isDone();
+            release.countDown();
+            assertNotNull(fetcher.get(5, TimeUnit.SECONDS));
+            assertNotNull(stale, "a caller with a usable stale key waited for another caller's fetch");
+            assertTrue(waited);
+            assertNull(misser.get(5, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void theValidationClockDoesNotAgeTheJwksCache() {
+        EllipticCurveJsonWebKey key = newKey("k");
+        AtomicInteger calls = new AtomicInteger();
+        AtomicLong validationClock = new AtomicLong(System.currentTimeMillis());
+        AccessTokenValidator v = AccessTokenValidator.builder(ValidatorConfig.builder().issuer(ISSUER)
+                .audiences(AUDIENCE).jwksUri(URI).build()).clock(validationClock::get).httpGet(url -> {
+                    calls.incrementAndGet();
+                    return jwksJson(key);
+                }).build();
+        String token = sign(key, claims("exp", Fixtures.now() + 3 * 3600));
+        assertTrue(v.validate(token).valid());
+        // validating as of a later instant is not an hour passing for the key set
+        validationClock.addAndGet(2 * AccessTokenValidator.DEFAULT_JWKS_MAX_AGE.toMillis());
+        assertTrue(v.validate(token).valid());
+        assertEquals(1, calls.get(), "a validation clock moved forward refetched the JWKS");
+    }
+
+    @Test
+    void aFixedValidationClockStillLetsTheJwksCacheRefetch() {
+        EllipticCurveJsonWebKey a = newKey("a");
+        EllipticCurveJsonWebKey b = newKey("b");
+        AtomicReference<String> served = new AtomicReference<>(jwksJson(a));
+        AtomicInteger calls = new AtomicInteger();
+        long fixed = System.currentTimeMillis();
+        AccessTokenValidator v = AccessTokenValidator.builder(ValidatorConfig.builder().issuer(ISSUER)
+                .audiences(AUDIENCE).jwksUri(URI).build()).clock(() -> fixed).jwksClock(this.clock::get)
+                .httpGet(url -> {
+                    calls.incrementAndGet();
+                    return served.get();
+                }).build();
+        assertTrue(v.validate(sign(a, claims())).valid());
+        // the issuer rotates to b; once the cooldown has passed, b's kid is fetched
+        served.set(jwksJson(b));
+        this.clock.addAndGet(AccessTokenValidator.DEFAULT_JWKS_MIN_REFRESH.toMillis());
+        assertTrue(v.validate(sign(b, claims())).valid(), "the JWKS was never refetched under a fixed clock");
+        assertEquals(2, calls.get());
+        // and the set still grows old: a key the issuer removed stops verifying after max age
+        served.set(jwksJson(a));
+        this.clock.addAndGet(AccessTokenValidator.DEFAULT_JWKS_MAX_AGE.toMillis());
+        assertEquals(ErrorCodes.KEY_NOT_FOUND, v.validate(sign(b, claims())).error(),
+                "a removed key was trusted past max age");
+        assertEquals(3, calls.get());
     }
 
     @Test

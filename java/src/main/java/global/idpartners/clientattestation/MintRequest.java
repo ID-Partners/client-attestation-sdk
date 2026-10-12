@@ -1,7 +1,9 @@
 package global.idpartners.clientattestation;
 
+import global.idpartners.clientattestation.internal.SdkLog;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import org.jose4j.json.JsonUtil;
@@ -22,12 +24,19 @@ public record MintRequest(SigningKeyPair instanceKey, String evidence, String ch
 
     /**
      * Signs {@code claims} as a compact JWS with the instance key, under header {@code typ} (no {@code jwk}).
+     * {@code typ} may not be one the SDK's own credentials use (the Client Attestation, its PoP, or DPoP): a
+     * profile could otherwise have the instance key sign a PoP or DPoP proof with claims of its choosing.
      *
      * @param claims the JWT claims
      * @param typ    the {@code typ} header
      * @return the compact JWS
+     * @throws IllegalArgumentException if {@code typ} is one of the SDK's own credential types
      */
     public String sign(Map<String, Object> claims, String typ) {
+        if (reservedTyp(typ)) {
+            throw new IllegalArgumentException("typ '" + typ + "' is reserved for the SDK's own credentials;"
+                    + " a profile cannot sign it with the instance key");
+        }
         return Jws.sign(JsonUtil.toJson(claims), this.instanceKey, typ, false);
     }
 
@@ -47,5 +56,25 @@ public record MintRequest(SigningKeyPair instanceKey, String evidence, String ch
             claims.put("challenge", this.challenge);
         }
         return sign(claims, typ);
+    }
+
+    /**
+     * Whether {@code typ} names one of the SDK's own credential types, compared as RFC 7515 section 4.1.9 says
+     * a verifier may: case-insensitively, with or without the {@code application/} prefix.
+     */
+    private static boolean reservedTyp(String typ) {
+        String t = String.valueOf(typ).strip().toLowerCase(Locale.ROOT);
+        if (t.startsWith("application/")) {
+            t = t.substring("application/".length());
+        }
+        return t.equals(ClientAttestationBuilder.TYP) || t.equals(PopBuilder.TYP) || t.equals(DpopProofBuilder.TYP);
+    }
+
+    /** Leaves the evidence and the challenge out (their lengths only), so a logged request logs neither. */
+    @Override
+    public String toString() {
+        return "MintRequest[instanceKey=" + this.instanceKey + ", evidence=" + SdkLog.redacted(this.evidence)
+                + ", challenge=" + SdkLog.redacted(this.challenge) + ", clientId=" + this.clientId
+                + ", authorizationDetails=" + this.authorizationDetails + ", operator=" + this.operator + "]";
     }
 }

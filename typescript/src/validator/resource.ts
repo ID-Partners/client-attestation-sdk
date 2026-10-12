@@ -13,12 +13,40 @@ import { failure, type ValidationResult } from "./result.js";
 import type { AccessTokenValidator } from "./validator.js";
 
 const WELL_KNOWN = "/.well-known/oauth-protected-resource";
+const BEARER = "bearer";
 
 /** Extract the token from an `Authorization: Bearer <token>` header value, or null. */
 export function bearerToken(authorizationHeader?: string | null): string | null {
   if (!authorizationHeader) return null;
-  const match = /^\s*Bearer\s+(.+?)\s*$/i.exec(authorizationHeader);
-  return match ? match[1] : null;
+  // One linear pass, no regex: a backtracking pattern here costs quadratic or cubic time on a hostile header.
+  // The result is what Go's RE2 (?i)^\s*Bearer\s+(.+?)\s*$ returns, so every port extracts the same token.
+  const h = authorizationHeader;
+  const n = h.length;
+  let i = 0;
+  while (i < n && isSpace(h.charCodeAt(i))) i++;
+  if (n - i <= BEARER.length) return null;
+  for (let k = 0; k < BEARER.length; k++, i++) {
+    if ((h.charCodeAt(i) | 0x20) !== BEARER.charCodeAt(k)) return null;
+  }
+  if (!isSpace(h.charCodeAt(i))) return null;
+  let end = n;
+  while (end > i && isSpace(h.charCodeAt(end - 1))) end--;
+  if (end === i) {
+    // Only whitespace after the scheme: RE2 takes the last non-LF whitespace character after the first.
+    for (let j = n - 1; j > i; j--) {
+      if (h[j] !== "\n") return h[j];
+    }
+    return null;
+  }
+  let start = i + 1;
+  while (isSpace(h.charCodeAt(start))) start++;
+  const token = h.slice(start, end);
+  return token.includes("\n") ? null : token;
+}
+
+/** RE2's `\s`: space, tab, LF, FF and CR. */
+function isSpace(c: number): boolean {
+  return c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
 }
 
 /** RFC 9728 protected-resource metadata document. */
@@ -96,11 +124,29 @@ export class ProtectedResource {
   }
 
   async authenticate(authorizationHeader?: string | null, requiredScopes?: string[]): Promise<AuthDecision> {
+    return this.#guard(authorizationHeader, (token) => this.#validator.validate(token, requiredScopes));
+  }
+
+  /**
+   * {@link authenticate} for tokens checked by RFC 7662 introspection ({@link AccessTokenValidator.validateActive}),
+   * such as opaque tokens, with the same rules: the response's `aud` must name this resource, so a response
+   * without one is refused (401), and a sender-constrained token (`cnf`) is refused (401). A failed
+   * introspection call is not a verdict: it rejects, as `validateActive` does, and the caller answers it (503,
+   * say).
+   */
+  async authenticateActive(authorizationHeader?: string | null, requiredScopes?: string[]): Promise<AuthDecision> {
+    return this.#guard(authorizationHeader, (token) => this.#validator.validateActive(token, requiredScopes));
+  }
+
+  async #guard(
+    authorizationHeader: string | null | undefined,
+    validate: (token: string) => Promise<ValidationResult>,
+  ): Promise<AuthDecision> {
     const token = bearerToken(authorizationHeader);
     if (token == null) {
       return { authorized: false, status: 401, wwwAuthenticate: this.challenge(), errorDescription: "authentication required" };
     }
-    let result = await this.#validator.validate(token, requiredScopes);
+    let result = await validate(token);
     if (result.valid && !result.audience.includes(this.resource)) {
       result = failure(errors.INVALID_AUDIENCE, "token audience is not this resource");
     }

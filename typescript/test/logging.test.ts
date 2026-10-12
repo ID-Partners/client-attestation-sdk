@@ -15,6 +15,8 @@ import { ClientAttestation, StaticSvidSource, TransportError, type Logger } from
 import { emit, failureReason, urlParts } from "../src/logging.js";
 import { AccessTokenValidator } from "../src/validator/index.js";
 
+const AUD = "https://attester.example"; // the evidence_audience the fake attester's discovery document names
+
 type Entry = { level: string; event: string; attrs: Record<string, unknown> };
 
 function recorder(): { logger: Logger; entries: Entry[]; events: () => string[] } {
@@ -88,7 +90,7 @@ async function fakeAttester(opts: FakeOptions = {}): Promise<string> {
         attestation_endpoint: base + "/attest",
         challenge_endpoint: base + "/challenge?x=1",
         token_endpoint: base + "/token",
-        evidence_audience: "https://attester.example",
+        evidence_audience: AUD,
       });
     }
     if (req.url?.startsWith("/challenge")) {
@@ -135,7 +137,7 @@ describe("token source logging", () => {
   it("logs the happy path (attestation PoP), the cache hit and a forced refresh, and nothing secret", async () => {
     const url = await fakeAttester();
     const rec = recorder();
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), logger: rec.logger });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec.logger });
 
     await ca.token();
     expect(rec.events()).toEqual([
@@ -172,7 +174,7 @@ describe("token source logging", () => {
     const resource = await nonceResource();
     const rec = recorder();
     const ca = new ClientAttestation(url, {
-      evidence: new StaticSvidSource(SVID),
+      evidence: new StaticSvidSource(SVID), evidenceAudience: AUD,
       popMethod: "dpop_combined",
       logger: rec.logger,
     });
@@ -195,7 +197,7 @@ describe("token source logging", () => {
   it("gives the reason expired when the cached token has run out", async () => {
     const url = await fakeAttester({ expiresIn: null });
     const rec = recorder();
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), logger: rec.logger });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec.logger });
     await ca.token();
     await ca.token();
     const reasons = rec.entries.filter((e) => e.event === "token.refreshing").map((e) => e.attrs.reason);
@@ -206,7 +208,7 @@ describe("token source logging", () => {
   it("logs a non-2xx token endpoint as http.failed with the status", async () => {
     const url = await fakeAttester({ token: (res) => json(res, 401, { error: "invalid_client" }) });
     const rec = recorder();
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), logger: rec.logger });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec.logger });
     await expect(ca.token()).rejects.toThrow();
     expect(rec.entries.at(-1)).toEqual({
       level: "warn",
@@ -218,7 +220,7 @@ describe("token source logging", () => {
   it("logs a token response without an access_token as malformed", async () => {
     const url = await fakeAttester({ token: (res) => json(res, 200, { token_type: "Bearer" }) });
     const rec = recorder();
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), logger: rec.logger });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec.logger });
     await expect(ca.token()).rejects.toThrow();
     expect(rec.entries.at(-1)?.attrs).toMatchObject({ step: "token", status: 200, reason: "malformed" });
   });
@@ -226,7 +228,7 @@ describe("token source logging", () => {
   it("logs a token response that is not JSON as malformed", async () => {
     const url = await fakeAttester({ token: (res) => json(res, 200, "not json") });
     const rec = recorder();
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), logger: rec.logger });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec.logger });
     await expect(ca.token()).rejects.toThrow();
     expect(rec.entries.at(-1)?.attrs).toMatchObject({ step: "token", reason: "malformed" });
   });
@@ -234,14 +236,14 @@ describe("token source logging", () => {
   it("logs malformed discovery JSON and an unreachable host", async () => {
     const url = await fakeAttester({ discovery: (res) => json(res, 200, "{nope") });
     const rec = recorder();
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), logger: rec.logger });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec.logger });
     await expect(ca.token()).rejects.toThrow();
     expect(rec.entries.at(-1)?.attrs).toMatchObject({ step: "discover", method: "GET", reason: "malformed", status: 200 });
 
     const dead = await listen(() => undefined);
     await new Promise<void>((r) => servers.pop()?.close(() => r()));
     const rec2 = recorder();
-    const gone = new ClientAttestation(dead, { evidence: new StaticSvidSource(SVID), logger: rec2.logger });
+    const gone = new ClientAttestation(dead, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD, logger: rec2.logger });
     await expect(gone.token()).rejects.toThrow();
     expect(rec2.entries.at(-1)?.attrs).toEqual({
       step: "discover",
@@ -256,7 +258,7 @@ describe("token source logging", () => {
     const failing = await fakeAttester({ challenge: (res) => json(res, 503, { error: "down" }) });
     const rec = recorder();
     await new ClientAttestation(failing, {
-      evidence: new StaticSvidSource(SVID),
+      evidence: new StaticSvidSource(SVID), evidenceAudience: AUD,
       requireChallenge: false,
       logger: rec.logger,
     }).token();
@@ -267,7 +269,7 @@ describe("token source logging", () => {
     const empty = await fakeAttester({ challenge: (res) => json(res, 200, {}) });
     const rec2 = recorder();
     await new ClientAttestation(empty, {
-      evidence: new StaticSvidSource(SVID),
+      evidence: new StaticSvidSource(SVID), evidenceAudience: AUD,
       requireChallenge: false,
       logger: rec2.logger,
     }).token();
@@ -278,12 +280,12 @@ describe("token source logging", () => {
 
   it("is silent without a logger and survives a logger that throws", async () => {
     const url = await fakeAttester();
-    expect(await new ClientAttestation(url, { evidence: new StaticSvidSource(SVID) }).token()).toMatch(/^eyJ/);
+    expect(await new ClientAttestation(url, { evidence: new StaticSvidSource(SVID), evidenceAudience: AUD }).token()).toMatch(/^eyJ/);
     const boom = () => {
       throw new Error("logger broke");
     };
     const ca = new ClientAttestation(url, {
-      evidence: new StaticSvidSource(SVID),
+      evidence: new StaticSvidSource(SVID), evidenceAudience: AUD,
       logger: { debug: boom, info: boom, warn: boom, error: boom },
     });
     expect(await ca.token()).toMatch(/^eyJ/);
@@ -314,8 +316,11 @@ describe("validator logging", () => {
   it("logs verdicts, the JWKS fetch and a throttled refetch, and nothing secret", async () => {
     const rec = recorder();
     const validator = validatorWith(rec.logger);
-    // only the cases that run under the shared config and the real clock
-    const shared = vectors.cases.filter((c: { config?: unknown; now?: unknown }) => !c.config && c.now === undefined);
+    // only the cases that run under the shared config, key set and the real clock
+    const shared = vectors.cases.filter(
+      (c: { config?: unknown; now?: unknown; jwks?: unknown; jwks_fetch_error?: unknown }) =>
+        !c.config && c.now === undefined && c.jwks === undefined && c.jwks_fetch_error === undefined,
+    );
     for (const c of shared) await validator.validate(c.token);
     const alg = JSON.parse(Buffer.from(tokenNamed("valid").split(".")[0], "base64url").toString("utf8")).alg;
     await validator.validate(`${b64({ alg, kid: "unknown-kid" })}.${b64({})}.c2ln`);
@@ -413,6 +418,77 @@ describe("logging helpers", () => {
     const rec = recorder();
     emit(rec.logger, "error", "x", { a: "eyJhbGciOi.e30.sig", b: undefined, c: null, d: "pf.example.com", n: 3 });
     expect(rec.entries[0]).toEqual({ level: "error", event: "x", attrs: { a: "<redacted:18 bytes>", d: "pf.example.com", n: 3 } });
+  });
+
+  // Synthetic, built here so no scanner mistakes them for real ones.
+  const vaultTokens = ["hvs.", "hvb.", "hvr.", "s.", "b.", "r."].flatMap((prefix) =>
+    ["", "-_x9"].map((suffix) => prefix + "TESTONLY".repeat(3) + suffix),
+  );
+
+  it.each([
+    "auth_req_id", "code", "handle", "token", "secret", "password", "assertion", "client_assertion",
+    "vault_token", "x-vault-token", "X-Vault-Token", "Authorization", "dpop", "private_key", "refresh_token",
+    "session_token", "api-token", "client_secret", "db_password",
+  ])("redacts any value under the credential key %s", (key) => {
+    const rec = recorder();
+    emit(rec.logger, "info", "x", { [key]: "opaque-value-123", n: 7 });
+    expect(rec.entries[0].attrs).toEqual({ [key]: "<redacted:16 bytes>", n: 7 });
+  });
+
+  it("redacts a non-string value under a credential key", () => {
+    const rec = recorder();
+    emit(rec.logger, "info", "x", { code: 123456 });
+    expect(rec.entries[0].attrs).toEqual({ code: "<redacted:6 bytes>" });
+  });
+
+  it.each([
+    ...vaultTokens,
+    ...vaultTokens.map((t) => `X-Vault-Token: ${t}`),
+    "Bearer 2YotnFZFEjr1zCsicMWpAA", "DPoP 2YotnFZFEjr1zCsicMWpAA", "bearer opaque",
+    "Basic YWxhZGRpbjpvcGVuc2VzYW1l", " Bearer 2YotnFZFEjr1zCsicMWpAA",
+    "Authorization: Bearer 2YotnFZFEjr1zCsicMWpAA",
+  ])("redacts a value that carries a credential: %s", (value) => {
+    const rec = recorder();
+    emit(rec.logger, "info", "x", { detail: value });
+    expect(String(rec.entries[0].attrs.detail)).toMatch(/^<redacted:/);
+  });
+
+  // validation/redaction.json: the Go, Java and Python tests read the same cases.
+  const redactionCases: { key: string; value: unknown; redacted: boolean }[] = JSON.parse(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "validation", "redaction.json"), "utf8"),
+  ).cases;
+  it("has shared redaction cases", () => {
+    expect(redactionCases.length).toBeGreaterThan(0);
+  });
+  it.each(redactionCases)("applies the shared redaction case %j", ({ key, value, redacted }) => {
+    const rec = recorder();
+    emit(rec.logger, "info", "x", { [key]: value });
+    const got = rec.entries[0].attrs[key];
+    if (redacted) expect(String(got)).toMatch(/^<redacted:/);
+    else expect(got).toBe(value);
+  });
+
+  it("never throws for a credential-keyed value whose toString throws", () => {
+    const rec = recorder();
+    const hostile = { toString(): string { throw new Error("boom"); } };
+    expect(() => emit(rec.logger, "info", "x", { token: hostile, n: 1 })).not.toThrow();
+    expect(rec.entries[0].attrs).toEqual({ token: "<redacted>", n: 1 });
+    expect(() => emit(rec.logger, "info", "x", { code: Object.create(null) })).not.toThrow();
+  });
+
+  it("keeps ordinary attributes", () => {
+    // A backstop, not a filter: the vocabulary in docs/logging.md passes through untouched.
+    const attrs = {
+      host: "pf.example.com:9031", path: "/as/token.oauth2", method: "POST", status: 400, step: "token",
+      reason: "timeout", token_type: "Bearer", pop_method: "dpop_combined", client_id: "urn:agent:x",
+      alg: "ES256", source: "StaticSvidSource", at: "token_endpoint", keys: 3, result: "invalid_audience",
+      mode: "introspection", error: "authorization_pending", expires_in: 120, detail: "s.example.com",
+      other: "hvs.short", label: "bob.smith", host2: "vault.s.abcdefghijklmnopqrstuvwxyz.internal",
+      word: "DPoP", scheme: "Bearer",
+    };
+    const rec = recorder();
+    emit(rec.logger, "info", "token.obtained", attrs);
+    expect(rec.entries[0].attrs).toEqual(attrs);
   });
 
   it("splits URLs without their query and classifies failures", () => {

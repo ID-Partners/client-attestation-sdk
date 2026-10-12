@@ -12,6 +12,7 @@ import { createServer } from "node:http";
 
 import { AccessTokenValidator, ProtectedResource } from "../src/validator/index.js";
 
+// A local demo: in production serve over TLS, with an https resource URI.
 const RESOURCE = "http://localhost:8770"; // this server's canonical URI (RFC 8707) — the token audience
 const ISSUER = "https://issuer.example.com"; // the authorization server clients get a token from
 
@@ -40,4 +41,4 @@ createServer(async (req, res) => {
   }
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ ok: true, sub: decision.result?.subject, scopes: decision.result?.scopes }));
-}).listen(8770, () => console.log("protected resource on", RESOURCE));
+}).listen(8770, "127.0.0.1", () => console.log("protected resource on", RESOURCE)); // loopback only

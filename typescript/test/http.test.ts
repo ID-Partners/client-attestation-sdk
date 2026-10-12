@@ -8,7 +8,7 @@ import { type AddressInfo } from "node:net";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { jsonOk, parseJsonObject, request, DEFAULT_MAX_BYTES } from "../src/http.js";
+import { displayUrl, hasUserinfo, jsonOk, parseJsonObject, request, DEFAULT_MAX_BYTES } from "../src/http.js";
 import {
   AttestationIssuanceClient,
   ClientAttestation,
@@ -21,6 +21,8 @@ import {
   TransportError,
 } from "../src/index.js";
 import { jwtSub } from "../src/token-source.js";
+
+const AUD = "https://attester.example"; // the evidence_audience the fake attester's discovery document names
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 
@@ -165,6 +167,35 @@ describe("request", () => {
     expect(err.message).toContain(`GET ${url} failed`);
   });
 
+  it("refuses a URL with userinfo without naming the userinfo or contacting the host", async () => {
+    let hits = 0;
+    const url = await serve((_req, res) => {
+      hits += 1;
+      res.end();
+    });
+    const withUser = url.replace("://", "://alice:s3cret@");
+    for (const target of [`${withUser}/x?q=1`, "https://alice:s3cret@example.invalid/x", "https://alice@example.invalid/"]) {
+      const err = await transportError(request(target));
+      expect(err.message).toContain("userinfo");
+      expect(err.message).not.toContain("s3cret");
+      expect(err.message).not.toContain("alice");
+    }
+    expect(hits).toBe(0);
+  });
+
+  it("keeps the query out of error messages", async () => {
+    const url = await serve((_req, res) => json(res, 401, { error: "invalid_client" }));
+    const err = await transportError(request(`${url}/token?client_secret=s3cret#frag`).then((r) => jsonOk(r)));
+    expect(err.message).toContain(`GET ${url}/token returned HTTP 401`);
+    expect(err.message).not.toContain("s3cret");
+    const dead = await serve(() => undefined);
+    const server = servers.pop() as Server;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const net = await transportError(request(`${dead}/x?code=s3cret`, { timeoutMs: 2000 }));
+    expect(net.message).toContain(`GET ${dead}/x failed`);
+    expect(net.message).not.toContain("s3cret");
+  });
+
   it("treats an opaque redirect from a stand-in fetch as a redirect", async () => {
     vi.stubGlobal("fetch", async () => ({ type: "opaqueredirect", status: 0, body: null }));
     expect((await transportError(request("https://x.example"))).kind).toBe("redirect");
@@ -205,6 +236,18 @@ describe("request", () => {
     const err = await transportError(request("https://x.example"));
     expect(err.kind).toBe("network");
     expect(err.message).toContain("connection reset");
+  });
+});
+
+describe("displayUrl and hasUserinfo", () => {
+  it("strip userinfo, query and fragment, and spot userinfo even in an unparseable URL", () => {
+    expect(displayUrl("https://alice:s3cret@as.example.com:8443/token?code=x#f")).toBe("https://as.example.com:8443/token");
+    expect(displayUrl("https://as.example.com/x?u=a@b")).toBe("https://as.example.com/x");
+    expect(displayUrl("https://as.example.com/a@b")).toBe("https://as.example.com/a@b");
+    expect(hasUserinfo("https://alice@as.example.com/")).toBe(true);
+    expect(hasUserinfo("https://as.example.com/x?u=a@b")).toBe(false);
+    expect(hasUserinfo("https://a:b@[::1/x")).toBe(true); // not a valid URL
+    expect(hasUserinfo("https://[::1/x")).toBe(false);
   });
 });
 
@@ -297,13 +340,13 @@ describe("AttestationIssuanceClient over the transport", () => {
 describe("ClientAttestation over the transport", () => {
   it("surfaces malformed discovery JSON as a TransportError", async () => {
     const url = await serve((_req, res) => res.end("{"));
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid") });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), evidenceAudience: AUD });
     expect((await transportError(ca.token())).kind).toBe("json");
   });
 
   it("times out a hung attester with the configured timeout", async () => {
     const url = await serve(() => undefined);
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), timeoutMs: 100 });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), evidenceAudience: AUD, timeoutMs: 100 });
     expect((await transportError(ca.discovery())).kind).toBe("timeout");
   });
 
@@ -318,7 +361,7 @@ describe("ClientAttestation over the transport", () => {
             attestation_endpoint: base + "/attest",
             challenge_endpoint: base + "/challenge",
             token_endpoint: base + "/token",
-            evidence_audience: "https://attester.example",
+            evidence_audience: AUD,
           });
         }
         if (req.url === "/challenge") return json(res, 200, { attestation_challenge: "c" });
@@ -333,7 +376,7 @@ describe("ClientAttestation over the transport", () => {
 
   it("keeps the token endpoint's non-2xx error: status and full body", async () => {
     const url = await attester((_req, res) => json(res, 401, { error: "invalid_client" }));
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid") });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), evidenceAudience: AUD });
     const err = (await ca.token().catch((e: unknown) => e)) as ClientAttestationError;
     expect(err).toBeInstanceOf(ClientAttestationError);
     expect(err).not.toBeInstanceOf(TransportError);
@@ -352,14 +395,14 @@ describe("ClientAttestation over the transport", () => {
       res.writeHead(308, { Location: target });
       res.end();
     });
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid") });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), evidenceAudience: AUD });
     expect((await transportError(ca.token())).kind).toBe("redirect");
     expect(targetHits).toBe(0);
   });
 
   it("surfaces a malformed token response as a TransportError", async () => {
     const url = await attester((_req, res) => res.end("not-json"));
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid") });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), evidenceAudience: AUD });
     expect((await transportError(ca.token())).kind).toBe("json");
   });
 
@@ -388,7 +431,7 @@ describe("HttpSvidSource over the transport", () => {
 
 describe("GoogleMetadataSvidSource over the transport", () => {
   it("sends Metadata-Flavor without following redirects and returns the token", async () => {
-    const fetchMock = vi.fn(async () => new Response(" id-token \n"));
+    const fetchMock = vi.fn(async () => new Response(" id-token \n", { headers: { "Metadata-Flavor": "Google" } }));
     vi.stubGlobal("fetch", fetchMock);
     expect(await new GoogleMetadataSvidSource().fetch("https://aud.example")).toBe("id-token");
     expect(fetchMock).toHaveBeenCalledWith(

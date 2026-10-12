@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -77,7 +79,7 @@ func newDpopAS(t *testing.T, tokenType string) *dpopAS {
 			"attestation_endpoint": as.srv.URL + "/federation/attestation",
 			"challenge_endpoint":   as.srv.URL + "/federation/attestation-challenge",
 			"token_endpoint":       as.srv.URL + "/as/token.oauth2?ignored=1",
-			"evidence_audience":    "https://attester.example.com",
+			"evidence_audience":    fakeAudience,
 		})
 	})
 	mux.HandleFunc("/federation/attestation-challenge", func(w http.ResponseWriter, r *http.Request) {
@@ -194,7 +196,7 @@ func newDpopResource(t *testing.T, as *dpopAS) *dpopResource {
 
 func newDpopClient(t *testing.T, as *dpopAS) *ClientAttestation {
 	t.Helper()
-	ca, err := NewClientAttestation(as.srv.URL,
+	ca, err := NewClientAttestation(as.srv.URL, WithEvidenceAudience(fakeAudience),
 		WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
 		WithPopMethod(PopMethodDpopCombined))
 	if err != nil {
@@ -387,7 +389,7 @@ func TestDpopKeySurvivesCacheAndChangesOnRefresh(t *testing.T) {
 
 func TestBearerModeRequestHeadersUnchanged(t *testing.T) {
 	srv, _ := fakeAttester(t)
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
 		WithPopMethod(PopMethodDpopCombined))
 	if err != nil {
 		t.Fatal(err)
@@ -423,7 +425,7 @@ func TestBearerModeRequestHeadersUnchanged(t *testing.T) {
 }
 
 func TestRequestHeadersPropagatesTokenErrors(t *testing.T) {
-	ca, err := NewClientAttestation("http://127.0.0.1:1", WithEvidence(StaticSvidSource{SVID: "x"}))
+	ca, err := NewClientAttestation("http://127.0.0.1:1", WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "x"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,24 +443,48 @@ func TestRequestHeadersPropagatesTokenErrors(t *testing.T) {
 	}
 }
 
-func TestNormalizeHTUForm(t *testing.T) {
-	cases := map[string]string{
-		"https://Example.COM/a/b?x=1#f": "https://example.com/a/b",
-		"HTTP://h:8080/p":               "http://h:8080/p",
-		"https://h":                     "https://h",
-		"/relative?q":                   "/relative",
-		"no-scheme#frag":                "no-scheme",
-		"plain":                         "plain",
-		"https://h/a%20b?q":             "https://h/a%20b",
-		"https://as.example:443/t":      "https://as.example/t",
-		"http://as.example:80":          "http://as.example",
-		"https://as.example:80/t":       "https://as.example:80/t",
-		"https://[::1]:8443/p?q":        "https://[::1]:8443/p",
+// TestHTUVectors runs the shared htu vectors (vectors/htu.json) through the builder, normalizeHTU and the
+// nonce key. Every port must agree.
+func TestHTUVectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "vectors", "htu.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for in, want := range cases {
-		if got := normalizeHTU(in); got != want {
-			t.Errorf("normalizeHTU(%q) = %q, want %q", in, got, want)
-		}
+	var file struct {
+		Cases []struct {
+			Name   string `json:"name"`
+			URL    string `json:"url"`
+			HTU    string `json:"htu"`
+			Origin string `json:"origin"`
+			Error  string `json:"error"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := Generate("ES256")
+	for _, c := range file.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			proof, err := NewDpopProofBuilder(key).URI(c.URL).Build()
+			if c.Error != "" {
+				if err == nil || err.Error() != c.Error {
+					t.Fatalf("Build(%q) error = %v, want %q", c.URL, err, c.Error)
+				}
+				if got := originOf(c.URL); got != c.URL {
+					t.Fatalf("originOf(%q) = %q, want the URL itself", c.URL, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Build(%q): %v", c.URL, err)
+			}
+			if got := decodeJWTClaims(t, proof)["htu"]; got != c.HTU {
+				t.Fatalf("htu(%q) = %v, want %q", c.URL, got, c.HTU)
+			}
+			if got := originOf(c.URL); got != c.Origin {
+				t.Fatalf("originOf(%q) = %q, want %q", c.URL, got, c.Origin)
+			}
+		})
 	}
 }
 
@@ -519,5 +545,295 @@ func TestNonceChallengeDetection(t *testing.T) {
 	}
 	if _, ok := nonceChallenge(500, h, nil); ok {
 		t.Fatal("500 is not a challenge")
+	}
+}
+
+func TestRoundTripperRefusesToSendCredentialsOnRedirect(t *testing.T) {
+	for _, tokenType := range []string{"Bearer", "DPoP"} {
+		t.Run(tokenType, func(t *testing.T) {
+			as := newDpopAS(t, tokenType)
+			ca := newDpopClient(t, as)
+			var leaked atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				leaked.Add(1)
+			}))
+			defer target.Close()
+			var frontAuth atomic.Value
+			front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				frontAuth.Store(r.Header.Get("Authorization"))
+				http.Redirect(w, r, target.URL+"/steal", http.StatusFound)
+			}))
+			defer front.Close()
+
+			client := &http.Client{Transport: ca.RoundTripper()}
+			_, err := client.Get(front.URL + "/data")
+			if err == nil || leaked.Load() != 0 {
+				t.Fatalf("redirect followed with credentials: err=%v target hits=%d", err, leaked.Load())
+			}
+			if got := asSDKError(t, err); got.Status != http.StatusFound || !strings.Contains(got.Message, "redirect") {
+				t.Fatalf("error = %+v", got)
+			}
+			if reason, status := transportReason(err); reason != "redirect" || status != http.StatusFound {
+				t.Fatalf("transportReason = %s, %d", reason, status)
+			}
+			if auth, _ := frontAuth.Load().(string); auth == "" {
+				t.Fatal("the first request carried no credentials")
+			}
+
+			// A client that stops at the 3xx gets it back, with nothing sent to the target.
+			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			resp, err := client.Get(front.URL + "/data")
+			if err != nil {
+				t.Fatal(err)
+			}
+			readAll(t, resp)
+			if resp.StatusCode != http.StatusFound || leaked.Load() != 0 {
+				t.Fatalf("status %d target hits %d", resp.StatusCode, leaked.Load())
+			}
+		})
+	}
+}
+
+// A 400 + DPoP-Nonce whose body is longer than maxNonceChallengeBody is not a nonce challenge, even if it
+// starts like one: the client reads no more than the cap, hands the response back and does not retry.
+func TestDpopRoundTripperIgnoresOversize400Body(t *testing.T) {
+	as := newDpopAS(t, "DPoP")
+	var hits int32
+	body := `{"error":"use_dpop_nonce"}` + strings.Repeat(" ", maxNonceChallengeBody)
+	rs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set(DpopNonceHeader, "rs-nonce")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(rs.Close)
+	ca := newDpopClient(t, as)
+	client := &http.Client{Transport: ca.RoundTripper()}
+
+	resp, err := client.Get(rs.URL + "/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, resp); resp.StatusCode != 400 || got != body {
+		t.Fatalf("status %d, body of %d bytes; want the whole 400 body handed back", resp.StatusCode, len(got))
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("resource hits = %d, want 1 (no retry)", n)
+	}
+}
+
+// The nonce memory is bounded: a DPoP-Nonce over maxDpopNonceLength is ignored, and at most
+// maxDpopNonceOrigins origins are kept, the one stored longest ago going first.
+func TestDpopNonceMemoryIsBounded(t *testing.T) {
+	ca := &ClientAttestation{}
+	ca.rememberNonce("https://big.example/", strings.Repeat("n", maxDpopNonceLength+1))
+	if got := ca.nonceFor("https://big.example/"); got != "" {
+		t.Fatalf("over-long nonce remembered (%d bytes)", len(got))
+	}
+	ca.rememberNonce("https://big.example/", strings.Repeat("n", maxDpopNonceLength))
+	if got := ca.nonceFor("https://big.example/"); len(got) != maxDpopNonceLength {
+		t.Fatalf("nonce at the cap not remembered (%d bytes)", len(got))
+	}
+
+	ca = &ClientAttestation{}
+	for i := 0; i < maxDpopNonceOrigins+44; i++ {
+		ca.rememberNonce(fmt.Sprintf("https://h%d.example/p%d", i, i), fmt.Sprintf("n%d", i))
+		if i == 0 {
+			continue
+		}
+		// h1 keeps being refreshed, so it is never the oldest.
+		ca.rememberNonce("https://h1.example/", "n1")
+	}
+	if n := len(ca.nonces); n != maxDpopNonceOrigins {
+		t.Fatalf("%d origins remembered, want %d", n, maxDpopNonceOrigins)
+	}
+	if got := ca.nonceFor("https://h0.example/"); got != "" {
+		t.Fatalf("oldest origin still remembered: %q", got)
+	}
+	if got := ca.nonceFor("https://h1.example/"); got != "n1" {
+		t.Fatalf("refreshed origin forgotten: %q", got)
+	}
+	last := maxDpopNonceOrigins + 43
+	if got := ca.nonceFor(fmt.Sprintf("https://h%d.example/", last)); got != fmt.Sprintf("n%d", last) {
+		t.Fatalf("newest origin not remembered: %q", got)
+	}
+
+	h := http.Header{}
+	h.Set(DpopNonceHeader, strings.Repeat("n", maxDpopNonceLength+1))
+	h.Set("WWW-Authenticate", `DPoP error="use_dpop_nonce"`)
+	if _, ok := nonceChallenge(401, h, nil); ok {
+		t.Fatal("a challenge with an over-long nonce must not be answered")
+	}
+}
+
+// A resource that challenges with an over-long nonce gets the challenge back, not a retry.
+func TestDpopRoundTripperIgnoresOverlongNonce(t *testing.T) {
+	as := newDpopAS(t, "DPoP")
+	rs := newDpopResource(t, as)
+	rs.nonce = strings.Repeat("n", maxDpopNonceLength+1)
+	ca := newDpopClient(t, as)
+	client := &http.Client{Transport: ca.RoundTripper()}
+
+	resp, err := client.Get(rs.srv.URL + "/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	if resp.StatusCode != 401 || atomic.LoadInt32(&rs.hits) != 1 {
+		t.Fatalf("status %d hits %d, want the 401 challenge back after one hit", resp.StatusCode, atomic.LoadInt32(&rs.hits))
+	}
+	if got := ca.nonceFor(rs.srv.URL); got != "" {
+		t.Fatalf("over-long nonce remembered (%d bytes)", len(got))
+	}
+}
+
+// The retry answers the challenge it got, with that challenge's nonce, even when another response for the
+// same origin stored a different nonce in between.
+func TestDpopRoundTripperRetriesWithTheChallengesNonce(t *testing.T) {
+	as := newDpopAS(t, "DPoP")
+	ca := newDpopClient(t, as)
+	const target = "https://rs.example/data"
+	var proofNonces []any
+	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		proof, err := verifyDpopProof(r.Header.Get(DpopHeader))
+		if err != nil {
+			t.Fatal(err)
+		}
+		proofNonces = append(proofNonces, proof.claims["nonce"])
+		if len(proofNonces) > 1 {
+			ok := io.NopCloser(strings.NewReader("ok"))
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: ok, Request: r}, nil
+		}
+		header := http.Header{}
+		header.Set(DpopNonceHeader, "challenge-nonce")
+		// Reading the body stands in for a concurrent response to the same origin storing its own nonce.
+		body := io.MultiReader(readFunc(func([]byte) (int, error) {
+			ca.rememberNonce(target, "concurrent-nonce")
+			return 0, io.EOF
+		}), strings.NewReader(`{"error":"use_dpop_nonce"}`))
+		return &http.Response{StatusCode: 400, Header: header, Body: io.NopCloser(body), Request: r}, nil
+	})
+	resp, err := (&http.Client{Transport: ca.RoundTripperOver(base)}).Get(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	if resp.StatusCode != 200 || len(proofNonces) != 2 || proofNonces[1] != "challenge-nonce" {
+		t.Fatalf("status %d, proof nonces %v; want the retry to carry challenge-nonce", resp.StatusCode, proofNonces)
+	}
+}
+
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(p []byte) (int, error) { return f(p) }
+
+// RequestHeaders and DpopProofBuilder refuse a URL that parsers read differently before its query.
+func TestAmbiguousURLsAreRefused(t *testing.T) {
+	as := newDpopAS(t, "DPoP")
+	ca := newDpopClient(t, as)
+	key, _ := Generate("ES256")
+	for _, bad := range []string{
+		`https://evil.example\@as.example/t`,
+		`https://as.example/a\b`,
+		" https://as.example/t",
+		"https://as.example/t ",
+		"https://as.example\t/t",
+		"https://as.example/t\n",
+		"https://as.example/\x00t",
+		"https://as.example/\x7ft",
+	} {
+		if _, err := ca.RequestHeaders(context.Background(), "GET", bad); err == nil {
+			t.Errorf("RequestHeaders(%q) accepted", bad)
+		} else {
+			asSDKError(t, err)
+		}
+		if _, err := NewDpopProofBuilder(key).URI(bad).Build(); err == nil {
+			t.Errorf("DpopProofBuilder.URI(%q) accepted", bad)
+		}
+	}
+	// What follows the path never becomes htu, so it is left alone.
+	for _, ok := range []string{`https://as.example/t?q=a\b c`, "https://as.example/t#a b"} {
+		if _, err := NewDpopProofBuilder(key).URI(ok).Build(); err != nil {
+			t.Errorf("DpopProofBuilder.URI(%q): %v", ok, err)
+		}
+	}
+}
+
+// A client configured for DPoP refuses a URL that has no htu with its own error type before it fetches
+// the token: on a cold cache the AS is never called. A DPoP token the AS issues anyway is refused too.
+func TestRequestHeadersRefusesAURLWithNoHTU(t *testing.T) {
+	for _, tokenType := range []string{"DPoP", "Bearer"} {
+		as := newDpopAS(t, tokenType)
+		ca := newDpopClient(t, as)
+		for _, bad := range []string{"https://bücher.example/t"} {
+			_, err := ca.RequestHeaders(context.Background(), "GET", bad)
+			if err == nil || !strings.HasPrefix(err.Error(), "uri (htu) ") {
+				t.Errorf("%s: RequestHeaders(%q) error = %v, want an htu refusal", tokenType, bad, err)
+				continue
+			}
+			asSDKError(t, err)
+		}
+		if calls, _ := as.calls(); calls != 0 {
+			t.Errorf("%s: %d token requests for refused URLs, want 0", tokenType, calls)
+		}
+	}
+}
+
+// A client not configured for DPoP gets a Bearer header for any URL without a backslash, whitespace or
+// control character: a Bearer token carries no htu.
+func TestBearerClientRequestHeadersNeedNoHTU(t *testing.T) {
+	srv, _ := fakeAttester(t)
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, url := range []string{"https://bücher.example/t"} {
+		h, err := ca.RequestHeaders(context.Background(), "GET", url)
+		if err != nil || h["Authorization"] != "Bearer AT-xyz" {
+			t.Errorf("RequestHeaders(%q) = %v, %v; want the Bearer header", url, h, err)
+		}
+	}
+}
+
+// The RoundTripper signs the request target it actually sends: Go sends "[" and "]" as written and
+// escapes "|", and the proof's htu must equal what the resource received, or a conforming RS (RFC 9449
+// section 4.3) refuses it. (net/url refuses a lone "%", so the RoundTripper never sends one.)
+func TestRoundTripperHTUIsTheTargetSent(t *testing.T) {
+	as := newDpopAS(t, "DPoP")
+	ca := newDpopClient(t, as)
+	var mu sync.Mutex
+	var target, htu string
+	rs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proof, err := verifyDpopProof(r.Header.Get(DpopHeader))
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			t.Errorf("proof: %v", err)
+		} else {
+			htu, _ = proof.claims["htu"].(string)
+		}
+		target = "http://" + r.Host + strings.SplitN(r.RequestURI, "?", 2)[0]
+	}))
+	defer rs.Close()
+	for _, path := range []string{"/items[0]", "/a[b]/c|d", "/caf\u00e9[x]"} {
+		resp, err := (&http.Client{Transport: ca.RoundTripper()}).Get(rs.URL + path + "?q=1")
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		readAll(t, resp)
+		mu.Lock()
+		if htu != target {
+			t.Errorf("%s: htu %q, request target %q", path, htu, target)
+		}
+		mu.Unlock()
+	}
+}
+
+// Not in htu.json (JSON can't carry it): a path that is not valid UTF-8 is refused, as the other ports
+// refuse a lone surrogate.
+func TestHTUInvalidUTF8PathIsRefused(t *testing.T) {
+	if _, err := normalizeHTU("https://as.example.com/a\xff"); err == nil || err.Error() != errHTUPath {
+		t.Fatalf("err = %v, want %q", err, errHTUPath)
 	}
 }

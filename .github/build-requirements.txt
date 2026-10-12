@@ -1,0 +1,14 @@
+# The Python build tooling release.yml uses to build the sdist and wheel, pinned with hashes so the build
+# can't pick up a new or tampered release of any of them. Every package `python -m build --no-isolation`
+# needs on Python 3.12 is listed (pip --require-hashes refuses anything unlisted).
+#
+# To update: bump a version, then replace its hash with the one `pip hash` prints for its wheel, or the
+# sha256 PyPI shows for that file. setuptools must stay inside python/pyproject.toml's build-system.requires.
+build==1.6.1 \
+    --hash=sha256:ecd351a4be9d35a9eaaba244a7687143c9c7d4aea6ac964e7e7ddab20cbcf4e7
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pyproject-hooks==1.3.3 \
+    --hash=sha256:5fc53fdac9f7bd63fbcdc868fb5f90b4784d78a53a3d3388cd738b807441a20b
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670

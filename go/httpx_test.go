@@ -57,7 +57,7 @@ func TestDoRequestRefusesRedirectWithoutContactingTarget(t *testing.T) {
 func TestEveryCallSiteRefusesRedirects(t *testing.T) {
 	front, hits := redirectPair(t)
 
-	ca, err := NewClientAttestation(front.URL, WithEvidence(StaticSvidSource{SVID: "s"}))
+	ca, err := NewClientAttestation(front.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "s"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestEveryCallSiteRefusesRedirects(t *testing.T) {
 func TestInjectedClientIsNotMutated(t *testing.T) {
 	front, hits := redirectPair(t)
 	injected := &http.Client{}
-	ca, err := NewClientAttestation(front.URL, WithEvidence(StaticSvidSource{SVID: "s"}), WithHTTPClient(injected))
+	ca, err := NewClientAttestation(front.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "s"}), WithHTTPClient(injected))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,8 +200,8 @@ func TestDecodeJSONOKNon2xxIsTypedAndTruncated(t *testing.T) {
 
 func TestDecodeJSONOKMalformedJSONIsTyped(t *testing.T) {
 	err := decodeJSONOK(&httpResult{Status: 200, Body: []byte("{not json")}, "GET x", &struct{}{})
-	if sdkErr := asSDKError(t, err); !strings.Contains(sdkErr.Message, "unparseable JSON") {
-		t.Fatalf("unexpected: %v", sdkErr)
+	if sdkErr := asSDKError(t, err); !strings.Contains(sdkErr.Message, "unparseable JSON") || sdkErr.Body != "" {
+		t.Fatalf("unexpected: %v (body %q)", sdkErr, sdkErr.Body)
 	}
 	if err := decodeJSONOK(&httpResult{Status: 204}, "GET x", nil); err != nil {
 		t.Fatalf("2xx with nil target should pass: %v", err)
@@ -259,6 +259,7 @@ func TestGoogleMetadataSvidSourceUsesHelper(t *testing.T) {
 	var gotFlavor string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotFlavor = r.Header.Get("Metadata-Flavor")
+		w.Header().Set("Metadata-Flavor", "Google")
 		if r.URL.Query().Get("audience") == "bad" {
 			w.WriteHeader(404)
 			return
@@ -304,7 +305,7 @@ func countingAttester(t *testing.T, gate chan struct{}, entered chan struct{}) (
 		writeJSON(w, 200, map[string]any{
 			"attestation_endpoint": srv.URL + "/mint",
 			"token_endpoint":       srv.URL + "/token",
-			"evidence_audience":    "aud",
+			"evidence_audience":    shortAudience,
 		})
 	})
 	mux.HandleFunc("/mint", func(w http.ResponseWriter, r *http.Request) {
@@ -329,7 +330,7 @@ func countingAttester(t *testing.T, gate chan struct{}, entered chan struct{}) (
 func TestTokenWaiterHonorsContextCancellation(t *testing.T) {
 	gate, entered := make(chan struct{}), make(chan struct{})
 	srv, calls := countingAttester(t, gate, entered)
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "s"}))
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "s"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +385,7 @@ func TestTokenWaiterHonorsContextCancellation(t *testing.T) {
 
 func TestForceRefreshBypassesCache(t *testing.T) {
 	srv, calls := countingAttester(t, nil, nil)
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "s"}))
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "s"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,12 +409,12 @@ func TestForceRefreshBypassesCache(t *testing.T) {
 	}
 }
 
-func TestTokenEndpointErrorKeepsFullBody(t *testing.T) {
+func TestTokenEndpointErrorBodyIsCapped(t *testing.T) {
 	long := `{"error":"invalid_client","error_description":"` + strings.Repeat("d", 1000) + `"}`
 	mux := http.NewServeMux()
 	var srv *httptest.Server
 	mux.HandleFunc("/.well-known/client-attester", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"attestation_endpoint": srv.URL + "/mint", "token_endpoint": srv.URL + "/token", "evidence_audience": "aud"})
+		writeJSON(w, 200, map[string]any{"attestation_endpoint": srv.URL + "/mint", "token_endpoint": srv.URL + "/token", "evidence_audience": shortAudience})
 	})
 	mux.HandleFunc("/mint", func(w http.ResponseWriter, r *http.Request) {
 		sub := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"c"}`))
@@ -425,10 +426,10 @@ func TestTokenEndpointErrorKeepsFullBody(t *testing.T) {
 	})
 	srv = httptest.NewServer(mux)
 	defer srv.Close()
-	ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "s"}))
+	ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "s"}))
 	_, err := ca.Token(context.Background())
 	sdkErr := asSDKError(t, err)
-	if sdkErr.Status != 401 || sdkErr.Body != long {
+	if sdkErr.Status != 401 || sdkErr.Body != long[:maxErrorBodyBytes] {
 		t.Fatalf("status %d, body %d bytes", sdkErr.Status, len(sdkErr.Body))
 	}
 }
@@ -442,5 +443,71 @@ func TestOpenBaoNon200IsTyped(t *testing.T) {
 	_, err := NewOpenBaoTransitSigner(srv.URL, "bad", "k")
 	if sdkErr := asSDKError(t, err); sdkErr.Status != http.StatusForbidden {
 		t.Fatalf("unexpected: %v", err)
+	}
+}
+
+func TestDoRequestRefusesUserinfoWithoutNamingIt(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	for _, target := range []string{
+		"http://alice:s3cret@" + u.Host + "/x?q=1",
+		"https://alice:s3cret@example.invalid/x",
+		"https://alice@example.invalid/x",
+	} {
+		_, err := doRequest(context.Background(), safeClient(nil, time.Second), http.MethodGet, target, nil, nil, 0)
+		sdkErr := asSDKError(t, err)
+		if strings.Contains(sdkErr.Message, "s3cret") || strings.Contains(sdkErr.Message, "alice") ||
+			!strings.Contains(sdkErr.Message, "userinfo") {
+			t.Errorf("%s: %q", target, sdkErr.Message)
+		}
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Fatalf("server contacted %d times", n)
+	}
+}
+
+func TestDoRequestErrorsOmitTheQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	target := srv.URL + "/token?client_secret=s3cret"
+	srv.Close() // connection refused
+	_, err := doRequest(context.Background(), safeClient(nil, time.Second), http.MethodGet, target, nil, nil, 0)
+	var ue *url.Error
+	if err == nil || !errors.As(err, &ue) {
+		t.Fatalf("want a *url.Error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "/token") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestSafeClientUsesTheSDKProxyPolicy(t *testing.T) {
+	if c := safeClient(nil, time.Second); c.Transport == nil {
+		t.Fatal("SDK client falls back to http.DefaultTransport (ProxyFromEnvironment proxies plain http)")
+	}
+	if c := safeClient(&http.Client{}, time.Second); c.Transport == nil {
+		t.Fatal("caller client without a Transport falls back to http.DefaultTransport")
+	}
+	own := &http.Transport{}
+	if c := safeClient(&http.Client{Transport: own}, time.Second); c.Transport != own {
+		t.Fatal("caller's own Transport replaced")
+	}
+}
+
+// safeClient never returns a client without a timeout, whatever its caller passes.
+func TestSafeClientAlwaysHasATimeout(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		if got := safeClient(nil, d); got.Timeout != fallbackTimeout {
+			t.Fatalf("safeClient(nil, %v).Timeout = %v", d, got.Timeout)
+		}
+		if got := safeClient(&http.Client{Timeout: -time.Second}, d); got.Timeout != fallbackTimeout {
+			t.Fatalf("safeClient(negative, %v).Timeout = %v", d, got.Timeout)
+		}
+	}
+	if got := safeClient(&http.Client{Timeout: -time.Second}, 2*time.Second); got.Timeout != 2*time.Second {
+		t.Fatalf("negative client timeout: got %v", got.Timeout)
 	}
 }

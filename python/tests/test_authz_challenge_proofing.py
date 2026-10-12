@@ -249,11 +249,11 @@ def test_status_hook_blip_is_not_a_verdict():
     assert world.outcomes == []
 
 
-def test_doctype_defaults_from_the_challenge():
+def test_doctype_defaults_from_the_challenge_when_allowed():
     world, fake, clock = World(), FakeAS(), Clock()
-    r = _resolver(world, fake, clock)
+    r = _resolver(world, fake, clock, doctypes=[MDL])
     res = r.resolve(CHALLENGE, subject="alice", instruction={"account": "savings"}, initiator="a")
-    assert res.detail["doctype"] == MDL          # taken from the challenge, not guessed
+    assert res.detail["doctype"] == MDL          # taken from the challenge, because the caller allows it
     assert res.txn_hash == transaction_hash({"subject": "alice", "account": "savings", "doctype": MDL})
 
 

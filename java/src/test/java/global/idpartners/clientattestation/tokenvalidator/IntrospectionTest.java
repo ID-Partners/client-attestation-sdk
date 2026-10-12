@@ -213,8 +213,9 @@ class IntrospectionTest {
         AccessTokenValidator v = new AccessTokenValidator(config()
                 .introspection(new IntrospectionConfig(dead, "rs", "s")).build());
         assertThrows(TransportException.class, () -> v.introspect("t"));
+        // allowInsecure, so "://bad" reaches the transport
         AccessTokenValidator bad = new AccessTokenValidator(config()
-                .introspection(new IntrospectionConfig("://bad", "rs", "s")).build());
+                .introspection(new IntrospectionConfig("://bad", "rs", "s")).allowInsecure(true).build());
         assertThrows(IllegalArgumentException.class, () -> bad.introspect("t"));
     }
 }

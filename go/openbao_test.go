@@ -175,3 +175,51 @@ func closedPortURL(t *testing.T) string {
 	}
 	return "http://" + addr
 }
+
+func TestOpenBaoRefusesPlainHTTPForNonLoopbackHost(t *testing.T) {
+	// Refused before any request: the vault token must not travel in cleartext, and a key read from
+	// whoever answers would become the attester's published JWK.
+	_, err := NewOpenBaoTransitSigner("http://openbao.internal.invalid:8200", "tok", fakeKeyName)
+	if err == nil || !strings.Contains(err.Error(), "https is required") || !strings.Contains(err.Error(), "WithOpenBaoAllowInsecure()") {
+		t.Fatalf("err = %v, want an https refusal", err)
+	}
+}
+
+func TestOpenBaoAllowInsecureOptOut(t *testing.T) {
+	// The opt-out lifts the rule: the call is attempted (and fails only because nothing is there).
+	_, err := NewOpenBaoTransitSigner("http://openbao.internal.invalid:8200", "tok", fakeKeyName, WithOpenBaoAllowInsecure())
+	if err == nil || strings.Contains(err.Error(), "https is required") {
+		t.Fatalf("err = %v, want the request attempted", err)
+	}
+}
+
+func TestOpenBaoLoopbackHTTPIsAllowed(t *testing.T) {
+	srv, _ := newFakeBao(t, "tok")
+	defer srv.Close()
+	localhost := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	if _, err := NewOpenBaoTransitSigner(localhost, "tok", fakeKeyName); err != nil {
+		t.Fatalf("loopback http must be allowed: %v", err)
+	}
+}
+
+func TestOpenBaoRejectsKeyNamesThatEscapeThePath(t *testing.T) {
+	var hits []string
+	srv, _ := newFakeBao(t, "tok")
+	defer srv.Close()
+	recorder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.RequestURI())
+		srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer recorder.Close()
+	for _, name := range []string{"../../sys/raw/x", "k/../../../sys/seal", "k?x=1", "k#frag", "a/b", "%2e%2e", ".", "..", "", "k y"} {
+		if _, err := NewOpenBaoTransitSigner(recorder.URL, "tok", name); err == nil || !strings.Contains(err.Error(), "invalid transit key name") {
+			t.Errorf("key name %q: err = %v, want a refusal", name, err)
+		}
+	}
+	if len(hits) != 0 {
+		t.Fatalf("the vault token was sent to %v", hits)
+	}
+	if _, err := NewOpenBaoTransitSigner(recorder.URL, "tok", "attestation_es256.v-2"); err != nil {
+		t.Fatalf("a plain key name must be accepted: %v", err)
+	}
+}

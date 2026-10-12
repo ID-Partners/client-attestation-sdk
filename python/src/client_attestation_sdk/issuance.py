@@ -33,9 +33,9 @@ INSTANCE_PROOF_TYP = PingFederateProfile.INSTANCE_PROOF_TYP
 
 
 class IssuanceError(ClientAttestationError):
-    """The issuance endpoint rejected the request (non-2xx). Carries the OAuth-style error body. Transport
-    failures (network, timeout, redirect, oversized or malformed response) raise
-    :class:`~client_attestation_sdk.errors.TransportError` instead."""
+    """The issuance endpoint rejected the request (non-2xx). Carries the OAuth-style error body (at most its
+    first 512 bytes). Transport failures (network, timeout, redirect, oversized or malformed response)
+    raise :class:`~client_attestation_sdk.errors.TransportError` instead."""
 
     def __init__(self, status: int, body: str):
         super().__init__(f"attestation issuance failed: HTTP {status}: {body}", status=status, body=body)
@@ -74,14 +74,19 @@ class AttestationIssuanceClient:
     ``profile`` sets the mint protocol (default :class:`~client_attestation_sdk.attester.PingFederateProfile`;
     see docs/attester-profiles.md). The endpoint is given directly, so the profile's discovery is not used.
 
+    The SVID is a bearer credential to the attester, so ``endpoint``, and every URL the profile calls, must be
+    https unless its host is loopback (``localhost``, ``127.0.0.1``, ``::1``) or ``allow_insecure=True``.
+
     **Experimental** (see docs/api.md): it calls a PingFederate demo issuance servlet
     (/federation/attestation) whose protocol is not standardised.
     """
 
     def __init__(self, endpoint: str, client_id: str, attester_issuer: str, svid_source: SvidSource,
                  *, instance_key: SigningKeyPair = None, algorithm: str = "ES256",
-                 profile: AttesterProfile = None):
+                 profile: AttesterProfile = None, allow_insecure: bool = False):
         self.endpoint = endpoint.rstrip("/")
+        _http.require_https(self.endpoint, "endpoint", allow_insecure)
+        self._allow_insecure = allow_insecure
         self.client_id = client_id
         self.attester_issuer = attester_issuer      # the SVID audience AND the instance-proof aud
         self._svid_source = svid_source
@@ -93,16 +98,22 @@ class AttestationIssuanceClient:
         """Fetch the SVID, prove possession of the instance key, and exchange them for a minted attestation."""
         svid = self._svid_source.fetch(self.attester_issuer)
         metadata = AttesterMetadata(evidence_audience=self.attester_issuer, attestation_endpoint=self.endpoint)
-        minted = self.profile.mint(_IssuanceTransport(), metadata, MintRequest(
+        minted = self.profile.mint(_IssuanceTransport(self._allow_insecure), metadata, MintRequest(
             instance_key=self.instance_key, evidence=svid, challenge=challenge or None,
             client_id=self.client_id, authorization_details=authorization_details or None))
+        if minted is None or not minted.attestation:
+            raise ClientAttestationError("attester response contained no attestation")
         return IssuedAttestation(minted.attestation, minted.expires_in, self.instance_key)
 
 
 class _IssuanceTransport:
-    """The issuance endpoint's transport: a non-2xx answer is an :class:`IssuanceError`."""
+    """The issuance endpoint's transport: the https rule, and a non-2xx answer is an :class:`IssuanceError`."""
+
+    def __init__(self, allow_insecure: bool = False):
+        self._allow_insecure = allow_insecure
 
     def request_json(self, step: str, method: str, url: str, body: dict = None) -> dict:
+        _http.require_https(url, f"{step} URL", self._allow_insecure)
         headers = {"Accept": "application/json"}
         data = None
         if body is not None:
@@ -110,5 +121,5 @@ class _IssuanceTransport:
             headers = {"Content-Type": "application/json", "Accept": "application/json"}
         result = _http.request(method, url, body=data, timeout=20, headers=headers)
         if not result.ok:
-            raise IssuanceError(result.status, result.text())
+            raise IssuanceError(result.status, result.body[:_http.ERROR_BODY_LIMIT].decode("utf-8", "replace"))
         return _http.json_ok(result, "attestation issuance endpoint")

@@ -8,9 +8,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import jwt
 import pytest
 
-from client_attestation_sdk import ClientAttestation, StaticSvidSource
+from client_attestation_sdk import AttesterMetadata, ClientAttestation, ClientAttestationError, StaticSvidSource
 from client_attestation_sdk import evidence as evidence_mod
+from client_attestation_sdk.errors import TransportError
 from client_attestation_sdk.token_source import _jwt_sub, _normalize_base_url
+
+AUD = "https://attester.example.com"  # the evidence_audience the fake attester's discovery document names
 
 
 def _claims(token):
@@ -82,7 +85,7 @@ def test_azure_imds_source_extracts_access_token_from_json_envelope(monkeypatch)
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
         monkeypatch.setattr(evidence_mod, "AZURE_IMDS_IDENTITY", base + "/metadata/identity/oauth2/token")
-        source = evidence_mod.AzureImdsSvidSource(timeout=2.0)
+        source = evidence_mod.AzureImdsSvidSource(timeout=2.0, resource="https://attester.example.com")
         token = source.fetch("https://attester.example.com")
         assert token == "azure-mi-jwt-xyz"
     finally:
@@ -184,7 +187,7 @@ def fake_attester():
 
 
 def test_full_flow_returns_and_caches_a_token(fake_attester):
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"))
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD)
     token = ca.token()
     assert token == "AT-xyz"
     assert ca.authorization_header()["Authorization"] == "Bearer AT-xyz"
@@ -201,7 +204,7 @@ def test_full_flow_returns_and_caches_a_token(fake_attester):
 
 
 def test_dpop_combined_mode_sends_dpop_header_with_challenge_as_nonce(fake_attester):
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"),
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD,
                             pop_method="dpop_combined")
     token = ca.token()
     assert token == "AT-xyz"
@@ -217,7 +220,7 @@ def test_asserted_context_is_sent_and_never_cached(fake_attester):
     # A directory-hosted gateway threading an Entra-asserted Copilot-agent oid through: sent on the mint
     # body, and each call mints fresh (a different asserted discriminator can resolve to a different
     # ceiling, so reusing a cached token across discriminators would be wrong).
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"))
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD)
     ca.token()  # warms the plain (no-asserted-context) cache
     assert len(_FakeAttester.mint_bodies) == 1
 
@@ -239,7 +242,7 @@ def test_trace_records_every_wire_call_as_runnable_curl(fake_attester):
     render as "show the exact request". Absent (default None) costs nothing, per the other tests."""
     trace = []
     # trace_redact=False: this test reads the raw artifacts back (local-debugging mode).
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), trace=trace,
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD, trace=trace,
                            trace_redact=False)
     ca.token()
 
@@ -268,7 +271,7 @@ def test_challenge_at_token_false_omits_it_from_the_pop(fake_attester):
     """Some attesters consume the challenge the moment the mint's instance proof uses it, then reject
     a token request presenting the same value as unknown/expired. challenge_at_token=False keeps the
     mint-time protection (the challenge still reaches the instance proof) but drops the PoP's copy."""
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), challenge_at_token=False)
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD, challenge_at_token=False)
     token = ca.token()
     assert token == "AT-xyz"
 
@@ -279,7 +282,7 @@ def test_challenge_at_token_false_omits_it_from_the_pop(fake_attester):
 
 
 def test_challenge_at_token_false_omits_the_dpop_nonce(fake_attester):
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), challenge_at_token=False,
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD, challenge_at_token=False,
                            pop_method="dpop_combined")
     assert ca.token() == "AT-xyz"
     assert "nonce" not in _claims(_FakeAttester.token_request_headers[0]["dpop"])
@@ -289,7 +292,7 @@ def test_challenge_at_token_false_omits_the_dpop_nonce(fake_attester):
 def test_operator_rides_the_mint_body_and_the_token_form_as_sorted_compact_json(fake_attester):
     from urllib.parse import parse_qs
     operator = {"sub": "ops-team@example.com", "iss": "https://op.example.com"}
-    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), operator=operator)
+    ca = ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD, operator=operator)
     assert ca.token() == "AT-xyz"
     assert _FakeAttester.mint_bodies[0]["operator"] == operator
     form = parse_qs(_FakeAttester.token_forms[0])
@@ -297,6 +300,46 @@ def test_operator_rides_the_mint_body_and_the_token_form_as_sorted_compact_json(
 
 
 def test_no_operator_sends_nothing(fake_attester):
-    ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid")).token()
+    ClientAttestation(fake_attester, evidence=StaticSvidSource("fake-svid"), evidence_audience=AUD).token()
     assert "operator" not in _FakeAttester.mint_bodies[0]
     assert "operator" not in _FakeAttester.token_forms[0]
+
+
+class _RecordingSource:
+    """An evidence source that records the audiences it was asked for."""
+
+    def __init__(self):
+        self.audiences = []
+
+    def fetch(self, audience):
+        self.audiences.append(audience)
+        return "svid"
+
+
+def test_evidence_audience_is_required_before_any_request():
+    """Without a pin the discovery document would choose the audience the workload's identity token is for."""
+    source = _RecordingSource()
+    ca = ClientAttestation("https://attester.invalid", evidence=source)  # not resolvable: any request would fail
+    with pytest.raises(ClientAttestationError, match="evidence_audience is required"):
+        ca.token()
+    assert source.audiences == []
+
+
+def test_a_discovered_audience_other_than_the_pin_fetches_no_evidence(fake_attester):
+    source = _RecordingSource()
+    ca = ClientAttestation(fake_attester, evidence=source, evidence_audience="https://other-service.example")
+    with pytest.raises(ClientAttestationError, match="asks for evidence for 'https://attester.example.com'"):
+        ca.token()
+    assert source.audiences == []
+
+
+def test_static_metadata_needs_no_pin_but_must_match_one():
+    meta = AttesterMetadata(evidence_audience="aud-1", attestation_endpoint="https://attester.invalid/mint",
+                            token_endpoint="https://attester.invalid/token")
+    source = _RecordingSource()
+    with pytest.raises(ClientAttestationError, match="but evidence_audience is 'aud-2'"):
+        ClientAttestation(metadata=meta, evidence=source, evidence_audience="aud-2").token()
+    assert source.audiences == []
+    with pytest.raises(TransportError):  # no pin needed: the flow gets as far as minting
+        ClientAttestation(metadata=meta, evidence=source, timeout=1).token()
+    assert source.audiences == ["aud-1"]

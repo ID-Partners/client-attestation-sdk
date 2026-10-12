@@ -1,6 +1,7 @@
 package clientattestation
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -214,5 +215,112 @@ func TestIssuanceErrorMessage(t *testing.T) {
 	err := &IssuanceError{Status: 403, Body: "denied"}
 	if got := err.Error(); got != "attestation issuance failed: HTTP 403: denied" {
 		t.Fatalf("Error() = %q", got)
+	}
+}
+
+// recordingTransport answers every request itself and records where it went, so a test can show that a
+// request to a non-loopback host was (or was not) sent, without any network.
+type recordingTransport struct{ urls []string }
+
+func (r *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.urls = append(r.urls, req.URL.String())
+	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{"attestation":"h.p.s","client_attestation":"h.p.s"}`)), Request: req}, nil
+}
+
+func TestIssuanceClientRefusesPlainHTTPEndpoint(t *testing.T) {
+	_, err := NewAttestationIssuanceClient("http://pf.example/federation/attestation", "c", "aud", StaticSvidSource{SVID: "s"})
+	if err == nil || !strings.Contains(err.Error(), "https is required") || !strings.Contains(err.Error(), "WithIssuanceAllowInsecure()") {
+		t.Fatalf("err = %v, want an https refusal", err)
+	}
+	if _, err := NewAttestationIssuanceClient("http://localhost:9031/federation/attestation", "c", "aud", StaticSvidSource{SVID: "s"}); err != nil {
+		t.Fatalf("loopback http must be allowed: %v", err)
+	}
+}
+
+func TestIssuanceClientAllowInsecureOptOut(t *testing.T) {
+	ic, err := NewAttestationIssuanceClient("http://pf.example/federation/attestation", "c", "aud", StaticSvidSource{SVID: "s"},
+		WithIssuanceAllowInsecure())
+	if err != nil || !ic.AllowInsecure {
+		t.Fatalf("the opt-out must accept the endpoint: %+v, %v", ic, err)
+	}
+	rec := &recordingTransport{}
+	ic.HTTPClient = &http.Client{Transport: rec}
+	if _, err := ic.Bootstrap(nil, ""); err != nil || len(rec.urls) != 1 {
+		t.Fatalf("with the opt-out the request is sent: %v, %v", rec.urls, err)
+	}
+	// AllowInsecure covers the calls a profile makes too.
+	ic.Profile = offsiteProfile{target: "http://attester.example/mint"}
+	if issued, err := ic.Bootstrap(nil, ""); err != nil || issued.Attestation != "h.p.s" || len(rec.urls) != 2 {
+		t.Fatalf("with AllowInsecure the profile's call is sent: %v, %v", rec.urls, err)
+	}
+}
+
+func TestIssuanceClientStructLiteralKeepsTheHTTPSRule(t *testing.T) {
+	key, _ := Generate("ES256")
+	rec := &recordingTransport{}
+	ic := &AttestationIssuanceClient{Endpoint: "http://pf.example/federation/attestation", ClientID: "c",
+		AttesterIssuer: "aud", Source: StaticSvidSource{SVID: "the-svid"}, InstanceKey: key,
+		HTTPClient: &http.Client{Transport: rec}}
+	if _, err := ic.Bootstrap(nil, ""); err == nil || !strings.Contains(err.Error(), "https is required") {
+		t.Fatalf("err = %v, want an https refusal", err)
+	}
+	if len(rec.urls) != 0 {
+		t.Fatalf("the SVID was sent to %v", rec.urls)
+	}
+}
+
+// offsiteProfile mints through the transport at a URL of its own choosing, as a custom profile may.
+type offsiteProfile struct{ target string }
+
+func (offsiteProfile) Discover(context.Context, AttesterTransport, string) (*AttesterMetadata, error) {
+	return nil, errors.New("not used")
+}
+
+func (p offsiteProfile) Mint(ctx context.Context, t AttesterTransport, _ *AttesterMetadata, req *MintRequest) (*MintResult, error) {
+	var out struct {
+		ClientAttestation string `json:"client_attestation"`
+	}
+	if err := t.RequestJSON(ctx, "mint", http.MethodPost, p.target, map[string]any{"evidence": req.Evidence}, &out); err != nil {
+		return nil, err
+	}
+	return &MintResult{Attestation: out.ClientAttestation}, nil
+}
+
+func TestIssuanceTransportAppliesTheHTTPSRuleToProfiles(t *testing.T) {
+	rec := &recordingTransport{}
+	ic, err := NewAttestationIssuanceClient("https://pf.example/federation/attestation", "c", "aud", StaticSvidSource{SVID: "the-svid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic.HTTPClient = &http.Client{Transport: rec}
+	ic.Profile = offsiteProfile{target: "http://attester.example/mint"}
+	if _, err := ic.Bootstrap(nil, ""); err == nil || !strings.Contains(err.Error(), "https is required") {
+		t.Fatalf("err = %v, want an https refusal", err)
+	}
+	if len(rec.urls) != 0 {
+		t.Fatalf("the SVID was sent to %v", rec.urls)
+	}
+}
+
+// emptyProfile returns no result and no error.
+type emptyProfile struct{ result *MintResult }
+
+func (emptyProfile) Discover(context.Context, AttesterTransport, string) (*AttesterMetadata, error) {
+	return nil, errors.New("not used")
+}
+
+func (p emptyProfile) Mint(context.Context, AttesterTransport, *AttesterMetadata, *MintRequest) (*MintResult, error) {
+	return p.result, nil
+}
+
+func TestBootstrapRejectsAProfileThatMintsNothing(t *testing.T) {
+	for _, result := range []*MintResult{nil, {}} {
+		ic, _ := NewAttestationIssuanceClient("https://pf.example", "c", "aud", StaticSvidSource{SVID: "s"})
+		ic.Profile = emptyProfile{result: result}
+		issued, err := ic.Bootstrap(nil, "")
+		if err == nil || issued != nil || !strings.Contains(err.Error(), "no attestation") {
+			t.Fatalf("result %+v: issued = %+v, err = %v", result, issued, err)
+		}
 	}
 }

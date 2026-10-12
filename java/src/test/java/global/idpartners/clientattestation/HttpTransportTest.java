@@ -130,8 +130,8 @@ class HttpTransportTest {
         TransportException e = assertThrows(TransportException.class, () -> HttpTransport.jsonOk(r));
         assertEquals(503, e.status());
         assertTrue(e.getMessage().startsWith("HTTP 503: "));
-        assertTrue(e.body().length() <= HttpTransport.ERROR_BODY_CHARS + 3);
-        assertTrue(e.getMessage().length() < 600);
+        assertEquals("z".repeat(512), e.body());
+        assertEquals("HTTP 503: " + "z".repeat(512), e.getMessage());
     }
 
     @Test
@@ -209,6 +209,84 @@ class HttpTransportTest {
     void truncateCapsAt512Chars() {
         assertEquals("", HttpTransport.truncate(null));
         assertEquals("short", HttpTransport.truncate("short"));
-        assertEquals(512 + 3, HttpTransport.truncate("q".repeat(2000)).length());
+        assertEquals("q".repeat(512), HttpTransport.truncate("q".repeat(2000)));
+        assertEquals("r".repeat(512), HttpTransport.truncate("r".repeat(512)));
+    }
+
+    @Test
+    void userinfoUrlIsRefusedWithoutNamingItOrContactingTheHost() {
+        this.server.respond("/x", 200, "{}");
+        String withUser = this.server.url("/x").replace("://", "://alice:s3cret@") + "?q=1";
+        for (String target : new String[] {withUser, "https://alice:s3cret@example.invalid/x",
+                "https://alice@example.invalid/x"}) {
+            TransportException e = assertThrows(TransportException.class, () -> HttpTransport.send(this.client,
+                    HttpRequest.newBuilder(URI.create(target)).GET(), TIMEOUT));
+            assertTrue(e.getMessage().contains("userinfo"), e.getMessage());
+            assertFalse(e.getMessage().contains("s3cret") || e.getMessage().contains("alice"), e.getMessage());
+        }
+        assertEquals(0, this.server.hits("/x"));
+    }
+
+    @Test
+    void errorsOmitTheQuery() throws Exception {
+        int port;
+        try (ServerSocket s = new ServerSocket(0)) {
+            port = s.getLocalPort();
+        }
+        String target = "http://127.0.0.1:" + port + "/token?client_secret=s3cret#f";
+        TransportException e = assertThrows(TransportException.class, () -> HttpTransport.send(this.client,
+                HttpRequest.newBuilder(URI.create(target)).GET(), TIMEOUT));
+        assertTrue(e.getMessage().startsWith("GET http://127.0.0.1:" + port + "/token "), e.getMessage());
+        assertFalse(e.getMessage().contains("s3cret"), e.getMessage());
+        assertEquals("https://as.example.com:8443/a%2Fb",
+                HttpTransport.display(URI.create("https://u:p@as.example.com:8443/a%2Fb?x=1#f")));
+    }
+
+    @Test
+    void neverProxiedHosts() {
+        for (String host : new String[] {"127.0.0.1", "127.8.0.1", "::1", "[::1]", "localhost", "LocalHost.",
+                "vault.localhost", "::ffff:127.0.0.1", "0.0.0.0", "169.254.169.254", "fe80::1", "fe80::1%en0",
+                "fd00:ec2::254", "metadata.google.internal", "metadata"}) {
+            assertTrue(HttpTransport.neverProxied(host), host);
+        }
+        for (String host : new String[] {"as.example.com", "10.0.0.1", "8.8.8.8", "2001:db8::1", "", "999.1.1.1"}) {
+            assertFalse(HttpTransport.neverProxied(host), host);
+        }
+        assertFalse(HttpTransport.neverProxied(null));
+    }
+
+    @Test
+    void proxyOnlyForHttpsToRemoteHosts() {
+        java.net.ProxySelector saved = java.net.ProxySelector.getDefault();
+        java.net.Proxy proxy = new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                java.net.InetSocketAddress.createUnresolved("proxy.example", 3128));
+        int[] failures = {0};
+        java.net.ProxySelector.setDefault(new java.net.ProxySelector() {
+            @Override
+            public java.util.List<java.net.Proxy> select(URI uri) {
+                return java.util.List.of(proxy);
+            }
+
+            @Override
+            public void connectFailed(URI uri, java.net.SocketAddress sa, java.io.IOException e) {
+                failures[0]++;
+            }
+        });
+        try {
+            java.net.ProxySelector sdk = this.client.proxy().orElseThrow();
+            assertEquals(java.util.List.of(proxy), sdk.select(URI.create("https://as.example.com/token")));
+            for (String direct : new String[] {"http://vault.example.com/v1/transit/keys/k",
+                    "http://metadata.google.internal/x", "https://169.254.169.254/x", "https://127.0.0.1:8443/x",
+                    "https://[fe80::1]/x", "https://localhost/x"}) {
+                assertEquals(java.util.List.of(java.net.Proxy.NO_PROXY), sdk.select(URI.create(direct)), direct);
+            }
+            sdk.connectFailed(URI.create("https://as.example.com/"), null, new java.io.IOException("x"));
+            assertEquals(1, failures[0]);
+            java.net.ProxySelector.setDefault(null);
+            assertEquals(java.util.List.of(java.net.Proxy.NO_PROXY), sdk.select(URI.create("https://as.example.com/")));
+            sdk.connectFailed(URI.create("https://as.example.com/"), null, new java.io.IOException("x"));
+        } finally {
+            java.net.ProxySelector.setDefault(saved);
+        }
     }
 }

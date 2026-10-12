@@ -14,6 +14,11 @@ A profile does two things:
 
 The profile also supplies the token endpoint when the attester does not name one.
 
+The client doesn't trust a discovered evidence audience on its own. When the audience comes from discovery,
+whichever profile ran it, the client must be given the same value as `evidence_audience` (Python),
+`evidenceAudience` (TypeScript), `WithEvidenceAudience` (Go) or `.evidenceAudience(...)` (Java). Otherwise the
+flow fails before any evidence is fetched. Static metadata needs no pin.
+
 Everything the draft defines stays in the client, whatever the profile: the challenge endpoint call
 (`POST challenge_endpoint`, `attestation_challenge` in the response), the Client Attestation PoP JWT or
 DPoP proof, the token request with its `OAuth-Client-Attestation` headers, the DPoP nonce retry, token
@@ -46,14 +51,15 @@ mention a profile behaves exactly as it did in 0.3.0, byte for byte on the wire.
   "instance_key": { "kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "..." },
   "svid": "<the workload's platform identity token>",
   "proof": "<instance proof JWT>",
-  "authorization_details": [ ... ],
-  "operator": { ... }
+  "authorization_details": [{ "type": "sales_agent", "sales_regions": ["EMEA"] }],
+  "operator": { "sub": "operator@example.com" }
 }
 ```
 
 `authorization_details` and `operator` are sent only when set (Python also sends `asserted_context` when a
 call passes one). The one-call client sends no `client_id`: the attester maps the identity to a client.
-The issuance client (`AttestationIssuanceClient`) puts `client_id` first.
+The issuance client (`AttestationIssuanceClient`) adds `client_id`, first in the body in every port but Go
+(Go's `encoding/json` sorts the keys; JSON member order carries no meaning).
 
 The instance proof is a JWT signed by the new instance key, with header
 `{"alg": ..., "typ": "oauth-attestation-instance-proof+jwt", "kid": <thumbprint>}` (no `jwk`) and claims
@@ -108,13 +114,50 @@ ClientAttestation ca = ClientAttestation.builder()
 
 Static endpoints must still be https unless they are loopback or the client allows insecure URLs.
 
+## Metadata and mint-request fields
+
+Static metadata takes precedence over profile discovery.
+The selected profile still handles minting.
+The resolved metadata is cached with the client.
+
+| Metadata field | Python | TypeScript / Java | Go | Default |
+| --- | --- | --- | --- | --- |
+| Evidence audience | `evidence_audience` | `evidenceAudience` | `EvidenceAudience` | Required by the one-call client, which fetches evidence for it before minting. |
+| Mint URL | `attestation_endpoint` | `attestationEndpoint` | `AttestationEndpoint` | Required by the PingFederate profile. |
+| Token URL | `token_endpoint` | `tokenEndpoint` | `TokenEndpoint` | Discovery falls back to the base URL plus `/as/token.oauth2`. Supply it explicitly in static metadata. |
+| Challenge URL | `challenge_endpoint` | `challengeEndpoint` | `ChallengeEndpoint` | Absent. No challenge request is made without it. |
+| PoP audience | `pop_audience` | `popAudience` | `PopAudience` | Token endpoint URL. |
+| Original document | `document` | `document` | `Document` | Absent. Optional object retained for profile-specific fields and discovery inspection. |
+
+Python constructs `AttesterMetadata` with keyword arguments.
+TypeScript supplies an object. Go supplies a struct.
+Java's full record constructor takes those six fields in the order shown.
+`AttesterMetadata.of(evidenceAudience, attestationEndpoint, tokenEndpoint)` sets the first values.
+`.withChallengeEndpoint(url)` and `.withPopAudience(audience)` return updated records.
+A document alone does not populate the normalised endpoint fields.
+
+`MintRequest` carries `instance_key`, `evidence`, optional `challenge`, `client_id`,
+`authorization_details` and `operator` in Python.
+TypeScript and Java use `instanceKey`, `clientId` and `authorizationDetails`.
+Go uses `InstanceKey`, `Evidence`, `Challenge`, `ClientID`, `AuthorizationDetails` and `Operator`.
+Python also exposes optional `asserted_context`.
+The caller supplies no operator or asserted context through `AttestationIssuanceClient`.
+A custom profile decides which of these values its attester accepts.
+
+`sign(claims, typ)` signs arbitrary profile claims with the instance key.
+`instance_proof(typ, audience)` signs `aud`, a fresh `jti`, current `iat` and an optional challenge.
+TypeScript and Java use `instanceProof`. Go uses `Sign` and `InstanceProof`.
+Neither helper chooses the attester's proprietary proof type for a custom profile.
+`MintResult` supplies `attestation` and optional `expires_in` / `expiresIn` / `ExpiresIn`.
+Its lifetime describes the attestation. The one-call token cache uses the later token response's lifetime.
+
 ## Writing a custom profile
 
 Implement the two methods. Each gets a **transport** from the client, so the profile's calls share the
 client's timeout, redirect and size limits, https rule, logging and (in Python) trace. Name each call with a
 `step` (`discover`, `mint`, or your own); it shows up in `http.failed` events. The **mint request** carries
 the instance key, the evidence, the challenge, the optional `client_id`, `authorization_details` and
-`operator`, and has two helpers: `instance_proof(typ, audience)` signs the usual
+`operator` (and in Python `asserted_context`), and has two helpers: `instance_proof(typ, audience)` signs the usual
 `{aud, jti, iat[, challenge]}` proof with the instance key, and `sign(claims, typ)` signs anything else.
 
 Each example below is for a made-up attester that publishes its configuration at `/acme/config`, wants a
@@ -138,7 +181,7 @@ class AcmeProfile(AttesterProfile):
         response = transport.request_json("mint", "POST", metadata.attestation_endpoint, body)
         return MintResult(response["client_attestation"], response.get("ttl"))
 
-ca = ClientAttestation("https://attester.example", profile=AcmeProfile())
+ca = ClientAttestation("https://attester.example", profile=AcmeProfile(), evidence_audience="acme-aud")
 ```
 
 ### TypeScript
@@ -167,7 +210,7 @@ const acme: AttesterProfile = {
   },
 };
 
-const ca = new ClientAttestation("https://attester.example", { profile: acme });
+const ca = new ClientAttestation("https://attester.example", { profile: acme, evidenceAudience: "acme-aud" });
 ```
 
 ### Go
@@ -205,7 +248,7 @@ func (acmeProfile) Mint(ctx context.Context, t clientattestation.AttesterTranspo
 }
 
 ca, err := clientattestation.NewClientAttestation("https://attester.example",
-    clientattestation.WithAttesterProfile(acmeProfile{}))
+    clientattestation.WithAttesterProfile(acmeProfile{}), clientattestation.WithEvidenceAudience("acme-aud"))
 ```
 
 ### Java
@@ -229,7 +272,8 @@ final class AcmeProfile implements AttesterProfile {
     }
 }
 
-ClientAttestation ca = ClientAttestation.builder("https://attester.example").profile(new AcmeProfile()).build();
+ClientAttestation ca = ClientAttestation.builder("https://attester.example").profile(new AcmeProfile())
+        .evidenceAudience("acme-aud").build();
 ```
 
 A profile and static metadata can be combined: the metadata replaces discovery, and the profile mints.
@@ -240,7 +284,11 @@ A profile and static metadata can be combined: the metadata replaces discovery, 
 takes a profile too (`profile=` in Python, `{ profile }` in the TypeScript `create` options, the `Profile`
 field in Go, a constructor argument in Java), and uses the profile's mint with `client_id` set on the mint
 request. Its transport keeps its own errors: a non-2xx answer is still an `IssuanceError` /
-`IssuanceException`.
+`IssuanceException`. It shares the timeout, redirect refusal and size cap, and keeps the https rule too:
+the endpoint and every URL the profile calls must be https unless loopback, and the client's own
+allow-insecure option (`allow_insecure=` in Python, `{ allowInsecure }` in TypeScript,
+`WithIssuanceAllowInsecure()` or the `AllowInsecure` field in Go, a trailing `boolean` in Java) lifts it.
+It does not log.
 
 ## Per-port names
 

@@ -85,7 +85,7 @@ class AttesterProfileTest {
     @Test
     void defaultProfileIsPingFederate() throws Exception {
         ClientAttestation ca = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
-                .build();
+                .evidenceAudience(this.server.url("")).build();
         assertEquals("at-1", ca.token());
         assertEquals(List.of("/.well-known/client-attester", "/pf/mint", "/token"), this.seen);
         Map<String, Object> body = body("/pf/mint");
@@ -99,7 +99,7 @@ class AttesterProfileTest {
     @Test
     void customProfileGetsATokenEndToEnd() throws Exception {
         ClientAttestation ca = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
-                .profile(new AcmeProfile()).build();
+                .profile(new AcmeProfile()).evidenceAudience("acme-aud").build();
         assertEquals("at-1", ca.token());
         assertEquals(List.of("/acme/config", "/acme/mint", "/token"), this.seen);
         Map<String, Object> body = body("/acme/mint");

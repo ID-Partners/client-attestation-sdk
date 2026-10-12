@@ -66,7 +66,9 @@ class AttestationIssuanceClientTest {
         String pop = issued.pop(TOKEN_ENDPOINT, null, null);
         String dpop = issued.dpop("POST", TOKEN_ENDPOINT, null);
         Map<String, Object> dpopHeader = JwtTestSupport.header(dpop);
-        assertEquals(issued.instanceKey().publicJwk(), dpopHeader.get("jwk"));
+        Map<String, Object> expected = issued.instanceKey().publicJwk();
+        expected.remove("kid"); // a DPoP jwk carries the public members only, as in every port
+        assertEquals(expected, dpopHeader.get("jwk"));
         // A PoP JWT doesn't embed the jwk (the AS already has it from the attestation's cnf) — sanity
         // check the two proofs are otherwise independent per-call mints (different jti).
         assertNotEquals(JwtTestSupport.claims(pop).get("jti"), JwtTestSupport.claims(dpop).get("jti"));

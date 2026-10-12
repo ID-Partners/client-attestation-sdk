@@ -12,10 +12,11 @@ then:
     curl -i  -H 'Authorization: Bearer <token>' localhost:8770/mcp       # 200 when valid for this resource
 """
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from client_attestation_sdk.token_validator import AccessTokenValidator, ProtectedResource, ValidatorConfig
 
+# A local demo: in production serve over TLS, with an https resource URI.
 RESOURCE = "http://localhost:8770"          # this server's canonical URI (RFC 8707) — the token audience
 ISSUER = "https://issuer.example.com"       # the authorization server clients get a token from
 
@@ -26,6 +27,8 @@ resource = ProtectedResource(RESOURCE, [ISSUER], validator, scopes_supported=["m
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 10                            # seconds per socket read/write, so a slow client is dropped
+
     def do_GET(self):
         if self.path == resource.metadata_path():
             return self._json(200, resource.metadata())
@@ -52,4 +55,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print("protected resource listening on", RESOURCE)
-    HTTPServer(("127.0.0.1", 8770), Handler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", 8770), Handler)   # one thread per connection
+    server.daemon_threads = True
+    server.serve_forever()

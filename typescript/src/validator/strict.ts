@@ -30,7 +30,12 @@ export interface CompactParts {
   payload: Uint8Array;
 }
 
-function decodeSegment(segment: string): Uint8Array {
+/**
+ * One segment of a compact JWS: unpadded base64url in its canonical form (no non-zero padding bits).
+ *
+ * @internal
+ */
+export function decodeSegment(segment: string): Uint8Array {
   if (!SEGMENT.test(segment) || segment.length % 4 === 1) {
     throw new Malformed("malformed token");
   }

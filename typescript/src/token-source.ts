@@ -11,7 +11,7 @@
  *
  *     import { ClientAttestation } from "@idpartners/client-attestation-sdk";
  *
- *     const ca = new ClientAttestation("pf.example.com");
+ *     const ca = new ClientAttestation("pf.example.com", { evidenceAudience: "https://attester.example.com/evidence" });
  *     const token = await ca.token();                       // cached until it nears expiry
  *
  *     // the fetch wrapper attaches the token (and a DPoP proof for a DPoP-bound token):
@@ -21,7 +21,7 @@
  */
 import { base64url } from "jose";
 
-import { DpopProofBuilder } from "./builders.js";
+import { checkHtu, DpopProofBuilder, htuParts, normalizeHtu } from "./builders.js";
 import { ClientAttestationCredential, DPOP_HEADER } from "./credential.js";
 import { ClientAttestationError, TransportError } from "./errors.js";
 import { autoDetectEvidence } from "./evidence.js";
@@ -33,9 +33,9 @@ import {
   PingFederateProfile,
   metadataDocument,
 } from "./attester.js";
-import { jsonOk, request, type HttpRequestOptions, type HttpResponse } from "./http.js";
+import { checkSecure, jsonOk, request, snippet, type HttpRequestOptions, type HttpResponse } from "./http.js";
 import { emit, failureReason, hostOf, NOOP_LOGGER, urlParts, type Logger } from "./logging.js";
-import { utf8Decode } from "./runtime.js";
+import { monotonicMs, utf8Decode } from "./runtime.js";
 import { SigningKeyPair } from "./signing-key-pair.js";
 import type { SvidSource } from "./svid-source.js";
 
@@ -43,6 +43,9 @@ export const ATTESTATION_HEADER = "OAuth-Client-Attestation";
 export const POP_HEADER = "OAuth-Client-Attestation-PoP";
 /** Refresh this many seconds before the token actually expires, so a token is never used at the edge. */
 export const DEFAULT_EXPIRY_SKEW_SECONDS = 30;
+const PIN_REQUIRED =
+  "evidenceAudience is required: set it to the audience your attester expects the workload's " +
+  "identity token for, so the attester's discovery document can't choose it";
 
 export { ClientAttestationError, TransportError } from "./errors.js";
 
@@ -74,6 +77,16 @@ export interface ClientAttestationOptions {
    */
   metadata?: AttesterMetadata;
   /**
+   * The audience the workload's platform identity token is requested for, which the attester's
+   * discovery document must name. Required unless `metadata` is given: every evidence source (GCP,
+   * AWS, Azure, SPIRE) fetches a token for whatever audience it is asked for, so without a pin an
+   * attester could have the workload mint a token for another service that trusts it. A missing pin or
+   * a different discovered audience throws {@link ClientAttestationError} before any evidence is
+   * fetched. With static `metadata`, the pin is optional and, when given, must match
+   * `metadata.evidenceAudience`.
+   */
+  evidenceAudience?: string;
+  /**
    * How to get the workload's platform identity. Leave unset to auto-detect the runtime (env token,
    * projected token file, SPIRE socket, or GCP metadata). Pass an {@link SvidSource} to override.
    */
@@ -94,7 +107,7 @@ export interface ClientAttestationOptions {
   operator?: Record<string, unknown>;
   /** Instance-key signature algorithm (default `ES256`). */
   algorithm?: string;
-  /** Refresh this long before the token expires (default 30s). */
+  /** Refresh this long before the token expires (default 30s). Must be a finite number, not negative. */
   expirySkewSeconds?: number;
   /** Per-request HTTP timeout in milliseconds (default 20000). */
   timeoutMs?: number;
@@ -140,17 +153,29 @@ interface TokenState {
   tokenType: string;
   /** The instance key bound into the attestation that minted this token. */
   key: SigningKeyPair;
+  /** {@link monotonicMs} deadline; 0 => not cached. A wall-clock step cannot extend it. */
   expiresAt: number;
 }
 
 interface TokenResponse {
   access_token: string;
-  expires_in?: number;
+  expires_in?: unknown;
   token_type?: string;
 }
 
 const USE_DPOP_NONCE = "use_dpop_nonce";
 const DPOP_NONCE_HEADER = "DPoP-Nonce";
+/** At most this much of a 400 body is read to look for `use_dpop_nonce`; a longer body is not a challenge. */
+const MAX_NONCE_CHALLENGE_BODY = 64 * 1024;
+/** RFC 9449 nonces are short opaque strings: a longer `DPoP-Nonce` is ignored, as if there were none. */
+const MAX_DPOP_NONCE_LENGTH = 1024;
+/**
+ * At most this many origins' nonces are remembered; a new origin over the cap replaces the one stored
+ * longest ago (it costs that origin one challenge).
+ */
+const MAX_DPOP_NONCE_ORIGINS = 256;
+/** A token is cached for at most this long (seconds), whatever `expires_in` the token endpoint gives. */
+const MAX_TOKEN_LIFETIME_SECONDS = 24 * 60 * 60;
 
 /** What the https check calls the URL a profile's call goes to, by step. */
 const STEP_LABELS: Record<string, string> = {
@@ -163,7 +188,7 @@ const STEP_LABELS: Record<string, string> = {
  * Gets and caches an access token using client attestation.
  *
  * `new ClientAttestation(attesterUrl, opts)`, or `new ClientAttestation(opts)` with `opts.metadata` (no
- * discovery) or a custom `opts.profile`.
+ * discovery) or a custom `opts.profile`. A client that discovers its attester needs `opts.evidenceAudience`.
  *
  * @param attesterUrl the attester's host — `"pf.example.com"`, or a full base URL
  *   `"https://pf.example.com"`. Plain hostnames default to https. Optional when `metadata` or `profile`
@@ -188,8 +213,10 @@ export class ClientAttestation {
   /** The token, its type and its bound key: always replaced together, never one without the others. */
   #state: TokenState | null = null;
   #metadata: AttesterMetadata | null;
+  readonly #staticMetadata: boolean;
+  readonly #evidenceAudience: string | undefined;
   #refreshing: Promise<TokenState> | null = null;
-  /** The last `DPoP-Nonce` each origin returned. */
+  /** The last `DPoP-Nonce` each origin returned, oldest first. */
   readonly #nonces = new Map<string, string>();
 
   constructor(attesterUrl?: string | ClientAttestationOptions, opts: ClientAttestationOptions = {}) {
@@ -200,12 +227,17 @@ export class ClientAttestation {
     const url = attesterUrl ?? opts.attesterUrl;
     this.#profile = opts.profile ?? new PingFederateProfile();
     this.#metadata = opts.metadata ?? null;
+    this.#staticMetadata = this.#metadata !== null;
+    this.#evidenceAudience = opts.evidenceAudience;
     this.#evidence = opts.evidence;
     this.#authorizationDetails = opts.authorizationDetails;
     this.#operator = opts.operator && Object.keys(opts.operator).length > 0 ? opts.operator : undefined;
     this.#challengeAtToken = opts.challengeAtToken ?? true;
     this.#algorithm = opts.algorithm ?? "ES256";
     this.#skew = opts.expirySkewSeconds ?? DEFAULT_EXPIRY_SKEW_SECONDS;
+    if (!Number.isFinite(this.#skew) || this.#skew < 0) {
+      throw new RangeError(`expirySkewSeconds must be a finite number, not negative: ${this.#skew}`);
+    }
     this.#timeoutMs = opts.timeoutMs ?? 20_000;
     this.#popMethod = opts.popMethod ?? "attestation_pop_jwt";
     this.#requireChallenge = opts.requireChallenge ?? true;
@@ -242,16 +274,56 @@ export class ClientAttestation {
    * - DPoP token: `{ Authorization: "DPoP <t>", DPoP: <proof> }` — a fresh proof signed by the key the
    *   token is bound to, for this `method` and `url`, carrying `ath` and the last `DPoP-Nonce` the
    *   url's origin returned, if any.
+   *
+   * `url` must be https, like every other URL the client sends a credential to (loopback hosts and
+   * `allowInsecure` excepted).
+   *
+   * Pass the exact URL your HTTP client sends: the proof is only valid for the `htu` it names. A url with
+   * a backslash, ASCII whitespace or a control character before its query or fragment is refused with a
+   * {@link ClientAttestationError}, because URL parsers disagree on where it goes. For a DPoP-bound token,
+   * so is a url that is not an absolute http(s) URL with a valid ASCII host, port and path; with
+   * `popMethod: "dpop_combined"` that is checked before the token is fetched. The path is signed as
+   * written, so pass `new URL(u).href` (what `fetch` sends) rather than a hand-written string: `fetch` may
+   * escape characters (a `{`, say) that the string leaves as they are. {@link fetch} does this for you.
    */
   async requestHeaders(method: string, url: string, opts: { forceRefresh?: boolean } = {}): Promise<Record<string, string>> {
+    return this.#requestHeaders(method, url, opts);
+  }
+
+  /**
+   * {@link requestHeaders}, with the proof carrying `nonce` when given (the nonce of the challenge being
+   * answered) instead of the origin's remembered one.
+   */
+  async #requestHeaders(
+    method: string,
+    url: string,
+    opts: { forceRefresh?: boolean },
+    nonce?: string,
+  ): Promise<Record<string, string>> {
+    this.#checkSecure(url, "resource URL");
+    // A client configured for DPoP checks the whole htu before fetching the token, so a URL with no htu
+    // never costs a mint and token request on a cold cache. Otherwise only what parsers disagree on is
+    // refused up front: a Bearer token carries no htu.
+    try {
+      if (this.#popMethod === "dpop_combined") normalizeHtu(url);
+      else checkHtu(url);
+    } catch (err) {
+      throw new ClientAttestationError((err as Error).message);
+    }
     const state = await this.#current(opts);
     const headers: Record<string, string> = { Authorization: `${scheme(state)} ${state.accessToken}` };
     if (isDpop(state)) {
+      // Also for a DPoP token from a client not configured for DPoP (the AS chose the token type).
+      try {
+        normalizeHtu(url);
+      } catch (err) {
+        throw new ClientAttestationError((err as Error).message);
+      }
       headers[DPOP_HEADER] = await new DpopProofBuilder(state.key)
         .method(method)
         .uri(url)
         .accessToken(state.accessToken)
-        .nonce(this.#nonces.get(originOf(url)) ?? null)
+        .nonce(nonce ?? this.#nonces.get(originOf(url)) ?? null)
         .build();
     }
     return headers;
@@ -266,15 +338,19 @@ export class ClientAttestation {
    */
   async fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
     const isRequest = typeof Request !== "undefined" && input instanceof Request;
-    const url = isRequest ? (input as Request).url : String(input);
+    // The proof names the URL as fetch parses it (WHATWG), which is where the request goes.
+    const url = isRequest ? (input as Request).url : parsedHref(String(input));
     const method = (init.method ?? (isRequest ? (input as Request).method : "GET")).toUpperCase();
     // A Request's own body is cloned so the retry can send it again.
     const nextInput = () => (isRequest ? (input as Request).clone() : input);
 
     let dpopBound = false;
-    const send = async () => {
+    const send = async (nonce?: string) => {
       const headers = new Headers(init.headers ?? (isRequest ? (input as Request).headers : undefined));
-      const auth = await this.requestHeaders(method, url);
+      const auth =
+        nonce === undefined
+          ? await this.requestHeaders(method, url)
+          : await this.#requestHeaders(method, url, {}, nonce);
       dpopBound = DPOP_HEADER in auth;
       for (const [name, value] of Object.entries(auth)) headers.set(name, value);
       return fetch(nextInput(), { ...init, headers, redirect: "manual" });
@@ -282,12 +358,23 @@ export class ClientAttestation {
 
     const first = await send();
     if (!dpopBound) return first;
-    const nonce = first.headers.get(DPOP_NONCE_HEADER);
-    if (nonce) this.#nonces.set(originOf(url), nonce);
-    if (!nonce || !replayable(init.body) || !(await isNonceChallenge(first))) return first;
+    const nonce = usableNonce(first.headers.get(DPOP_NONCE_HEADER));
+    if (nonce) this.#rememberNonce(url, nonce);
+    if (!nonce || !replayable(init.body) || !(await isNonceChallenge(first, this.#timeoutMs))) return first;
     emit(this.#logger, "info", "dpop.nonce_retry", { host: hostOf(url), status: first.status, at: "resource" });
     await first.body?.cancel().catch(() => undefined);
-    return send();
+    // Answer this challenge with its own nonce, not one a concurrent response stored since.
+    return send(nonce);
+  }
+
+  /** Store `nonce` as the origin's latest, forgetting the origin stored longest ago over the cap. */
+  #rememberNonce(url: string, nonce: string): void {
+    const key = originOf(url);
+    this.#nonces.delete(key);
+    if (this.#nonces.size >= MAX_DPOP_NONCE_ORIGINS) {
+      this.#nonces.delete(this.#nonces.keys().next().value as string);
+    }
+    this.#nonces.set(key, nonce);
   }
 
   /**
@@ -324,9 +411,10 @@ export class ClientAttestation {
   /** The cached token state, or a freshly minted one. Concurrent callers share one refresh. */
   async #current(opts: { forceRefresh?: boolean }): Promise<TokenState> {
     const state = this.#state;
-    if (!opts.forceRefresh && state && Date.now() < state.expiresAt) {
+    const now = monotonicMs();
+    if (!opts.forceRefresh && state && now < state.expiresAt) {
       emit(this.#logger, "debug", "token.cache_hit", {
-        expires_in: Math.max(0, Math.round((state.expiresAt - Date.now()) / 1000)),
+        expires_in: Math.max(0, Math.round((state.expiresAt - now) / 1000)),
       });
       return state;
     }
@@ -343,22 +431,29 @@ export class ClientAttestation {
 
   async #refresh(): Promise<TokenState> {
     const { response, key } = await this.#runFlow();
-    const expiresIn = response.expires_in;
+    const lifetime = tokenLifetime(response.expires_in);
     const state: TokenState = {
       accessToken: response.access_token,
       tokenType: typeof response.token_type === "string" && response.token_type ? response.token_type : "Bearer",
       key,
-      expiresAt: expiresIn ? Date.now() + (Number(expiresIn) - this.#skew) * 1000 : 0,
+      expiresAt: lifetime !== undefined ? monotonicMs() + (lifetime - this.#skew) * 1000 : 0,
     };
     this.#state = state;
     return state;
   }
 
   async #runFlow(): Promise<{ response: TokenResponse; key: SigningKeyPair }> {
+    if (!this.#evidenceAudience && !this.#staticMetadata) throw new ClientAttestationError(PIN_REQUIRED);
     const meta = await this.attesterMetadata();
     const audience = meta.evidenceAudience;
     if (!audience) {
       throw new ClientAttestationError("attester discovery document has no evidence_audience");
+    }
+    if (this.#evidenceAudience && audience !== this.#evidenceAudience) {
+      throw new ClientAttestationError(
+        `the attester asks for evidence for ${JSON.stringify(audience)}, but evidenceAudience is ` +
+          JSON.stringify(this.#evidenceAudience),
+      );
     }
 
     const evidenceSource = this.#evidence ?? (await autoDetectEvidence());
@@ -401,12 +496,12 @@ export class ClientAttestation {
 
     const credential = new ClientAttestationCredential(attestation, instanceKey);
     const obtained = (response: TokenResponse) => {
-      const expiresIn = Number(response.expires_in);
+      const lifetime = tokenLifetime(response.expires_in);
       emit(this.#logger, "info", "token.obtained", {
         host: hostOf(tokenEndpoint),
         client_id: clientId,
         token_type: typeof response.token_type === "string" && response.token_type ? response.token_type : "Bearer",
-        expires_in: response.expires_in != null && Number.isFinite(expiresIn) ? expiresIn : undefined,
+        expires_in: lifetime !== undefined ? Math.trunc(lifetime) : undefined,
         pop_method: this.#popMethod,
       });
       return { response, key: instanceKey };
@@ -419,8 +514,8 @@ export class ClientAttestation {
     // DPoP combined: the attester challenge rides as the DPoP nonce. If the AS demands its own nonce
     // (400 use_dpop_nonce + DPoP-Nonce), retry once with that — the server's demand wins.
     let res = await this.#postToken(tokenEndpoint, await credential.dpopHeaders("POST", tokenEndpoint, tokenChallenge ?? null));
-    const serverNonce = res.headers.get(DPOP_NONCE_HEADER);
-    if (serverNonce) this.#nonces.set(originOf(tokenEndpoint), serverNonce);
+    const serverNonce = usableNonce(res.headers.get(DPOP_NONCE_HEADER));
+    if (serverNonce) this.#rememberNonce(tokenEndpoint, serverNonce);
     if (res.status === 400 && serverNonce && jsonError(res.body) === USE_DPOP_NONCE) {
       emit(this.#logger, "info", "dpop.nonce_retry", { host: hostOf(tokenEndpoint), status: res.status, at: "token_endpoint" });
       res = await this.#postToken(tokenEndpoint, await credential.dpopHeaders("POST", tokenEndpoint, serverNonce));
@@ -494,17 +589,7 @@ export class ClientAttestation {
 
   /** Refuse a non-https URL unless it is loopback or the caller passed `allowInsecure`. */
   #checkSecure(url: string, what: string): void {
-    if (this.#allowInsecure) return;
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      throw new ClientAttestationError(`${what} is not a valid URL: ${url}`);
-    }
-    if (parsed.protocol === "https:" || LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) return;
-    throw new ClientAttestationError(
-      `${what} must use https: ${url} (loopback hosts are exempt; pass allowInsecure: true to override)`,
-    );
+    checkSecure(url, what, this.#allowInsecure);
   }
 
   async #getJson<T>(step: string, method: string, url: string, jsonBody?: Record<string, unknown>): Promise<T> {
@@ -538,20 +623,33 @@ export class ClientAttestation {
   }
 }
 
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
-
 function tokenResponse(res: HttpResponse): TokenResponse {
   if (!res.ok) {
     throw new ClientAttestationError(`token endpoint returned HTTP ${res.status}`, {
       status: res.status,
-      body: res.body,
+      body: snippet(res.body),
     });
   }
-  const parsed = jsonOk<{ access_token?: string; expires_in?: number; token_type?: string }>(res, { allowEmpty: true });
+  const parsed = jsonOk<{ access_token?: string; expires_in?: unknown; token_type?: string }>(res, { allowEmpty: true });
   if (!parsed.access_token) {
-    throw new ClientAttestationError("token endpoint returned no access_token", { body: res.body });
+    // No body: a 2xx token response may hold the token under another name.
+    throw new ClientAttestationError("token endpoint returned no access_token");
   }
   return parsed as TokenResponse;
+}
+
+/**
+ * How long to cache a token, in seconds: `expires_in` as a JSON number, or a string of decimal digits,
+ * capped at {@link MAX_TOKEN_LIFETIME_SECONDS}. Anything else - missing, null, not a number, not finite,
+ * zero or negative - is undefined, and the token is not cached, as with no `expires_in` at all.
+ */
+function tokenLifetime(expiresIn: unknown): number | undefined {
+  let seconds: number;
+  if (typeof expiresIn === "number") seconds = expiresIn;
+  else if (typeof expiresIn === "string" && /^[0-9]+(\.[0-9]+)?$/.test(expiresIn)) seconds = Number(expiresIn);
+  else return undefined;
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.min(seconds, MAX_TOKEN_LIFETIME_SECONDS);
 }
 
 function isDpop(state: TokenState): boolean {
@@ -562,10 +660,27 @@ function scheme(state: TokenState): string {
   return isDpop(state) ? "DPoP" : "Bearer";
 }
 
-/** `scheme://host[:port]` of a URL, the key DPoP nonces are remembered under. */
+/** A `DPoP-Nonce` value, or null when there is none or it is longer than {@link MAX_DPOP_NONCE_LENGTH}. */
+function usableNonce(nonce: string | null): string | null {
+  return nonce && nonce.length <= MAX_DPOP_NONCE_LENGTH ? nonce : null;
+}
+
+/** `url` as WHATWG URL parsing (and so fetch) serialises it, or as given when it does not parse. */
+function parsedHref(url: string): string {
+  try {
+    return new URL(url).href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * `scheme://host[:port]` of a URL as its `htu` names it ({@link htuParts}), the key DPoP nonces are
+ * remembered under. A URL that rule refuses is its own key.
+ */
 function originOf(url: string): string {
   try {
-    return new URL(url).origin;
+    return htuParts(url)[0];
   } catch {
     return url;
   }
@@ -589,17 +704,58 @@ function replayable(body: RequestInit["body"]): boolean {
 
 /**
  * RFC 9449 section 9: a resource asks for a nonce with 401 + `WWW-Authenticate: DPoP error="use_dpop_nonce"`;
- * section 8 (and some resources) use a 400 JSON `{"error":"use_dpop_nonce"}`.
+ * section 8 (and some resources) use a 400 JSON `{"error":"use_dpop_nonce"}`. The 400 body is read from a
+ * clone, at most {@link MAX_NONCE_CHALLENGE_BODY} bytes and for at most `timeoutMs`, so the caller still
+ * gets the whole body.
  */
-async function isNonceChallenge(res: Response): Promise<boolean> {
+async function isNonceChallenge(res: Response, timeoutMs: number): Promise<boolean> {
   if (res.status === 401) {
     const challenge = res.headers.get("WWW-Authenticate") ?? "";
     return /(^|,)\s*DPoP\b/i.test(challenge) && /error\s*=\s*"?use_dpop_nonce"?/i.test(challenge);
   }
   if (res.status === 400) {
-    return jsonError(await res.clone().text()) === USE_DPOP_NONCE;
+    const body = await peekBody(res, MAX_NONCE_CHALLENGE_BODY, timeoutMs);
+    return body !== undefined && jsonError(body) === USE_DPOP_NONCE;
   }
   return false;
+}
+
+/**
+ * The text of `res`'s body read from a clone, or undefined when it is longer than `maxBytes`, fails, or is
+ * not complete within `timeoutMs`. The clone is cancelled once read, so no more than about `maxBytes` is
+ * buffered for the caller's copy.
+ */
+async function peekBody(res: Response, maxBytes: number, timeoutMs: number): Promise<string | undefined> {
+  const reader = res.clone().body?.getReader();
+  if (!reader) return "";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs);
+  });
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const next = await Promise.race([reader.read(), expired]);
+      if (next === undefined) return undefined;
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) return undefined;
+      chunks.push(next.value);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+    reader.cancel().catch(() => undefined);
+  }
+  const all = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return utf8Decode(all);
 }
 
 /**

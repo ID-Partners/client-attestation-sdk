@@ -74,7 +74,16 @@ _PROSE_RE = re.compile(
     r"(?:\s*::\s*(?P<reason>.*))?\s*$", re.DOTALL)
 
 # RFC 6750 §3 auth-param grammar, permissively: key="value" or key=token, comma/space separated.
-_AUTH_PARAM_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_\-]*)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,]+))')
+# The lookbehind stops a key starting in the middle of a token: without it a long run of token
+# characters is retried from every offset, which is quadratic on an untrusted header.
+_AUTH_PARAM_RE = re.compile(r'(?<![A-Za-z0-9_\-])([A-Za-z_][A-Za-z0-9_\-]*)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,]+))')
+# A bare token that is not a key: the auth-scheme that starts the next challenge (RFC 9110 §11.6.1).
+_AUTH_SCHEME_RE = re.compile(r"(?<![^\s,])([!#$%&'*+.^_`|~0-9A-Za-z-]+)(?=[\s,]|$)")
+_AUTH_PART_RE = re.compile(_AUTH_PARAM_RE.pattern + "|" + _AUTH_SCHEME_RE.pattern)
+
+# Larger inputs are not read: a challenge is a few hundred bytes, and the JSON parser recurses.
+_MAX_HEADER_CHARS = 8 * 1024
+_MAX_BODY_CHARS = 64 * 1024
 
 
 @dataclass
@@ -108,18 +117,23 @@ class Challenge:
 def parse_www_authenticate(value: Optional[str]) -> dict:
     """Parse an RFC 6750 ``WWW-Authenticate: Bearer …`` header value into its auth-params.
 
-    Returns ``{}`` for a missing header or a non-Bearer scheme. Values are unquoted; backslash
-    escapes inside quoted strings are resolved. Keys are lower-cased.
+    Returns ``{}`` for a missing header, a header with no Bearer challenge, or one over 8 KiB. When the
+    header carries several challenges (``Bearer realm="api", DPoP algs="ES256"``) only the Bearer
+    challenge's params are returned. Values are unquoted; backslash escapes inside quoted strings are
+    resolved. Keys are lower-cased.
     """
-    if not value:
+    if not value or len(value) > _MAX_HEADER_CHARS:
         return {}
-    parts = value.strip().split(None, 1)
-    if not parts or parts[0].lower() != "bearer":
-        return {}
-    if len(parts) == 1:
-        return {}
+    scheme: Optional[str] = None
     out: dict = {}
-    for m in _AUTH_PARAM_RE.finditer(parts[1]):
+    for m in _AUTH_PART_RE.finditer(value):
+        if m.group(4) is not None:
+            if scheme == "bearer":
+                break           # the Bearer challenge ended where the next scheme starts
+            scheme = m.group(4).lower()
+            continue
+        if scheme != "bearer":
+            continue
         key = m.group(1).lower()
         quoted, bare = m.group(2), m.group(3)
         val = re.sub(r"\\(.)", r"\1", quoted) if quoted is not None else bare
@@ -146,11 +160,13 @@ def _from_error(error: Optional[str], fields: Mapping[str, Any], *, source: str,
 
 
 def _s(v: Any) -> Optional[str]:
-    if v is None:
+    """A string field, or ``None``. A list of strings is joined with spaces (a scope array); any other
+    type (an object, a number) is dropped rather than turned into its Python repr."""
+    if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+        v = " ".join(v)
+    if not isinstance(v, str):
         return None
-    if isinstance(v, (list, tuple)):
-        v = " ".join(str(x) for x in v)
-    v = str(v).strip()
+    v = v.strip()
     return v or None
 
 
@@ -161,6 +177,8 @@ def _lower_headers(headers: Optional[Mapping[str, str]]) -> dict:
 def _json_body(body: Any) -> Any:
     if body is None:
         return None
+    if isinstance(body, (bytes, bytearray, str)) and len(body) > _MAX_BODY_CHARS:
+        return None
     if isinstance(body, (bytes, bytearray)):
         body = body.decode("utf-8", "replace")
     if isinstance(body, str):
@@ -169,7 +187,7 @@ def _json_body(body: Any) -> Any:
             return None
         try:
             return json.loads(s)
-        except ValueError:
+        except (ValueError, RecursionError):
             return s
     return body
 

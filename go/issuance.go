@@ -13,7 +13,8 @@ import (
 // (matches the server's InstanceKeyProofValidator.TYP).
 const InstanceProofTyp = "oauth-attestation-instance-proof+jwt"
 
-// IssuanceError is returned when the issuance endpoint rejects the request (non-2xx).
+// IssuanceError is returned when the issuance endpoint rejects the request (non-2xx). Body is at most the
+// first 512 bytes of the response.
 type IssuanceError struct {
 	Status int
 	Body   string
@@ -64,22 +65,44 @@ type AttestationIssuanceClient struct {
 	// Profile sets the mint protocol; nil means PingFederateProfile. The endpoint is given directly, so
 	// the profile's Discover is not used. See docs/attester-profiles.md.
 	Profile AttesterProfile
+	// AllowInsecure permits plain-http URLs on non-loopback hosts, for Endpoint and for every call the
+	// profile makes. Without it each must be https (localhost, 127.0.0.1 and ::1 are always allowed): the
+	// SVID is a bearer credential to the attester.
+	AllowInsecure bool
 }
 
-// NewAttestationIssuanceClient generates a fresh ES256 instance key and returns a ready client.
-func NewAttestationIssuanceClient(endpoint, clientID, attesterIssuer string, source SvidSource) (*AttestationIssuanceClient, error) {
-	key, err := Generate("ES256")
-	if err != nil {
-		return nil, err
-	}
-	return &AttestationIssuanceClient{
+// IssuanceOption tunes NewAttestationIssuanceClient.
+type IssuanceOption func(*AttestationIssuanceClient)
+
+// WithIssuanceAllowInsecure sets AllowInsecure: a plain-http endpoint on a non-loopback host is accepted.
+func WithIssuanceAllowInsecure() IssuanceOption {
+	return func(c *AttestationIssuanceClient) { c.AllowInsecure = true }
+}
+
+// NewAttestationIssuanceClient generates a fresh ES256 instance key and returns a ready client. endpoint
+// must be https unless it is loopback or WithIssuanceAllowInsecure() is given.
+func NewAttestationIssuanceClient(endpoint, clientID, attesterIssuer string, source SvidSource, opts ...IssuanceOption) (*AttestationIssuanceClient, error) {
+	c := &AttestationIssuanceClient{
 		Endpoint:       strings.TrimRight(endpoint, "/"),
 		ClientID:       clientID,
 		AttesterIssuer: attesterIssuer,
 		Source:         source,
-		InstanceKey:    key,
 		HTTPClient:     &http.Client{Timeout: 20 * time.Second},
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	if !c.AllowInsecure {
+		if err := requireSecureURL(c.Endpoint, "WithIssuanceAllowInsecure()"); err != nil {
+			return nil, err
+		}
+	}
+	key, err := Generate("ES256")
+	if err != nil {
+		return nil, err
+	}
+	c.InstanceKey = key
+	return c, nil
 }
 
 // Bootstrap fetches the SVID, proves possession of the instance key, and exchanges them for a minted
@@ -95,7 +118,8 @@ func (c *AttestationIssuanceClient) Bootstrap(authorizationDetails []map[string]
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	minted, err := profile.Mint(ctx, issuanceTransport{safeClient(c.HTTPClient, 20*time.Second)},
+	transport := issuanceTransport{client: safeClient(c.HTTPClient, 20*time.Second), allowInsecure: c.AllowInsecure}
+	minted, err := profile.Mint(ctx, transport,
 		&AttesterMetadata{EvidenceAudience: c.AttesterIssuer, AttestationEndpoint: c.Endpoint},
 		&MintRequest{
 			InstanceKey:          c.InstanceKey,
@@ -107,13 +131,25 @@ func (c *AttestationIssuanceClient) Bootstrap(authorizationDetails []map[string]
 	if err != nil {
 		return nil, err
 	}
+	if minted == nil || minted.Attestation == "" {
+		return nil, &ClientAttestationError{Message: "attester response contained no attestation"}
+	}
 	return &IssuedAttestation{Attestation: minted.Attestation, ExpiresIn: minted.ExpiresIn, InstanceKey: c.InstanceKey}, nil
 }
 
-// issuanceTransport is the issuance endpoint's AttesterTransport: a non-2xx answer is an *IssuanceError.
-type issuanceTransport struct{ client *http.Client }
+// issuanceTransport is the issuance endpoint's AttesterTransport: the client's https rule, and a non-2xx
+// answer is an *IssuanceError.
+type issuanceTransport struct {
+	client        *http.Client
+	allowInsecure bool
+}
 
 func (t issuanceTransport) RequestJSON(ctx context.Context, _ string, method, target string, body any, out any) error {
+	if !t.allowInsecure {
+		if err := requireSecureURL(target, "AllowInsecure: true"); err != nil {
+			return err
+		}
+	}
 	var payload []byte
 	if body != nil {
 		var err error
@@ -129,7 +165,7 @@ func (t issuanceTransport) RequestJSON(ctx context.Context, _ string, method, ta
 		return err
 	}
 	if !res.ok() {
-		return &IssuanceError{Status: res.Status, Body: string(res.Body)}
+		return &IssuanceError{Status: res.Status, Body: truncateBody(res.Body)}
 	}
 	return decodeJSONOK(res, method+" "+target, out)
 }

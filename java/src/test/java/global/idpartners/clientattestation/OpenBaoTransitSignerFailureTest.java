@@ -99,6 +99,13 @@ class OpenBaoTransitSignerFailureTest {
     }
 
     @Test
+    void publicKeyOnAnotherCurveThanTheKeyTypeIsRefused() throws Exception {
+        String keys = keysResponse("ecdsa-p256", pem(EcJwkGenerator.generateJwk(EllipticCurves.P384).getPublicKey()));
+        IllegalStateException e = expectConstructorFailure(keys);
+        assertTrue(e.getMessage().contains("P-384"), e.getMessage());
+    }
+
+    @Test
     void es384TransitKeyMapsToEs384() throws Exception {
         String keys = keysResponse("ecdsa-p384", pem(EcJwkGenerator.generateJwk(EllipticCurves.P384).getPublicKey()));
         try (StubBao bao = new StubBao(200, keys, 200, "{}")) {

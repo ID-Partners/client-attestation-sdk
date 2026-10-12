@@ -8,20 +8,27 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpExchange;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.ResourceBundle;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.jose4j.json.JsonUtil;
 import org.jose4j.jwk.PublicJsonWebKey;
 import org.jose4j.jws.JsonWebSignature;
@@ -37,6 +44,8 @@ import org.junit.jupiter.api.Test;
  * both the resource and the token endpoint. Loopback fakes only.
  */
 class ClientAttestationDpopTest {
+    /** The evidence_audience the fake attester's discovery document names. */
+    private static final String AUD = "https://attester.example.com";
 
     private StubHttpServer server;
     private final HttpClient client = HttpClient.newHttpClient();
@@ -64,7 +73,7 @@ class ClientAttestationDpopTest {
                 + "\"attestation_endpoint\":\"" + this.server.url("/attest") + "\","
                 + "\"challenge_endpoint\":\"" + this.server.url("/challenge") + "\","
                 + "\"token_endpoint\":\"" + this.server.url("/token") + "\","
-                + "\"evidence_audience\":\"https://attester.example.com\"}");
+                + "\"evidence_audience\":\"" + AUD + "\"}");
         this.server.respond("/challenge", 200, "{\"attestation_challenge\":\"chal-1\"}");
         String sub = Base64.getUrlEncoder().withoutPadding()
                 .encodeToString("{\"sub\":\"demo-client\"}".getBytes(StandardCharsets.UTF_8));
@@ -79,7 +88,7 @@ class ClientAttestationDpopTest {
     }
 
     private ClientAttestation dpopClient() {
-        return ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
+        return ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid")).evidenceAudience(AUD)
                 .popMethod("dpop_combined").build();
     }
 
@@ -95,13 +104,53 @@ class ClientAttestationDpopTest {
         assertEquals(0, this.server.hits("/resource"));
     }
 
+    @Test
+    void refusesARequestOnAnotherOriginThanTheCredentialsAreBuiltFor() {
+        URI uri = URI.create(this.server.url("/resource"));
+        URI elsewhere = URI.create("https://elsewhere.example/resource");
+        assertThrows(IllegalArgumentException.class, () -> dpopClient().send(this.client,
+                HttpRequest.newBuilder(elsewhere).GET(), "GET", uri, HttpResponse.BodyHandlers.ofString()));
+        assertEquals(0, this.issued.get());
+    }
+
+    @Test
+    void refusesAPlainHttpResourceUnlessLoopbackOrAllowInsecure() {
+        ClientAttestation ca = dpopClient();
+        ClientAttestation.ClientAttestationException e = assertThrows(ClientAttestation.ClientAttestationException.class,
+                () -> ca.requestHeaders("GET", "http://api.example.com/things"));
+        assertTrue(e.getMessage().contains("resource URL must use https"), e.getMessage());
+        URI plain = URI.create("http://api.example.com/things");
+        assertThrows(ClientAttestation.ClientAttestationException.class, () -> ca.send(this.client,
+                HttpRequest.newBuilder(plain).GET(), "GET", plain, HttpResponse.BodyHandlers.ofString()));
+        assertThrows(ClientAttestation.ClientAttestationException.class,
+                () -> ca.authorize(HttpRequest.newBuilder(plain), "GET", plain));
+        assertEquals(0, this.issued.get());
+
+        assertTrue(ca.requestHeaders("GET", this.server.url("/resource")).containsKey("DPoP"));
+        ClientAttestation insecure = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
+                .popMethod("dpop_combined").evidenceAudience(AUD).allowInsecure(true).build();
+        assertTrue(insecure.requestHeaders("GET", "http://api.example.com/things").containsKey("DPoP"));
+    }
+
+    @Test
+    void httpsRuleReadsUrlsThatUriCreateRefuses() {
+        // Unencoded `|`, `{`, `}`, `"`, `^` or a space in the query: other HTTP clients send these as-is
+        ClientAttestation ca = dpopClient();
+        assertTrue(ca.requestHeaders("GET", "https://api.example.com/graphql?q={a|b}").containsKey("DPoP"));
+        assertTrue(ca.requestHeaders("GET", "http://localhost:8080/q?x=a|b").containsKey("DPoP"));
+        assertTrue(ca.requestHeaders("GET", "http://[::1]:8080/q?x=a b").containsKey("DPoP"));
+        ClientAttestation.ClientAttestationException e = assertThrows(ClientAttestation.ClientAttestationException.class,
+                () -> ca.requestHeaders("GET", "http://api.example.com/q?x=a|b"));
+        assertTrue(e.getMessage().contains("resource URL must use https"), e.getMessage());
+        assertThrows(ClientAttestation.ClientAttestationException.class,
+                () -> ca.requestHeaders("GET", "not a url|at all"));
+    }
+
     // ── fake AS ─────────────────────────────────────────────────────────────────────────────────────
 
     private void tokenEndpoint(HttpExchange exchange) throws IOException {
-        String proof = exchange.getRequestHeaders().getFirst("DPoP");
-        if (proof == null) {
-            proof = exchange.getRequestHeaders().getFirst(ClientAttestation.POP_HEADER);
-        }
+        String dpop = exchange.getRequestHeaders().getFirst("DPoP");
+        String proof = dpop != null ? dpop : exchange.getRequestHeaders().getFirst(ClientAttestation.POP_HEADER);
         this.tokenEndpointProofs.add(proof);
         Map<String, Object> claims = claims(proof);
         if (this.asDemandsNonce && !"as-nonce".equals(claims.get("nonce"))) {
@@ -112,7 +161,8 @@ class ClientAttestationDpopTest {
             return;
         }
         String token = "AT-" + this.issued.incrementAndGet();
-        this.boundThumbprints.put(token, verifiedThumbprint(proof));
+        // attestation_pop_jwt mode sends no DPoP proof: a DPoP token issued then is bound to no proof key.
+        this.boundThumbprints.put(token, dpop != null ? verifiedThumbprint(proof) : "none");
         String type = this.tokenType == null ? "" : ",\"token_type\":\"" + this.tokenType + "\"";
         StubHttpServer.send(exchange, 200, "{\"access_token\":\"" + token + "\",\"expires_in\":3600" + type + "}");
     }
@@ -322,7 +372,7 @@ class ClientAttestationDpopTest {
     void popModeDoesNotRetryTheTokenEndpointOnAUseDpopNonceAnswer() {
         this.asDemandsNonce = true;
         ClientAttestation ca = ClientAttestation.builder(this.server.url(""))
-                .evidence(new SvidSource.Static("svid")).build();
+                .evidence(new SvidSource.Static("svid")).evidenceAudience(AUD).build();
         assertThrows(ClientAttestation.ClientAttestationException.class, ca::token);
         assertEquals(1, this.server.hits("/token"));
     }
@@ -380,6 +430,278 @@ class ClientAttestationDpopTest {
                 "{\"error\":\"use_dpop_nonce\"}"));
     }
 
+    // ── the nonce memory and the retry's nonce ──────────────────────────────────────────────────────
+
+    @Test
+    void aChallengeWithAnOverLongNonceIsNotAnsweredOrRemembered() throws Exception {
+        this.resourceNonce = "n".repeat(ClientAttestation.MAX_DPOP_NONCE_LENGTH + 1);
+        ClientAttestation ca = dpopClient();
+        URI uri = URI.create(this.server.url("/resource"));
+        HttpResponse<String> resp = ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(401, resp.statusCode());
+        assertEquals(1, this.server.hits("/resource"));
+        assertNull(ca.nonceFor(uri.toString()));
+    }
+
+    @Test
+    void theNonceMemoryKeepsAtMost256OriginsDroppingTheOldest() {
+        ClientAttestation ca = dpopClient();
+        int count = ClientAttestation.MAX_DPOP_NONCE_ORIGINS + 44;
+        for (int i = 0; i < count; i++) {
+            ca.rememberNonce("https://h" + i + ".example/p" + i, "n" + i);
+            ca.rememberNonce("https://h1.example/", "n1");             // kept fresh, so never the oldest
+        }
+        assertNull(ca.nonceFor("https://h0.example/"));
+        assertEquals("n1", ca.nonceFor("https://h1.example/"));
+        assertEquals("n" + (count - 1), ca.nonceFor("https://h" + (count - 1) + ".example/"));
+    }
+
+    @Test
+    void noncesAreKeyedByOriginEvenWhenUriFindsNoHost() {
+        // URI has no host for a name with '_'; the key is still the authority, never the path.
+        assertEquals("https://my_host.example.com", ClientAttestation.nonceKey("https://my_host.example.com/a?x"));
+        assertEquals("https://my_host.example.com",
+                ClientAttestation.nonceKey("https://user@MY_HOST.example.com:443/b/c"));
+        assertEquals("https://my_host.example.com:8443",
+                ClientAttestation.nonceKey("https://my_host.example.com:8443/b"));
+        assertEquals("https://as.example", ClientAttestation.nonceKey("https://as.example/a|b"));   // URI refuses it
+        assertEquals("https://as.example", ClientAttestation.nonceKey("HTTPS://AS.example:443/x"));
+    }
+
+    @Test
+    void theRetryCarriesTheChallengesNonceEvenIfAnotherResponseStoredOne() throws Exception {
+        String url = this.server.url("/resource");
+        AtomicReference<ClientAttestation> ref = new AtomicReference<>();
+        // Between the challenge and the retry, another response for the origin stores a different nonce.
+        System.Logger logger = new System.Logger() {
+            @Override
+            public String getName() {
+                return ClientAttestation.LOGGER_NAME;
+            }
+
+            @Override
+            public boolean isLoggable(Level level) {
+                return true;
+            }
+
+            @Override
+            public void log(Level level, ResourceBundle bundle, String msg, Throwable thrown) {
+                if (msg.startsWith("dpop.nonce_retry")) {
+                    ref.get().rememberNonce(url, "other-nonce");
+                }
+            }
+
+            @Override
+            public void log(Level level, ResourceBundle bundle, String format, Object... params) {
+                log(level, bundle, format, (Throwable) null);
+            }
+        };
+        ClientAttestation ca = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid")).evidenceAudience(AUD)
+                .popMethod("dpop_combined").logger(logger).build();
+        ref.set(ca);
+        URI uri = URI.create(url);
+        HttpResponse<String> resp = ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, resp.statusCode());
+        assertEquals("rs-nonce-1", this.acceptedProofs.get(0).get("nonce"));
+    }
+
+    // ── streamed body handlers ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    void a400ChallengeIsSeenThroughAStreamingBodyHandler() throws Exception {
+        this.resourceUses400 = true;
+        ClientAttestation ca = dpopClient();
+        URI uri = URI.create(this.server.url("/resource"));
+        HttpResponse<InputStream> resp = ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                HttpResponse.BodyHandlers.ofInputStream());
+        assertEquals(200, resp.statusCode());
+        assertEquals("{\"ok\":true}", new String(resp.body().readAllBytes(), StandardCharsets.UTF_8));
+        assertEquals(2, this.server.hits("/resource"));
+    }
+
+    @Test
+    void a400ThatIsNotAChallengeReachesAStreamingHandlerWhole() throws Exception {
+        String big = "{\"error\":\"use_dpop_nonce\"}" + " ".repeat(ClientAttestation.MAX_NONCE_CHALLENGE_BODY);
+        this.server.route("/big", exchange -> {
+            exchange.getResponseHeaders().set("DPoP-Nonce", "n");
+            StubHttpServer.send(exchange, 400, big);
+        });
+        this.server.route("/other", exchange -> {
+            exchange.getResponseHeaders().set("DPoP-Nonce", "n");
+            StubHttpServer.send(exchange, 400, "{\"error\":\"invalid_request\"}");
+        });
+        ClientAttestation ca = dpopClient();
+        for (String path : List.of("/big", "/other")) {
+            URI uri = URI.create(this.server.url(path));
+            HttpResponse<InputStream> streamed = ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                    HttpResponse.BodyHandlers.ofInputStream());
+            String expected = path.equals("/big") ? big : "{\"error\":\"invalid_request\"}";
+            assertEquals(400, streamed.statusCode());
+            assertEquals(expected, new String(streamed.body().readAllBytes(), StandardCharsets.UTF_8));
+            assertEquals(expected, ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                    HttpResponse.BodyHandlers.ofString()).body());
+            assertEquals(2, this.server.hits(path));                      // never retried
+        }
+    }
+
+    @Test
+    void aStreamedChallengeBodyIsReleasedBeforeTheRetry() throws Exception {
+        ClientAttestation ca = dpopClient();
+        URI uri = URI.create(this.server.url("/resource"));
+        List<AtomicBoolean> closed = Collections.synchronizedList(new ArrayList<>());
+        HttpResponse<InputStream> resp = ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                info -> HttpResponse.BodySubscribers.mapping(HttpResponse.BodySubscribers.ofInputStream(), in -> {
+                    AtomicBoolean flag = new AtomicBoolean();
+                    closed.add(flag);
+                    return new FilterInputStream(in) {
+                        @Override
+                        public void close() throws IOException {
+                            flag.set(true);
+                            super.close();
+                        }
+                    };
+                }));
+        assertEquals(200, resp.statusCode());
+        assertEquals(List.of(true, false), closed.stream().map(AtomicBoolean::get).toList());
+        resp.body().close();
+
+        this.resourceNonce = "rs-nonce-2";                               // challenge again
+        List<AtomicBoolean> cancelled = Collections.synchronizedList(new ArrayList<>());
+        HttpResponse<Flow.Publisher<List<ByteBuffer>>> published = ca.send(this.client,
+                HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                info -> HttpResponse.BodySubscribers.mapping(HttpResponse.BodySubscribers.ofPublisher(), p -> {
+                    AtomicBoolean flag = new AtomicBoolean();
+                    cancelled.add(flag);
+                    return subscriber -> p.subscribe(new Flow.Subscriber<List<ByteBuffer>>() {
+                        @Override
+                        public void onSubscribe(Flow.Subscription subscription) {
+                            subscriber.onSubscribe(new Flow.Subscription() {
+                                @Override
+                                public void request(long n) {
+                                    subscription.request(n);
+                                }
+
+                                @Override
+                                public void cancel() {
+                                    flag.set(true);
+                                    subscription.cancel();
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onNext(List<ByteBuffer> item) {
+                            subscriber.onNext(item);
+                        }
+
+                        @Override
+                        public void onError(Throwable throwable) {
+                            subscriber.onError(throwable);
+                        }
+
+                        @Override
+                        public void onComplete() {
+                            subscriber.onComplete();
+                        }
+                    });
+                }));
+        assertEquals(200, published.statusCode());
+        assertEquals(2, cancelled.size());
+        assertTrue(cancelled.get(0).get(), "the challenge's body was not released");
+    }
+
+    // ── URLs that parsers disagree on ───────────────────────────────────────────────────────────────
+
+    @Test
+    void urlsThatParsersDisagreeOnAreRefused() throws Exception {
+        ClientAttestation ca = dpopClient();
+        SigningKeyPair key = SigningKeyPair.generate("ES256");
+        for (String url : List.of("https://evil.example\\@as.example/t", "https://as.example/a\\b",
+                " https://as.example/t", "https://as.example/t ", "https://as.example\t/t", "https://as.example/t\n",
+                "https://as.example/\u0000t", "https://as.example/\u007ft")) {
+            assertThrows(ClientAttestation.ClientAttestationException.class, () -> ca.requestHeaders("GET", url), url);
+            assertThrows(IllegalArgumentException.class, () -> new DpopProofBuilder(key).uri(url).build(), url);
+        }
+        assertEquals(0, this.server.hits("/token"));
+        // What follows the path never becomes htu, so it is left alone.
+        assertEquals("https://as.example/t",
+                claims(new DpopProofBuilder(key).uri("https://as.example/t?q=a\\b c#a b").build()).get("htu"));
+    }
+
+    private static final List<String> NO_HTU = List.of("https://b\u00fccher.example/t");
+
+    @Test
+    void aDpopClientRefusesAUrlWithNoHtuBeforeTheTokenIsFetched() {
+        for (String type : List.of("DPoP", "Bearer")) {
+            this.tokenType = type;
+            ClientAttestation ca = dpopClient();
+            for (String url : NO_HTU) {
+                ClientAttestation.ClientAttestationException e = assertThrows(
+                        ClientAttestation.ClientAttestationException.class, () -> ca.requestHeaders("GET", url), url);
+                assertTrue(e.getMessage().startsWith("uri (htu) "), e.getMessage());
+            }
+        }
+        // A cold cache every time, yet no mint and no token request.
+        assertEquals(0, this.server.hits("/attest"));
+        assertEquals(0, this.server.hits("/token"));
+    }
+
+    @Test
+    void aClientNotConfiguredForDpopSendsABearerTokenToAnyUrl() {
+        this.tokenType = "Bearer";
+        ClientAttestation ca = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
+                .evidenceAudience(AUD).build();
+        for (String url : NO_HTU) {
+            assertEquals(Map.of("Authorization", "Bearer AT-1"), ca.requestHeaders("GET", url), url);
+        }
+    }
+
+    @Test
+    void aDpopTokenTheAsChoseStillRefusesAUrlWithNoHtu() {
+        this.tokenType = "DPoP";
+        ClientAttestation ca = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
+                .evidenceAudience(AUD).build();
+        for (String url : NO_HTU) {
+            ClientAttestation.ClientAttestationException e = assertThrows(
+                    ClientAttestation.ClientAttestationException.class, () -> ca.requestHeaders("GET", url), url);
+            assertTrue(e.getMessage().startsWith("uri (htu) "), e.getMessage());
+        }
+        assertEquals(1, this.server.hits("/token"));
+    }
+
+    /**
+     * send() signs the request target the JDK client sends: the htu is what the resource received, which a
+     * conforming RS (RFC 9449 section 4.3) compares after RFC 3986 section 6.2.2 normalisation, decoding only
+     * unreserved characters. {@code java.net.URI} cannot hold a raw {@code [}, {@code ]}, {@code |} or lone
+     * {@code %}, so they are given escaped (as the multi-argument constructor writes them), with a non-ASCII
+     * character the client encodes itself.
+     */
+    @Test
+    void sendSignsTheRequestTargetItSends() throws Exception {
+        List<String[]> seen = Collections.synchronizedList(new ArrayList<>());
+        this.server.route("/odd", exchange -> {
+            String proof = exchange.getRequestHeaders().getFirst("DPoP");
+            verifiedThumbprint(proof);
+            seen.add(new String[] {this.server.url(exchange.getRequestURI().getRawPath()),
+                    (String) claims(proof).get("htu")});
+            StubHttpServer.send(exchange, 200, "{}");
+        });
+        ClientAttestation ca = dpopClient();
+        URI built = new URI("http", null, "127.0.0.1", URI.create(this.server.url("")).getPort(),
+                "/odd/items[0]/a|b/caf\u00e9", "q=1", null);
+        for (URI uri : List.of(built, URI.create(this.server.url("/odd/a%5Bb%5D%7Cc%25")))) {
+            assertEquals(200, ca.send(this.client, HttpRequest.newBuilder(uri).GET(), "GET", uri,
+                    HttpResponse.BodyHandlers.ofString()).statusCode(), uri.toString());
+        }
+        assertEquals(2, seen.size());
+        assertEquals(this.server.url("/odd/items%5B0%5D/a%7Cb/caf%C3%A9"), seen.get(0)[0]);
+        for (String[] targetAndHtu : seen) {
+            assertEquals(targetAndHtu[0], targetAndHtu[1]);
+        }
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────────────────────────────
 
     private static HttpHeaders headers(String... kv) {
@@ -415,5 +737,16 @@ class ClientAttestationDpopTest {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    @Test
+    void sendTreatsAUrlTheHtuRuleRefusesAsOneOrigin() {
+        // an IPv6 zone literal is refused by the htu rule (so it is its own nonce key), but two requests to it
+        // with different paths, queries or userinfo are still on one origin; another port is not
+        URI a = URI.create("https://User@[FE80::1%25eth0]:8443/a?x=1");
+        assertTrue(ClientAttestation.sameOrigin(a, URI.create("https://[fe80::1%25eth0]:8443/b")));
+        assertFalse(ClientAttestation.sameOrigin(a, URI.create("https://[fe80::1%25eth0]:9443/a?x=1")));
+        assertTrue(ClientAttestation.sameOrigin(URI.create("https://as.example/a"), URI.create("https://AS.example:443/b")));
+        assertFalse(ClientAttestation.sameOrigin(URI.create("https://as.example/a"), URI.create("https://other.example/a")));
     }
 }

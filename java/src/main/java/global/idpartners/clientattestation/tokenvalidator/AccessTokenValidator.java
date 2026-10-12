@@ -97,7 +97,7 @@ public final class AccessTokenValidator {
         this.log = new ValidatorLog(b.logger);
         this.httpPost = b.httpPost != null ? b.httpPost : this::defaultPost;
         HttpGet get = b.httpGet != null ? b.httpGet : this::defaultGet;
-        this.jwks = new JwksProvider(b.config.jwks(), b.config.jwksUri(), get, b.clock, this.log);
+        this.jwks = new JwksProvider(b.config.jwks(), b.config.jwksUri(), get, b.jwksClock, this.log);
     }
 
     /**
@@ -177,9 +177,10 @@ public final class AccessTokenValidator {
         Object kid = header.get("kid");
         Key key = kid == null || kid instanceof String ? this.jwks.resolve((String) kid, algorithm) : null;
         if (key == null) {
-            String reason = this.jwks.lastError();
+            // a fetch failure's detail (internal host, dial error, IdP body) went to the logger as
+            // jwks.fetch_failed; the description lands in WWW-Authenticate, in front of anyone
             return ValidationResult.failure(ErrorCodes.KEY_NOT_FOUND,
-                    reason != null ? reason : "no signing key for this kid");
+                    this.jwks.lastError() != null ? "signing keys unavailable" : "no signing key for this kid");
         }
 
         try {
@@ -438,6 +439,7 @@ public final class AccessTokenValidator {
         private HttpPost httpPost;
         private System.Logger logger;
         private LongSupplier clock = System::currentTimeMillis;
+        private LongSupplier jwksClock = JwksProvider::monotonicMillis;
 
         private Builder(ValidatorConfig config) {
             this.config = config;
@@ -485,15 +487,21 @@ public final class AccessTokenValidator {
         }
 
         /**
-         * The clock {@code exp}, {@code nbf} and {@code iat} are checked against (and the JWKS cache ages by),
-         * in epoch milliseconds. Default: {@link System#currentTimeMillis()}. Inject one to validate as of a
-         * fixed instant.
+         * The clock {@code exp}, {@code nbf} and {@code iat} are checked against, in epoch milliseconds. Default:
+         * {@link System#currentTimeMillis()}. Inject one to validate as of a fixed instant. The JWKS cache does not
+         * use it: the key set ages, and refetches are spaced, on {@link System#nanoTime()}.
          *
          * @param clock the epoch-millisecond clock
          * @return this builder
          */
         public Builder clock(LongSupplier clock) {
             this.clock = clock;
+            return this;
+        }
+
+        /** Tests only: the monotonic millisecond clock the JWKS cache ages by, instead of {@code nanoTime}. */
+        Builder jwksClock(LongSupplier jwksClock) {
+            this.jwksClock = jwksClock;
             return this;
         }
 

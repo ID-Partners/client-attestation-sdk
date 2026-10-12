@@ -7,10 +7,12 @@ name: release
 #   go      -> tag go/vX.Y.Z, which is what `go get .../go@vX.Y.Z` resolves
 #
 # Nothing publishes unless the full CI suite passes on the tagged commit and every manifest already says
-# X.Y.Z. The publish jobs run in the `release` environment, which requires a reviewer's approval.
+# X.Y.Z. The publish jobs run in the `release` environment, which requires a reviewer's approval. Python
+# and npm are built in unprivileged jobs; the jobs holding the OIDC token only download and publish.
 #
 # One-time setup, outside this repo:
-#   - GitHub: create the `release` environment with required reviewers.
+#   - GitHub: create the `release` environment with required reviewers (prevent self-review on) and
+#       deployment tags v* only.
 #   - PyPI: add a trusted publisher for client-attestation-sdk
 #       (owner ID-Partners, repo client-attestation-sdk, workflow release.yml, environment release).
 #   - npm: create the @idpartners org, then add a trusted publisher for @idpartners/client-attestation-sdk
@@ -37,14 +39,17 @@ jobs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # brings main for the check below, so no later fetch needs credentials
+          persist-credentials: false
       - id: v
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::release tag '$TAG' is not vX.Y.Z"; exit 1 ;; esac
           v="${TAG#v}"
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          # Fully qualified: a tag named "origin/main" (fetched with every other tag) would shadow the bare name.
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || { echo "::error::$TAG is not on main"; exit 1; }
           python3 scripts/version.py check
           [ "$(cat VERSION)" = "$v" ] || { echo "::error::VERSION says $(cat VERSION), the tag says $v"; exit 1; }
           py=$(python3 -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project']['version'])")
@@ -58,59 +63,124 @@ jobs:
     needs: version
     uses: ./.github/workflows/ci.yml
 
-  python:
-    name: publish python
-    needs: ci
+  # Python and npm are each built in an unprivileged job (contents: read, no environment, no OIDC token) and
+  # published from a separate job that only downloads that build and uploads it. Installing dependencies and
+  # running a build executes third-party code (setuptools, npm packages); none of it runs where the id-token
+  # that PyPI and npm trust is available.
+  python-build:
+    name: build python
+    needs: version
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: read
-      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      # build, setuptools and their dependencies are pinned with hashes; --no-isolation builds with exactly
+      # those instead of letting `build` fetch whatever setuptools is newest into a throwaway venv.
+      - name: Install the pinned build tooling
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r .github/build-requirements.txt
       - name: Build sdist + wheel
         working-directory: python
         run: |
-          python -m pip install --upgrade build
-          python -m build
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+          python -m build --no-isolation
+          ls dist
+          test -f "dist/client_attestation_sdk-$VERSION.tar.gz"
+          test -f "dist/client_attestation_sdk-$VERSION-py3-none-any.whl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          packages-dir: python/dist
+          name: python-dist
+          path: python/dist/
+          if-no-files-found: error
+          retention-days: 7
 
-  npm:
-    name: publish npm
-    needs: ci
+  python:
+    name: publish python
+    needs: [ci, python-build]
     runs-on: ubuntu-latest
     environment: release
     permissions:
-      contents: read
       id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+
+  npm-build:
+    name: build npm
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: typescript
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      # The build is tsc alone, so no dependency's install script (esbuild, workerd) needs to run.
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Pack
+        run: |
+          npm pack --ignore-scripts
+          test -f "idpartners-client-attestation-sdk-$VERSION.tgz"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-dist
+          path: typescript/idpartners-client-attestation-sdk-${{ needs.version.outputs.version }}.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  npm:
+    name: publish npm
+    needs: [version, ci, npm-build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
-      - run: npm ci
-      - run: npm run build
+      # Trusted publishing needs npm >= 11.5.1. An exact version, not @latest: this job holds the OIDC token.
+      - run: npm install -g npm@11.21.0 --ignore-scripts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-dist
+          path: npm-dist
       # A version already on npm is skipped, not failed: the first release of a package is published by
       # hand (npm adds a trusted publisher per package, so the package has to exist first).
       - id: published
         run: |
-          v=$(node -p "require('./package.json').version")
-          if [ "$(npm view "@idpartners/client-attestation-sdk@$v" version 2>/dev/null)" = "$v" ]; then
-            echo "::notice::@idpartners/client-attestation-sdk@$v is already on npm, skipping the publish"
+          if [ "$(npm view "@idpartners/client-attestation-sdk@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "::notice::@idpartners/client-attestation-sdk@$VERSION is already on npm, skipping the publish"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+      # npm publish runs here, in the job npm trusts, so the provenance names this workflow; it publishes the
+      # tarball npm-build packed and runs no package scripts.
       - if: steps.published.outputs.skip != 'true'
-        run: npm publish --provenance --access public
+        run: npm publish "npm-dist/idpartners-client-attestation-sdk-$VERSION.tgz" --provenance --access public --ignore-scripts
 
   java:
     name: publish java (Maven Central)
@@ -124,15 +194,16 @@ jobs:
         working-directory: java
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
-      CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
-      MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+    # The Central token and GPG passphrase are set only on the steps that use them, not job-wide.
     steps:
       # Fail, never skip, when the setup isn't done: a release that quietly leaves Java off Central would
       # look like a success.
       - name: Central and GPG secrets are set
         env:
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
           MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
         working-directory: .
         run: |
           missing=""
@@ -162,6 +233,10 @@ jobs:
           esac
       - if: steps.published.outputs.skip != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # setup-java writes settings.xml with ${env.CENTRAL_TOKEN_*} and ${env.MAVEN_GPG_PASSPHRASE} placeholders
+      # (resolved by the deploy step's env) and imports the key, which needs no passphrase.
       - if: steps.published.outputs.skip != 'true'
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -177,7 +252,12 @@ jobs:
       - if: steps.published.outputs.skip != 'true'
         # mvnw pins Maven 3.9.16. Maven 3.10 stages maven-metadata-local.xml and _remote.repositories, the
         # plugin bundles them, and Central rejects the bundle ("content that does NOT have a .pom file").
-        run: ./mvnw -B -P release deploy -DskipTests
+        # --strict-checksums fails the build on any downloaded artifact whose checksum doesn't match.
+        env:
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: ./mvnw -B --strict-checksums -P release deploy -DskipTests
 
   go:
     name: tag go module
@@ -187,9 +267,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # credentials persisted on purpose: the git push below uses this job's token (contents: write)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - env:
           GO_TAG: go/v${{ needs.version.outputs.version }}
         run: |
           git tag "$GO_TAG" "$GITHUB_SHA"
-          git push origin "$GO_TAG"
+          git push origin "refs/tags/$GO_TAG"

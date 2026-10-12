@@ -119,13 +119,16 @@ func TestJWKSURIRefreshResolvesUnknownKid(t *testing.T) {
 func TestJWKSURIFetchFailure(t *testing.T) {
 	key, _ := newTestKey(t, "k1")
 	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKSURI: "https://as.test/jwks"},
-		WithHTTPGet(func(string) ([]byte, error) { return nil, errors.New("boom") }))
+		WithHTTPGet(func(string) ([]byte, error) {
+			return nil, errors.New("dial tcp keys.internal:8443: connection refused")
+		}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
 	r := val.Validate(token, nil)
-	if r.Valid || r.Error != ErrKeyNotFound || !strings.Contains(r.ErrorDescription, "fetch jwks") {
+	// the description reaches WWW-Authenticate: the fetch failure's detail stays in the log
+	if r.Valid || r.Error != ErrKeyNotFound || r.ErrorDescription != "signing keys unavailable" {
 		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
 	}
 }
@@ -139,7 +142,7 @@ func TestJWKSURIUnparseableDocument(t *testing.T) {
 	}
 	token := signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300})
 	r := val.Validate(token, nil)
-	if r.Valid || r.Error != ErrKeyNotFound || !strings.Contains(r.ErrorDescription, "parse jwks") {
+	if r.Valid || r.Error != ErrKeyNotFound || r.ErrorDescription != "signing keys unavailable" {
 		t.Errorf("got valid=%v error=%s desc=%s", r.Valid, r.Error, r.ErrorDescription)
 	}
 }
@@ -384,7 +387,8 @@ func TestValidateActiveWrongAudience(t *testing.T) {
 
 func TestDefaultHTTPPostErrors(t *testing.T) {
 	newVal := func(endpoint string) *AccessTokenValidator {
-		val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{Endpoint: endpoint}})
+		val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{Endpoint: endpoint},
+			AllowInsecure: true}) // so "://bad" reaches the transport
 		if err != nil {
 			t.Fatal(err)
 		}

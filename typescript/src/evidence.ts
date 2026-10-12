@@ -10,12 +10,12 @@
  * - the GCP metadata server (GCE, GKE, Cloud Run, Vertex AI Agent Engine).
  *
  * {@link autoDetectEvidence} tries these in order and returns the first that applies, so a developer
- * can write `new ClientAttestation(attesterUrl)` and have it work without naming the source. Override by
+ * can write `new ClientAttestation(attesterUrl, { evidenceAudience })` and have it work without naming the source. Override by
  * passing an explicit {@link SvidSource} to {@link ClientAttestation}.
  */
 import { TransportError } from "./errors.js";
 import { request, snippet } from "./http.js";
-import { envVar, importNodeBuiltin } from "./runtime.js";
+import { envVar, importNodeBuiltin, utf8Decode } from "./runtime.js";
 import { SpireWorkloadApiSvidSource, StaticSvidSource, type SvidSource } from "./svid-source.js";
 
 /** Environment variable holding the evidence token itself (static). */
@@ -42,6 +42,8 @@ export const GCP_METADATA_BASE = "http://metadata.google.internal";
  */
 export const GCP_METADATA_IDENTITY =
   GCP_METADATA_BASE + "/computeMetadata/v1/instance/service-accounts/default/identity";
+/** A token file larger than this (64 KiB) is refused: a projected token is a few KiB. */
+const MAX_TOKEN_FILE_BYTES = 64 * 1024;
 
 /** No platform identity could be detected and none was supplied. */
 export class EvidenceNotFound extends Error {
@@ -57,6 +59,7 @@ export class EvidenceNotFound extends Error {
  * Kubernetes and GKE mount a short-lived, auto-rotated service-account token into the pod as a file
  * (a projected `serviceAccountToken` volume). Reading it fresh each time picks up the rotation. The
  * file's audience must already be the attester's evidence audience — set it when you declare the volume.
+ * The path must be a regular file of at most 64 KiB; anything else is an {@link EvidenceNotFound}.
  *
  * Needs a filesystem: `node:fs/promises` is loaded on the first `fetch`, which throws a
  * `ClientAttestationError` on a runtime without it.
@@ -65,12 +68,30 @@ export class FileTokenSvidSource implements SvidSource {
   constructor(private readonly path: string) {}
 
   async fetch(_audience: string): Promise<string> {
-    const { readFile } = await importNodeBuiltin<typeof import("node:fs/promises")>(
+    const { open, stat } = await importNodeBuiltin<typeof import("node:fs/promises")>(
       "fs/promises",
       "FileTokenSvidSource",
     );
-    const contents = await readFile(this.path, "utf8");
-    return contents.trim();
+    // Checked before opening: opening a FIFO blocks, and a device such as /dev/zero never ends.
+    if (!(await stat(this.path)).isFile()) {
+      throw new EvidenceNotFound(`token file ${this.path} is not a regular file`);
+    }
+    const handle = await open(this.path, "r");
+    try {
+      const buf = new Uint8Array(MAX_TOKEN_FILE_BYTES + 1);
+      let total = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buf, total, buf.length - total, null);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+        if (total > MAX_TOKEN_FILE_BYTES) {
+          throw new EvidenceNotFound(`token file ${this.path} is larger than ${MAX_TOKEN_FILE_BYTES} bytes`);
+        }
+      }
+      return utf8Decode(buf.subarray(0, total)).trim();
+    } finally {
+      await handle.close();
+    }
   }
 }
 
@@ -79,7 +100,8 @@ export class FileTokenSvidSource implements SvidSource {
  *
  * Works on any Google runtime that exposes the metadata server (GCE, GKE, Cloud Run, Vertex AI Agent
  * Engine). The token's `aud` is the attester's evidence audience; `sub` is the service account. No
- * google-auth dependency — a plain metadata call.
+ * google-auth dependency — a plain metadata call. The answer must be HTTP 200 carrying the
+ * `Metadata-Flavor: Google` response header, as the real metadata server sends.
  */
 export class GoogleMetadataSvidSource implements SvidSource {
   /**
@@ -98,10 +120,15 @@ export class GoogleMetadataSvidSource implements SvidSource {
       headers: { "Metadata-Flavor": "Google" },
       timeoutMs: this.timeoutMs,
     });
-    if (!res.ok) {
+    if (res.status !== 200) {
       throw new TransportError(`GCP metadata identity endpoint -> ${res.status}`, "status", {
         status: res.status,
         body: snippet(res.body),
+      });
+    }
+    if (!fromGoogleMetadata(res.headers)) {
+      throw new TransportError("GCP metadata identity endpoint answered without Metadata-Flavor: Google", "status", {
+        status: res.status,
       });
     }
     return res.body.trim();
@@ -121,6 +148,16 @@ async function pathProbe(): Promise<(path: string) => boolean> {
   }
 }
 
+/** Whether a response carries the header the GCP metadata server always sets. */
+function fromGoogleMetadata(headers: Headers): boolean {
+  return headers.get("Metadata-Flavor") === "Google";
+}
+
+/**
+ * Whether the GCP metadata server answers: HTTP 200 with `Metadata-Flavor: Google`.
+ * `metadata.google.internal` is a DNS name, so whatever a search domain, LLMNR or a hostile resolver
+ * points it at could answer; the header is what google-auth checks too.
+ */
 async function gcpMetadataAvailable(base: string, timeoutMs = 300): Promise<boolean> {
   try {
     const res = await request(base + "/computeMetadata/v1/", {
@@ -128,7 +165,7 @@ async function gcpMetadataAvailable(base: string, timeoutMs = 300): Promise<bool
       headers: { "Metadata-Flavor": "Google" },
       timeoutMs,
     });
-    return res.ok;
+    return res.status === 200 && fromGoogleMetadata(res.headers);
   } catch {
     return false;
   }

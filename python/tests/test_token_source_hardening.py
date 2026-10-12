@@ -13,6 +13,8 @@ from client_attestation_sdk import ClientAttestation, ClientAttestationError, St
 from client_attestation_sdk import evidence as evidence_mod
 from client_attestation_sdk.svid_source import SpireWorkloadApiSvidSource
 
+AUD = "https://attester.example.com"  # the evidence_audience the fake attester's discovery document names
+
 
 def _seg(obj):
     import base64
@@ -81,7 +83,7 @@ def attester():
 ])
 def test_advertised_challenge_that_cannot_be_fetched_fails_the_flow(attester, challenge):
     _Attester.config = {"challenge": challenge}
-    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), timeout=2)
+    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), evidence_audience=AUD, timeout=2)
     with pytest.raises(ClientAttestationError, match="could not get an attestation challenge"):
         ca.token()
     assert _Attester.mint_bodies == []  # never minted without the advertised challenge
@@ -89,7 +91,7 @@ def test_advertised_challenge_that_cannot_be_fetched_fails_the_flow(attester, ch
 
 def test_require_challenge_false_keeps_minting_without_one(attester):
     _Attester.config = {"challenge": (500, {"error": "server_error"})}
-    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), timeout=2, require_challenge=False)
+    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), evidence_audience=AUD, timeout=2, require_challenge=False)
     assert ca.token().startswith("eyJ")
     proof = jwt.decode(_Attester.mint_bodies[0]["proof"], options={"verify_signature": False})
     assert "challenge" not in proof
@@ -97,7 +99,7 @@ def test_require_challenge_false_keeps_minting_without_one(attester):
 
 def test_no_advertised_challenge_endpoint_is_not_an_error(attester):
     _Attester.config = {"discovery": {"challenge_endpoint": None}}
-    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), timeout=2)
+    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), evidence_audience=AUD, timeout=2)
     assert ca.token()
 
 
@@ -163,7 +165,7 @@ def test_allow_insecure_accepts_plain_http():
 def test_plain_http_discovery_endpoint_is_refused(attester, field):
     insecure = "http://attester.example.com/" + field
     _Attester.config = {"discovery": {field: insecure}}
-    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), timeout=2)
+    ca = ClientAttestation(attester, evidence=StaticSvidSource("svid"), evidence_audience=AUD, timeout=2)
     with pytest.raises(ClientAttestationError, match=f"{field} must use https") as info:
         ca.token()
     assert insecure in str(info.value)
@@ -183,7 +185,7 @@ def _data_arg(curl):
 
 def test_trace_is_redacted_by_default(attester):
     trace = []
-    ca = ClientAttestation(attester, evidence=StaticSvidSource("eyJ.the-svid.sig"), trace=trace, timeout=2)
+    ca = ClientAttestation(attester, evidence=StaticSvidSource("eyJ.the-svid.sig"), evidence_audience=AUD, trace=trace, timeout=2)
     ca.token()
     assert [r["step"] for r in trace] == ["discover", "challenge", "mint", "token"]
     dumped = json.dumps(trace)
@@ -203,7 +205,7 @@ def test_trace_is_redacted_by_default(attester):
 
 def test_trace_redact_false_records_credentials_verbatim(attester):
     trace = []
-    ca = ClientAttestation(attester, evidence=StaticSvidSource("eyJ.the-svid.sig"), trace=trace,
+    ca = ClientAttestation(attester, evidence=StaticSvidSource("eyJ.the-svid.sig"), evidence_audience=AUD, trace=trace,
                            trace_redact=False, timeout=2)
     ca.token()
     assert trace[1]["value"] == "chal-1"
@@ -217,7 +219,7 @@ def test_curl_arguments_survive_a_single_quote(attester, redact):
     svid = "it's'a'svid"
     details = [{"type": "o'brien's \"quoted\" $(rm -rf /) `x`"}]
     trace = []
-    ca = ClientAttestation(attester, evidence=StaticSvidSource(svid), trace=trace, trace_redact=redact,
+    ca = ClientAttestation(attester, evidence=StaticSvidSource(svid), evidence_audience=AUD, trace=trace, trace_redact=redact,
                            authorization_details=details, timeout=2)
     ca.token()
     body = json.loads(_data_arg(trace[2]["curl"]))

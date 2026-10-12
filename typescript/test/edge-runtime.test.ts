@@ -63,19 +63,25 @@ const dpop = await new sdk.DpopProofBuilder(instance)
 const dpopClaims = JSON.parse(atob(dpop.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
 
 function validatorFor(v, vectors, c) {
-  // the shared config plus the case's overrides (present wins, even when empty) and clock
+  // the shared config plus the case's overrides (present wins, even when empty), key set and clock; a case
+  // with a fetch error gets a jwksUri whose fetch fails
   const o = c.config ?? {};
+  const fetchError = c.jwks_fetch_error;
   const cfg = {
     issuer: vectors.issuer,
     audiences: [vectors.audience],
-    jwks: vectors.jwks,
+    jwks: fetchError === undefined ? (c.jwks ?? vectors.jwks) : undefined,
+    jwksUri: fetchError === undefined ? undefined : "https://keys.internal.example:8443/jwks",
     requiredScopes: vectors.required_scopes,
     acceptedAlgorithms: vectors.accepted_algorithms,
   };
   if ("accepted_algorithms" in o) cfg.acceptedAlgorithms = o.accepted_algorithms;
   if ("accepted_token_types" in o) cfg.acceptedTokenTypes = o.accepted_token_types;
   if ("leeway_seconds" in o) cfg.leewaySeconds = o.leeway_seconds;
-  return new v.AccessTokenValidator(cfg, c.now === undefined ? {} : { clock: () => c.now * 1000 });
+  const httpGet = async () => {
+    throw new Error(fetchError);
+  };
+  return new v.AccessTokenValidator(cfg, c.now === undefined ? { httpGet } : { httpGet, clock: () => c.now * 1000 });
 }
 const verdicts = [];
 for (const c of vectors.cases) {

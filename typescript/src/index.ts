@@ -58,7 +58,7 @@ export type { TransportFailure } from "./errors.js";
 export { NOOP_LOGGER } from "./logging.js";
 export type { Logger, LogAttributes, LogLevel } from "./logging.js";
 
-export const VERSION = "1.0.1";
+export const VERSION = "1.1.0";
 
 /** draft-ietf-oauth-attestation-based-client-auth revision this SDK implements. */
 export const DRAFT_REVISION = "10";

@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import urllib.parse
 
-from ._redact import SECRET_FIELDS, looks_like_jwt, redacted
+from ._redact import is_secret_key, looks_like_secret, redacted
 
 LOGGER_NAME = "client_attestation_sdk"
 logging.getLogger(LOGGER_NAME).addHandler(logging.NullHandler())
@@ -19,14 +19,15 @@ def get(name: str) -> logging.Logger:
 def emit(logger: logging.Logger, level: int, event: str, **attrs) -> None:
     """Log ``event`` with ``attrs`` (``None`` values dropped). The attributes ride on the record as
     ``record.event`` / ``record.attributes`` and are also rendered ``key=value`` into the message. Any
-    value under a credential key, or that looks like a JWT, is redacted as a backstop."""
+    value under a credential key, or that looks like a credential (a JWT, a Vault token, an
+    ``Authorization`` header value), is redacted as a backstop."""
     if not logger.isEnabledFor(level):
         return
     clean = {}
     for key, value in attrs.items():
         if value is None:
             continue
-        if key in SECRET_FIELDS or looks_like_jwt(value):
+        if is_secret_key(key) or looks_like_secret(value):
             value = redacted(value)
         clean[key] = value
     rendered = " ".join([event] + [f"{key}={_render(value)}" for key, value in clean.items()])

@@ -9,6 +9,7 @@
  * {@link ClientAttestation} and {@link AttestationIssuanceClient} use {@link PingFederateProfile} unless
  * told otherwise, which is exactly the behaviour of earlier releases. See docs/attester-profiles.md.
  */
+import { ATTESTATION_TYP, DPOP_TYP, POP_TYP } from "./builders.js";
 import { ClientAttestationError } from "./errors.js";
 import { type SigningKeyPair, signCompact } from "./signing-key-pair.js";
 
@@ -66,14 +67,15 @@ export interface AttesterProfile {
   mint(transport: AttesterTransport, metadata: AttesterMetadata, request: MintRequest): Promise<MintResult>;
 }
 
-/** Everything a profile needs to mint one attestation. */
+/**
+ * Everything a profile needs to mint one attestation. The evidence and the challenge are getters over
+ * private fields, so `JSON.stringify` and `console.log` of a request show neither.
+ */
 export class MintRequest {
   /** The fresh key the attestation will be bound to (its `cnf`). */
   readonly instanceKey: SigningKeyPair;
-  /** The workload's platform identity token (a JWT-SVID or equivalent). */
-  readonly evidence: string;
-  /** The attester-issued challenge, if any. */
-  readonly challenge?: string;
+  readonly #evidence: string;
+  readonly #challenge?: string;
   /** Set by {@link AttestationIssuanceClient}; unset in the evidence-first one-call flow. */
   readonly clientId?: string;
   /** Optional RFC 9396 access request. */
@@ -90,15 +92,34 @@ export class MintRequest {
     operator?: Record<string, unknown>;
   }) {
     this.instanceKey = init.instanceKey;
-    this.evidence = init.evidence;
-    this.challenge = init.challenge;
+    this.#evidence = init.evidence;
+    this.#challenge = init.challenge;
     this.clientId = init.clientId;
     this.authorizationDetails = init.authorizationDetails;
     this.operator = init.operator;
   }
 
-  /** Sign `claims` as a compact JWS with the instance key, under header `typ` (no `jwk`). */
-  sign(claims: Record<string, unknown>, typ: string): Promise<string> {
+  /** The workload's platform identity token (a JWT-SVID or equivalent). */
+  get evidence(): string {
+    return this.#evidence;
+  }
+
+  /** The attester-issued challenge, if any. */
+  get challenge(): string | undefined {
+    return this.#challenge;
+  }
+
+  /**
+   * Sign `claims` as a compact JWS with the instance key, under header `typ` (no `jwk`). `typ` may not be
+   * one the SDK's own credentials use (`ATTESTATION_TYP`, `POP_TYP`, `DPOP_TYP`): a profile could otherwise
+   * have the instance key sign a Client Attestation PoP or DPoP proof with claims of its choosing.
+   */
+  async sign(claims: Record<string, unknown>, typ: string): Promise<string> {
+    if (reservedTyp(typ)) {
+      throw new Error(
+        `typ ${JSON.stringify(typ)} is reserved for the SDK's own credentials; a profile cannot sign it with the instance key`,
+      );
+    }
     return signCompact(claims, this.instanceKey, typ, false);
   }
 
@@ -112,6 +133,15 @@ export class MintRequest {
     if (this.challenge) claims.challenge = this.challenge;
     return this.sign(claims, typ);
   }
+}
+
+/**
+ * Whether `typ` names one of the SDK's own credential types, compared as RFC 7515 section 4.1.9 says a
+ * verifier may: case-insensitively, with or without the `application/` prefix.
+ */
+function reservedTyp(typ: string): boolean {
+  const t = String(typ).trim().toLowerCase().replace(/^application\//, "");
+  return t === ATTESTATION_TYP || t === POP_TYP || t === DPOP_TYP;
 }
 
 /**
@@ -173,9 +203,8 @@ export class PingFederateProfile implements AttesterProfile {
     const response = await transport.requestJson("mint", "POST", metadata.attestationEndpoint, body);
     const attestation = response.attestation;
     if (typeof attestation !== "string" || !attestation) {
-      throw new ClientAttestationError("attester response contained no attestation", {
-        body: JSON.stringify(response),
-      });
+      // No body: a 2xx mint response may hold the attestation under another name.
+      throw new ClientAttestationError("attester response contained no attestation");
     }
     const expiresIn = response.expires_in;
     return { attestation, expiresIn: typeof expiresIn === "number" ? expiresIn : undefined };

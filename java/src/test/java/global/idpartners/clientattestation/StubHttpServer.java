@@ -58,6 +58,14 @@ final class StubHttpServer implements Closeable {
         return route(path, exchange -> send(exchange, status, body));
     }
 
+    /** A canned response carrying {@code Metadata-Flavor: Google}, as the GCP metadata server sends. */
+    StubHttpServer metadata(String path, int status, String body) {
+        return route(path, exchange -> {
+            exchange.getResponseHeaders().set("Metadata-Flavor", "Google");
+            send(exchange, status, body);
+        });
+    }
+
     /** A 302 to {@code location}. */
     StubHttpServer redirect(String path, String location) {
         return route(path, exchange -> {

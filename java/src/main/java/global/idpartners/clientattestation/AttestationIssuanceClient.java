@@ -32,6 +32,10 @@ import org.jose4j.json.JsonUtil;
  *
  * <p>The mint protocol belongs to an {@link AttesterProfile}, by default {@link PingFederateProfile}. The
  * endpoint is given directly, so the profile's discovery is not used. See docs/attester-profiles.md.
+ *
+ * <p>The SVID is a bearer credential to the attester, so the endpoint, and every URL the profile calls, must
+ * be https unless its host is loopback ({@code localhost}, {@code 127.0.0.1}, {@code ::1}) or
+ * {@code allowInsecure} is set.
   *
   * <p><b>Experimental</b> (see docs/api.md): it calls a PingFederate demo issuance servlet
   * (/federation/attestation) whose protocol is not standardised.
@@ -47,6 +51,7 @@ public final class AttestationIssuanceClient {
     private final SvidSource svidSource;
     private final SigningKeyPair instanceKey;
     private final AttesterProfile profile;
+    private final boolean allowInsecure;
     static final Duration TIMEOUT = Duration.ofSeconds(20);
     private final HttpClient http = HttpTransport.client(TIMEOUT);
 
@@ -68,15 +73,36 @@ public final class AttestationIssuanceClient {
      * @param svidSource     where the SVID comes from
      * @param instanceKey    the workload's instance key
      * @param profile        the attester profile that builds and sends the mint request
+     * @throws ClientAttestation.ClientAttestationException if {@code endpoint} is not https and not loopback
      */
     public AttestationIssuanceClient(String endpoint, String clientId, String attesterIssuer,
                                      SvidSource svidSource, SigningKeyPair instanceKey, AttesterProfile profile) {
+        this(endpoint, clientId, attesterIssuer, svidSource, instanceKey, profile, false);
+    }
+
+    /**
+     * A client that, with {@code allowInsecure}, also accepts plain-http URLs on hosts that are not loopback,
+     * for the endpoint and for every call the profile makes. The SVID then travels in cleartext.
+     *
+     * @param endpoint       the attestation (mint) endpoint
+     * @param clientId       the client id sent in the mint request
+     * @param attesterIssuer the SVID audience and the instance proof's {@code aud}
+     * @param svidSource     where the SVID comes from
+     * @param instanceKey    the workload's instance key
+     * @param profile        the attester profile that builds and sends the mint request ({@code null}: PingFederate)
+     * @param allowInsecure  allow plain http to hosts that are not loopback (default {@code false})
+     */
+    public AttestationIssuanceClient(String endpoint, String clientId, String attesterIssuer,
+                                     SvidSource svidSource, SigningKeyPair instanceKey, AttesterProfile profile,
+                                     boolean allowInsecure) {
         this.endpoint = endpoint.replaceAll("/+$", "");
+        ClientAttestation.requireSecure(this.endpoint, "endpoint", allowInsecure);
         this.clientId = clientId;
         this.attesterIssuer = attesterIssuer;
         this.svidSource = svidSource;
         this.instanceKey = instanceKey;
         this.profile = profile != null ? profile : new PingFederateProfile();
+        this.allowInsecure = allowInsecure;
     }
 
     /** The workload's instance key (bound into the minted attestation's cnf; signs PoPs). */
@@ -101,11 +127,19 @@ public final class AttestationIssuanceClient {
         } catch (ClientAttestation.ClientAttestationException e) {
             throw new IssuanceException("attestation issuance failed: " + e.getMessage(), e.status(), e);
         }
+        if (minted == null || minted.attestation() == null || minted.attestation().isBlank()) {
+            throw new IssuanceException("attestation issuance failed: attester response contained no attestation",
+                    0, null);
+        }
         return new IssuedAttestation(minted.attestation(), minted.expiresIn(), this.instanceKey);
     }
 
-    /** The issuance endpoint's transport: a non-2xx answer or a transport failure is an IssuanceException. */
+    /**
+     * The issuance endpoint's transport: the https rule, and a non-2xx answer or a transport failure is an
+     * IssuanceException.
+     */
     private Map<String, Object> send(String step, String method, String url, Map<String, Object> body) {
+        ClientAttestation.requireSecure(url, step + " URL", this.allowInsecure);
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url))
                 .header("Content-Type", "application/json").header("Accept", "application/json")
                 .method(method, body == null ? HttpRequest.BodyPublishers.noBody()

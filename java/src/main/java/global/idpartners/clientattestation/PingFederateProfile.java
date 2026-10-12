@@ -2,7 +2,6 @@ package global.idpartners.clientattestation;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
-import org.jose4j.json.JsonUtil;
 
 /**
  * The attester this SDK was built against (PingFederate), and the default {@link AttesterProfile}.
@@ -72,8 +71,9 @@ public final class PingFederateProfile implements AttesterProfile {
         }
         Map<String, Object> response = transport.requestJson("mint", "POST", endpoint, body);
         if (!(response.get("attestation") instanceof String attestation) || attestation.isBlank()) {
+            // No body: a 2xx mint response may hold the attestation under another name.
             throw new ClientAttestation.ClientAttestationException("attester response contained no attestation",
-                    0, JsonUtil.toJson(response));
+                    0, null);
         }
         Object expiresIn = response.get("expires_in");
         return new MintResult(attestation, expiresIn instanceof Number n ? n.longValue() : null);

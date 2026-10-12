@@ -3,7 +3,11 @@
  * one-call flow; {@link TransportError} is the subclass for anything that went wrong on the wire.
  */
 
-/** A step in the flow failed. `status` and `body` are set for HTTP failures. */
+/**
+ * A step in the flow failed. `status` and `body` are set for HTTP failures: `body` is at most the first 512
+ * characters of a non-2xx response, and unset for a 2xx response that could not be used, since that body
+ * may hold a token, attestation or SVID.
+ */
 export class ClientAttestationError extends Error {
   readonly status?: number;
   readonly body?: string;
@@ -28,7 +32,7 @@ export type TransportFailure =
 /**
  * An outbound HTTP call failed: unreachable, timed out, redirected, oversized, non-2xx, or malformed
  * JSON (see {@link kind}). `status` is set when a response was received; `body` holds at most the first
- * 512 characters of it.
+ * 512 characters of a non-2xx one.
  */
 export class TransportError extends ClientAttestationError {
   readonly kind: TransportFailure;

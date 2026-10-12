@@ -2,7 +2,9 @@ package clientattestation
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,9 +53,21 @@ type MintRequest struct {
 	Operator map[string]any
 }
 
-// Sign signs claims as a compact JWS with the instance key under header typ (no jwk header).
+// Sign signs claims as a compact JWS with the instance key under header typ (no jwk header). typ may not
+// be one the SDK's own credentials use (AttestationTyp, PopTyp, DpopTyp): a profile could otherwise have
+// the instance key sign a Client Attestation PoP or DPoP proof with claims of its choosing.
 func (r *MintRequest) Sign(claims map[string]any, typ string) (string, error) {
+	if reservedTyp(typ) {
+		return "", fmt.Errorf("typ %q is reserved for the SDK's own credentials; a profile cannot sign it with the instance key", typ)
+	}
 	return r.InstanceKey.signCompact(claims, typ, false)
+}
+
+// reservedTyp reports whether typ names one of the SDK's own credential types, compared as RFC 7515
+// section 4.1.9 says a verifier may: case-insensitively, with or without the "application/" prefix.
+func reservedTyp(typ string) bool {
+	t := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(typ)), "application/")
+	return t == AttestationTyp || t == PopTyp || t == DpopTyp
 }
 
 // InstanceProof is a proof of possession of the instance key: {aud, jti, iat[, challenge]} signed with it

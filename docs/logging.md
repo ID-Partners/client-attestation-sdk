@@ -7,7 +7,8 @@ works whichever port a service runs.
 
 Logging is **off by default**. Nothing is written until you configure a logger.
 
-The logger option in each port is Stable API, and the rule that nothing secret is logged never changes.
+The logger hook in each port (the logger option in Go, TypeScript and Java; the `client_attestation_sdk`
+logger hierarchy in Python) is Stable API, and the rule that nothing secret is logged never changes.
 The event names and attributes below are **Experimental** (see [`api.md`](api.md)): a minor release may
 add, split or rename them, with a CHANGELOG entry.
 
@@ -28,15 +29,17 @@ logging.getLogger("client_attestation_sdk").setLevel(logging.DEBUG)
 
 ```go
 logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-ca, err := clientattestation.NewClientAttestation("pf.example.com", clientattestation.WithLogger(logger))
+ca, err := clientattestation.NewClientAttestation("pf.example.com",
+    clientattestation.WithEvidenceAudience("https://attester.example.com"), clientattestation.WithLogger(logger))
 ```
 
 ```ts
-const ca = new ClientAttestation("pf.example.com", { logger: console });
+const ca = new ClientAttestation("pf.example.com", { evidenceAudience: "https://attester.example.com", logger: console });
 ```
 
 ```java
 ClientAttestation ca = ClientAttestation.builder("pf.example.com")
+        .evidenceAudience("https://attester.example.com")
         .logger(System.getLogger(ClientAttestation.LOGGER_NAME))
         .build();
 ```
@@ -55,9 +58,48 @@ The message is the event name. The attributes travel the way the language carrie
 
 No access token, attestation, PoP or DPoP proof, SVID, challenge value, client secret, private key or
 JWK member, and no `Authorization`, `DPoP` or `OAuth-Client-Attestation*` header value. URLs are logged as
-`host` and `path` only, never with a query string or fragment. As a backstop, every port also replaces any attribute
-value containing `eyJ` (the start of every JWT) with `<redacted:N bytes>` before it reaches the logger. Each port has a test that runs a full
+`host` and `path` only, never with a query string or fragment.
+
+As a backstop, every port also replaces an attribute value with `<redacted:N bytes>` before it reaches the
+logger when either of these holds:
+
+- **The key names a credential.** Matched in lower case: `svid`, `proof`, `assertion`, `client_assertion`,
+  `subject_token`, `actor_token`, `client_secret`, `attestation`, `access_token`, `refresh_token`,
+  `id_token`, `authorization`, `dpop`, `oauth-client-attestation`, `oauth-client-attestation-pop`,
+  `auth_req_id`, `code`, `handle`, `token`, `secret`, `password`, `private_key`, `vault_token` and
+  `x-vault-token`, and any key ending in `_token`, `-token`, `_secret`, `-secret` or `_password`. This
+  catches what has no recognisable shape: opaque access tokens, CIBA `auth_req_id` values, ceremony handles.
+- **The value carries a credential.** It contains `eyJ` (the start of every JWT); it contains a Vault or
+  OpenBao token (`hvs.`, `hvb.` or `hvr.` followed by 20 or more of `A-Za-z0-9_-`, or `s.`, `b.` or `r.`
+  followed by 24 or more, standing alone rather than inside a longer word or dotted name); or it contains an
+  `Authorization` header value anywhere: `Bearer`, `DPoP` or `Basic` in any case, not preceded by a letter,
+  digit, `_` or `-`, then spaces or tabs and a character of `A-Za-z0-9._~+/-` (so `Bearer x`, ` Bearer x`
+  and `Authorization: Bearer x` match, and `Bearer`, `token_type=Bearer` and `dpop_combined` don't).
+
+None of the attribute keys or values the SDK logs (the tables below) match, so the backstop changes nothing
+in normal output; each port has a test that holds it to that. [`validation/redaction.json`](../validation/redaction.json)
+holds shared cases, credential-carrying and near-miss, that all four ports' logging tests read. Each port also has a test that runs a full
 flow with logging at its most verbose level and fails if any output contains `eyJ` or key material.
+
+The same rule covers what reaches your own logs another way:
+
+- **Error bodies.** An error that carries a response body (`body` on `ClientAttestationError`,
+  `TransportError` and `IssuanceError`; `Body` on Go's `*ClientAttestationError` and `*IssuanceError`;
+  `body()` on Java's `ClientAttestationException` and `TransportException`) carries at most the first
+  512 characters of a **non-2xx** response. A **2xx** response that the SDK can't use (malformed JSON,
+  duplicate members, trailing data, a missing `access_token` or `attestation`) never has its body kept,
+  and neither the message nor the cause chain quotes it, because a 2xx body is where the access token,
+  attestation or SVID travels.
+- **String forms.** Values that hold a credential print it redacted: Go's `String`, `GoString` and (for
+  types with exported secret fields) `LogValue` on `ClientAttestation`, `ClientAttestationCredential`,
+  `OpenBaoTransitSigner`, `MintRequest`, `MintResult`, `IssuedAttestation` and `StaticSvidSource`; Java's
+  `MintRequest` and `MintResult` `toString`; Python's `repr` of `MintRequest`, `MintResult` and `JwtSvid`;
+  and in TypeScript the evidence, challenge, attestation and static SVID are private fields read through
+  getters, so `JSON.stringify` and `console.log` don't show them. The exact text of a string form is not
+  API.
+- **Python trace.** With `trace_redact=True` (the default), any request-body value that looks like a JWT is
+  redacted as well as the known credential members, so a custom attester profile's own member names are
+  covered.
 
 ## Events
 
@@ -84,7 +126,7 @@ Levels are the four common ones: `debug`, `info`, `warn` (Python `WARNING`, Java
 | Event | Level | Attributes | When |
 | --- | --- | --- | --- |
 | `token.validated` | debug when valid, info otherwise | `result`, `mode` | A verdict. `result` is the stable error code (`valid`, `expired`, `invalid_audience`, ...); `mode` is `jwt` or `introspection`. |
-| `jwks.fetched` | debug | `host`, `keys` | The JWKS was fetched; `keys` is how many usable keys it held. |
+| `jwks.fetched` | debug | `host`, `keys` | The JWKS was fetched; `keys` is how many usable keys it held (keys that may verify a signature and could be read). |
 | `jwks.fetch_failed` | warn | `host`, `reason`, `status` | The JWKS fetch failed. The validator keeps serving the keys it already has. |
 | `jwks.refetch_throttled` | debug | `host` | An unknown `kid` (or a stale set) would have triggered a fetch, but the last attempt was too recent. |
 | `http.failed` | warn | `step`, `method`, `host`, `path`, `status`, `reason` | The introspection call failed (`step` is `introspection`). The call then raises (Go: returns an error), so no `token.validated` follows. |
@@ -105,13 +147,13 @@ Ceremony codes, login hints, binding messages and instructions are not logged.
 
 | Key | Meaning |
 | --- | --- |
-| `host` | Host (and port, when not the default) of the URL called. |
+| `host` | Host (and port, when not the default) of the URL called. Java includes the port whenever the URL states one, `:443` included. |
 | `path` | Path of the URL called, without query string or fragment. |
 | `method` | HTTP method. |
 | `status` | HTTP status, when the server answered. Absent otherwise. |
 | `step` | Which call: `discover`, `challenge`, `mint`, `token`, `introspection`, and in Python's CIBA client `ciba_request` and `ciba_poll`. |
 | `reason` | For `http.failed` and `jwks.fetch_failed`: `timeout`, `network`, `redirect`, `too_large`, `status` (a non-2xx answer) or `malformed` (the body was not the JSON expected). For `token.refreshing`: see above. |
-| `expires_in` | Seconds until the token expires (`token.cache_hit`: seconds left in the cache). Absent when the server gave no expiry. |
+| `expires_in` | Seconds until the token expires (`token.cache_hit`: seconds left in the cache). For `token.obtained`, the token endpoint's `expires_in` as the SDK caches it: a positive, finite JSON number or a string of decimal digits, capped at 86400 (24 hours). Absent when the server gave no such expiry; the token is then not cached. |
 | `token_type` | `Bearer` or `DPoP`. |
 | `pop_method` | `attestation_pop_jwt` or `dpop_combined`. |
 | `client_id` | The client the attester mapped the workload to (the attestation's `sub`). |

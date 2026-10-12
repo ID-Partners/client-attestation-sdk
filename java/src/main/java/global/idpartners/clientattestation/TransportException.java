@@ -16,7 +16,7 @@ public final class TransportException extends RuntimeException {
      *
      * @param message what failed
      * @param status  the HTTP status, or 0 when none was received
-     * @param body    at most 512 characters of the response body, or null
+     * @param body    at most 512 characters of a non-2xx response body, or null
      */
     public TransportException(String message, int status, String body) {
         super(message);
@@ -29,7 +29,7 @@ public final class TransportException extends RuntimeException {
      *
      * @param message what failed
      * @param status  the HTTP status, or 0 when none was received
-     * @param body    at most 512 characters of the response body, or null
+     * @param body    at most 512 characters of a non-2xx response body, or null
      * @param cause   the underlying exception
      */
     public TransportException(String message, int status, String body, Throwable cause) {
@@ -43,7 +43,7 @@ public final class TransportException extends RuntimeException {
         return this.status;
     }
 
-    /** At most 512 characters of the response body, or null. */
+    /** At most 512 characters of a non-2xx response body, or null. A 2xx body is never kept. */
     public String body() {
         return this.body;
     }

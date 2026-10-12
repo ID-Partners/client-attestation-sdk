@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 import { SignJWT } from "jose";
-import { SigningKeyPair } from "../src/index.js";
+import { SigningKeyPair, TransportError } from "../src/index.js";
 
 import { AccessTokenValidator, ProtectedResource, bearerToken, errors } from "../src/validator/index.js";
 
@@ -57,6 +57,42 @@ describe("protected resource", () => {
     expect((await resource.authenticate("Bearer " + await sign({ ...claims, cnf: null }))).authorized).toBe(true);
   });
 
+  it("authenticateActive binds this resource and refuses confirmation, like authenticate", async () => {
+    const guard = (response: Record<string, unknown> | null) =>
+      new ProtectedResource(
+        "https://api.test",
+        ["https://issuer.test"],
+        new AccessTokenValidator(
+          {
+            issuer: "https://issuer.test",
+            audiences: ["https://api.test", "https://other.test"],
+            jwks: { keys: [] },
+            introspection: { endpoint: "https://issuer.test/introspect", clientId: "rs", clientSecret: "secret" },
+          },
+          {
+            httpPost: async () => {
+              if (response == null) throw new TransportError("introspection failed: 503", "status", { status: 503 });
+              return response;
+            },
+          },
+        ),
+      );
+    const active = { active: true, sub: "agent-1", aud: "https://api.test" };
+    expect((await guard(active).authenticateActive("Bearer opaque")).authorized).toBe(true);
+    const { aud: _aud, ...noAud } = active;
+    for (const [response, error] of [
+      [{ ...active, aud: "https://other.test" }, errors.INVALID_AUDIENCE],
+      [noAud, errors.INVALID_AUDIENCE],
+      [{ ...active, cnf: { jkt: "bound-key" } }, errors.INVALID_TOKEN],
+      [{ active: false }, errors.INACTIVE],
+    ] as const) {
+      const decision = await guard(response).authenticateActive("Bearer opaque");
+      expect([decision.authorized, decision.status, decision.result?.error]).toEqual([false, 401, error]);
+    }
+    expect((await guard(active).authenticateActive(null)).status).toBe(401);
+    await expect(guard(null).authenticateActive("Bearer opaque")).rejects.toThrow(TransportError);
+  });
+
   it("extracts bearer tokens", () => {
     expect(bearerToken("Bearer abc.def")).toBe("abc.def");
     expect(bearerToken("bearer abc")).toBe("abc");
@@ -64,6 +100,34 @@ describe("protected resource", () => {
     expect(bearerToken("")).toBeNull();
     expect(bearerToken(null)).toBeNull();
     expect(bearerToken("Bearer ")).toBeNull();
+  });
+
+  // validation/bearer.json: the Go, Java and Python tests read the same cases (Go's "" is null).
+  const bearerCases: { header: string; token: string | null }[] = JSON.parse(
+    readFileSync(join(VALIDATION, "bearer.json"), "utf8"),
+  ).cases;
+  it("has shared bearer cases", () => {
+    expect(bearerCases.length).toBeGreaterThan(0);
+  });
+  it.each(bearerCases)("extracts the shared token from %j", ({ header, token }) => {
+    expect(bearerToken(header)).toBe(token);
+  });
+
+  it("extracts bearer tokens in linear time", async () => {
+    // The old pattern was quadratic on runs of spaces inside the token and cubic when a line terminator
+    // stopped '.' short: seconds of blocked event loop per request.
+    const spaces = "Bearer a" + " ".repeat(64000) + "b";
+    const newline = "Bearer" + " ".repeat(4000) + "!\n!";
+    const started = performance.now();
+    const fromSpaces = bearerToken(spaces);
+    const fromNewline = bearerToken(newline);
+    const elapsed = performance.now() - started;
+    expect(fromSpaces).toBe("a" + " ".repeat(64000) + "b");
+    expect(fromNewline).toBeNull();
+    expect(elapsed).toBeLessThan(200);
+    const denied = await resource().authenticate(newline);
+    expect(denied.status).toBe(401);
+    expect(denied.errorDescription).toBe("authentication required");
   });
 
   it("emits RFC 9728 metadata and paths", () => {

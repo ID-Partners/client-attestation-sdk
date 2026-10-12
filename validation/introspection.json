@@ -1,9 +1,17 @@
 {
-  "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, with required_scopes and audience from tokens.json. `raises`: the call must fail with the port's error. Semantics: SEMANTICS.md.",
+  "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, with required_scopes and audience from tokens.json. `raises`: the call must fail with the port's error. expect_guard: the verdict of ProtectedResource.authenticate_active for the guard resource, whose validator accepts guard.audiences. Semantics: SEMANTICS.md.",
+  "guard": {
+    "resource": "https://api.example.com",
+    "audiences": [
+      "https://api.example.com",
+      "https://other.example.com"
+    ]
+  },
   "cases": [
     {
       "name": "active",
       "expect": "valid",
+      "expect_guard": "valid",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -15,6 +23,7 @@
     {
       "name": "active_no_aud",
       "expect": "valid",
+      "expect_guard": "invalid_audience",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -25,6 +34,7 @@
     {
       "name": "active_aud_array",
       "expect": "valid",
+      "expect_guard": "valid",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -39,6 +49,7 @@
     {
       "name": "inactive",
       "expect": "inactive",
+      "expect_guard": "inactive",
       "response": {
         "active": false
       }
@@ -46,6 +57,7 @@
     {
       "name": "active_missing",
       "expect": "inactive",
+      "expect_guard": "inactive",
       "response": {
         "sub": "agent-1",
         "scope": "read write",
@@ -56,6 +68,7 @@
     {
       "name": "active_string_true",
       "expect": "inactive",
+      "expect_guard": "inactive",
       "response": {
         "active": "true",
         "sub": "agent-1",
@@ -67,6 +80,7 @@
     {
       "name": "active_number_one",
       "expect": "inactive",
+      "expect_guard": "inactive",
       "response": {
         "active": 1,
         "sub": "agent-1",
@@ -78,6 +92,7 @@
     {
       "name": "active_null",
       "expect": "inactive",
+      "expect_guard": "inactive",
       "response": {
         "active": null,
         "sub": "agent-1",
@@ -89,6 +104,7 @@
     {
       "name": "active_object",
       "expect": "inactive",
+      "expect_guard": "inactive",
       "response": {
         "active": {
           "value": true
@@ -102,6 +118,7 @@
     {
       "name": "missing_scope",
       "expect": "insufficient_scope",
+      "expect_guard": "insufficient_scope",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -113,6 +130,7 @@
     {
       "name": "scope_not_string",
       "expect": "invalid_token",
+      "expect_guard": "invalid_token",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -126,6 +144,7 @@
     {
       "name": "scp_array",
       "expect": "valid",
+      "expect_guard": "valid",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -139,6 +158,7 @@
     {
       "name": "scp_string",
       "expect": "valid",
+      "expect_guard": "valid",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -150,6 +170,7 @@
     {
       "name": "scp_non_string_entry",
       "expect": "invalid_token",
+      "expect_guard": "invalid_token",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -164,6 +185,7 @@
     {
       "name": "wrong_audience",
       "expect": "invalid_audience",
+      "expect_guard": "invalid_audience",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -173,8 +195,52 @@
       }
     },
     {
+      "name": "cnf_jkt",
+      "expect": "valid",
+      "expect_guard": "invalid_token",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp",
+        "cnf": {
+          "jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
+        }
+      }
+    },
+    {
+      "name": "cnf_x5t",
+      "expect": "valid",
+      "expect_guard": "invalid_token",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp",
+        "cnf": {
+          "x5t#S256": "bwcK0esc3ACC3DB2Y5_lESsXE8o9ltc05O89jdN-dg2"
+        }
+      }
+    },
+    {
+      "name": "cnf_null",
+      "expect": "valid",
+      "expect_guard": "valid",
+      "response": {
+        "active": true,
+        "sub": "agent-1",
+        "scope": "read write",
+        "aud": "https://api.example.com",
+        "client_id": "rp",
+        "cnf": null
+      }
+    },
+    {
       "name": "aud_non_string_entry",
       "expect": "invalid_token",
+      "expect_guard": "invalid_token",
       "response": {
         "active": true,
         "sub": "agent-1",
@@ -189,6 +255,7 @@
     {
       "name": "sub_number",
       "expect": "invalid_token",
+      "expect_guard": "invalid_token",
       "response": {
         "active": true,
         "sub": 7,
@@ -200,11 +267,13 @@
     {
       "name": "transport_error",
       "expect": "raises",
+      "expect_guard": "raises",
       "transport_error": true
     },
     {
       "name": "no_endpoint",
       "expect": "raises",
+      "expect_guard": "raises",
       "no_endpoint": true
     }
   ]

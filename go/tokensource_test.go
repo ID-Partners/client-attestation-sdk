@@ -4,13 +4,23 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+)
+
+// Evidence audiences the fake attesters' discovery documents name, which the tests pin with
+// WithEvidenceAudience.
+const (
+	fakeAudience  = "https://attester.example.com" // fakeAttester, the DPoP attester, loggingAttester
+	shortAudience = "aud"                          // standardDoc and the smaller fakes
 )
 
 // capturedHeaders records the proof-of-possession headers the fake token endpoint last saw, so tests
@@ -34,7 +44,7 @@ func fakeAttester(t *testing.T) (*httptest.Server, *capturedHeaders) {
 			"attestation_endpoint": srv.URL + "/federation/attestation",
 			"challenge_endpoint":   srv.URL + "/federation/attestation-challenge",
 			"token_endpoint":       srv.URL + "/as/token.oauth2",
-			"evidence_audience":    "https://attester.example.com",
+			"evidence_audience":    fakeAudience,
 			"pop_audience":         "https://pf.issuer.example",
 		})
 	})
@@ -114,7 +124,7 @@ func writeJSON(w http.ResponseWriter, code int, obj any) {
 
 func TestFullFlowReturnsAndCachesAToken(t *testing.T) {
 	srv, _ := fakeAttester(t)
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +157,7 @@ func TestFullFlowReturnsAndCachesAToken(t *testing.T) {
 // (fixed at "chal-123"), not just the mint-time instance-key proof.
 func TestDefaultModePopJWTCarriesChallenge(t *testing.T) {
 	srv, captured := fakeAttester(t)
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +181,7 @@ func TestDefaultModePopJWTCarriesChallenge(t *testing.T) {
 // challenge as DPoP's "nonce".
 func TestDpopCombinedModeSendsDpopHeaderWithChallengeNonce(t *testing.T) {
 	srv, captured := fakeAttester(t)
-	ca, err := NewClientAttestation(srv.URL,
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience),
 		WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
 		WithPopMethod(PopMethodDpopCombined),
 	)
@@ -195,7 +205,7 @@ func TestDpopCombinedModeSendsDpopHeaderWithChallengeNonce(t *testing.T) {
 
 func TestRoundTripperAttachesBearer(t *testing.T) {
 	srv, _ := fakeAttester(t)
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "fake-svid"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,5 +308,189 @@ func TestAutoDetectRaisesWhenNothingFound(t *testing.T) {
 	}
 	if _, ok := err.(*EvidenceNotFound); !ok {
 		t.Fatalf("err = %T, want *EvidenceNotFound", err)
+	}
+}
+
+// expiryAttester is a minimal attester + AS (static metadata, no challenge) whose token endpoint answers
+// {"access_token":"AT-<n>", "expires_in": <expiresIn>} with expiresIn spliced in as raw JSON ("" leaves
+// the member out). It counts token calls; set changes expiresIn for later calls.
+func expiryAttester(t *testing.T, expiresIn string) (ca *ClientAttestation, calls *int32, set func(string)) {
+	t.Helper()
+	calls = new(int32)
+	var current atomic.Value
+	current.Store(expiresIn)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mint", func(w http.ResponseWriter, r *http.Request) {
+		sub := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"demo-client"}`))
+		writeJSON(w, 200, map[string]any{"attestation": "h." + sub + ".sig"})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(calls, 1)
+		body := fmt.Sprintf(`{"access_token":"AT-%d","token_type":"Bearer"`, n)
+		if e := current.Load().(string); e != "" {
+			body += `,"expires_in":` + e
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body + "}"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	ca, err := NewClientAttestation("", WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
+		WithAttesterMetadata(AttesterMetadata{
+			EvidenceAudience:    "https://attester.example.com",
+			AttestationEndpoint: srv.URL + "/mint",
+			TokenEndpoint:       srv.URL + "/token",
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ca, calls, func(e string) { current.Store(e) }
+}
+
+func TestTokenExpiresInParsing(t *testing.T) {
+	cases := []struct {
+		expiresIn string
+		cached    bool
+	}{
+		{"3600", true},
+		{"3600.5", true},
+		{`"3600"`, true}, // a numeric string, as some servers send
+		{"", false},      // missing: no expiry, not cached
+		{"null", false},
+		{"0", false},
+		{"-60", false},
+		{"1e400", false}, // overflows to +Inf
+		{`"soon"`, false},
+		{`"1e3"`, false},
+		{"true", false},
+		{`{"s":1}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.expiresIn, func(t *testing.T) {
+			ca, calls, _ := expiryAttester(t, tc.expiresIn)
+			ctx := context.Background()
+			first, err := ca.Token(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := ca.Token(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := first == second && atomic.LoadInt32(calls) == 1; got != tc.cached {
+				t.Fatalf("cached = %v (tokens %s, %s; %d token calls), want %v", got, first, second, atomic.LoadInt32(calls), tc.cached)
+			}
+		})
+	}
+}
+
+func TestTokenLifetimeIsCappedAt24Hours(t *testing.T) {
+	ca, _, _ := expiryAttester(t, "1e15")
+	if _, err := ca.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if left := time.Until(ca.expiresAt); left <= 23*time.Hour || left > 24*time.Hour {
+		t.Fatalf("cached for %v, want at most 24h", left)
+	}
+}
+
+func TestForceRefreshWithInvalidExpiresInDoesNotKeepOldExpiry(t *testing.T) {
+	ca, _, set := expiryAttester(t, "3600")
+	ctx := context.Background()
+	if _, err := ca.Token(ctx); err != nil {
+		t.Fatal(err)
+	}
+	set(`"soon"`)
+	refreshed, err := ca.TokenWithOptions(ctx, WithForceRefresh())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The refreshed token is not cached past its (unknown) expiry: the next call mints again.
+	if again, _ := ca.Token(ctx); again == refreshed {
+		t.Fatalf("token %s was served from cache after an invalid expires_in", again)
+	}
+}
+
+func TestNegativeExpirySkewIsRejected(t *testing.T) {
+	if _, err := NewClientAttestation("https://attester.example.com", WithExpirySkew(-time.Second)); err == nil {
+		t.Fatal("want an error for a negative expiry skew")
+	}
+	if _, err := NewClientAttestation("https://attester.example.com", WithExpirySkew(0)); err != nil {
+		t.Fatalf("zero skew: %v", err)
+	}
+}
+
+// recordingSource is an evidence source that records the audiences it was asked for.
+type recordingSource struct{ audiences []string }
+
+func (s *recordingSource) Fetch(audience string) (string, error) {
+	s.audiences = append(s.audiences, audience)
+	return "svid", nil
+}
+
+func TestEvidenceAudienceIsRequiredBeforeAnyRequest(t *testing.T) {
+	// Without a pin the discovery document would choose the audience the workload's identity token is for.
+	source := &recordingSource{}
+	rec := &recordingTransport{}
+	// Not resolvable: any request would fail. The recording transport shows none is attempted.
+	ca, err := NewClientAttestation("https://attester.invalid", WithEvidence(source),
+		WithHTTPClient(&http.Client{Transport: rec}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ca.Token(context.Background())
+	if sdkErr := asSDKError(t, err); !strings.Contains(sdkErr.Message, "evidence audience is required") {
+		t.Fatalf("err = %v, want the evidence audience to be required", err)
+	}
+	if len(source.audiences) != 0 || len(rec.urls) != 0 {
+		t.Fatalf("evidence fetched for %v, requests %v; want none", source.audiences, rec.urls)
+	}
+}
+
+func TestADiscoveredAudienceOtherThanThePinFetchesNoEvidence(t *testing.T) {
+	srv, _ := fakeAttester(t)
+	source := &recordingSource{}
+	ca, err := NewClientAttestation(srv.URL, WithEvidence(source), WithEvidenceAudience("https://other-service.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ca.Token(context.Background())
+	want := `the attester asks for evidence for "https://attester.example.com", but the evidence audience is "https://other-service.example"`
+	if sdkErr := asSDKError(t, err); sdkErr.Message != want {
+		t.Fatalf("err = %v, want %s", err, want)
+	}
+	if len(source.audiences) != 0 {
+		t.Fatalf("evidence fetched for %v, want none", source.audiences)
+	}
+}
+
+func TestStaticMetadataNeedsNoPinButMustMatchOne(t *testing.T) {
+	md := AttesterMetadata{EvidenceAudience: "aud-1", AttestationEndpoint: "https://attester.invalid/mint",
+		TokenEndpoint: "https://attester.invalid/token"}
+	source := &recordingSource{}
+	ca, err := NewClientAttestation("", WithAttesterMetadata(md), WithEvidence(source), WithEvidenceAudience("aud-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ca.Token(context.Background())
+	if sdkErr := asSDKError(t, err); !strings.Contains(sdkErr.Message, `but the evidence audience is "aud-2"`) {
+		t.Fatalf("err = %v, want a pin mismatch", err)
+	}
+	if len(source.audiences) != 0 {
+		t.Fatalf("evidence fetched for %v, want none", source.audiences)
+	}
+	// No pin needed: the flow gets as far as minting, which the recording transport answers.
+	rec := &recordingTransport{}
+	ca, err = NewClientAttestation("", WithAttesterMetadata(md), WithEvidence(source),
+		WithHTTPClient(&http.Client{Transport: rec}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ca.Token(context.Background())
+	if len(source.audiences) != 1 || source.audiences[0] != "aud-1" {
+		t.Fatalf("evidence fetched for %v, want [aud-1]", source.audiences)
+	}
+	if len(rec.urls) == 0 || rec.urls[0] != "https://attester.invalid/mint" {
+		t.Fatalf("requests = %v, want the mint first", rec.urls)
 	}
 }

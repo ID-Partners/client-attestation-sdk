@@ -11,6 +11,8 @@ import { decodeJwt } from "jose";
 import { ClientAttestation, DRAFT_REVISION, StaticSvidSource } from "../src/index.js";
 import { canonicalJson } from "../src/token-source.js";
 
+const AUD = "https://attester.example.com"; // the evidence_audience the fake attester's discovery document names
+
 interface Seen {
   mintBody?: Record<string, unknown>;
   tokenForm?: URLSearchParams;
@@ -39,7 +41,7 @@ beforeEach(async () => {
             attestation_endpoint: base + "/attestation",
             challenge_endpoint: base + "/challenge",
             token_endpoint: base + "/token",
-            evidence_audience: "https://attester.example.com",
+            evidence_audience: AUD,
           });
         case "/challenge":
           return json(200, { attestation_challenge: "chal-abc" });
@@ -80,7 +82,7 @@ describe("DRAFT_REVISION", () => {
 describe("operator", () => {
   it("is sent in the mint body and as a sorted compact-JSON token form parameter", async () => {
     const operator = { sub: "ops@example.com", iss: "https://idp.example.com", ext: { z: 1, a: [{ y: 2, b: 3 }] } };
-    const ca = new ClientAttestation(baseUrl, { evidence, operator });
+    const ca = new ClientAttestation(baseUrl, { evidence, evidenceAudience: AUD, operator });
     expect(await ca.token()).toBe("AT");
 
     expect(seen.mintBody!.operator).toEqual(operator);
@@ -91,7 +93,7 @@ describe("operator", () => {
   });
 
   it.each([undefined, {}])("sends nothing when unset or empty (%j)", async (operator) => {
-    const ca = new ClientAttestation(baseUrl, { evidence, operator });
+    const ca = new ClientAttestation(baseUrl, { evidence, evidenceAudience: AUD, operator });
     await ca.token();
     expect(seen.mintBody).not.toHaveProperty("operator");
     expect(seen.tokenForm!.has("operator")).toBe(false);
@@ -105,21 +107,21 @@ describe("operator", () => {
 
 describe("challengeAtToken", () => {
   it("defaults to true: the challenge protects the mint proof and the token-endpoint PoP", async () => {
-    await new ClientAttestation(baseUrl, { evidence }).token();
+    await new ClientAttestation(baseUrl, { evidence, evidenceAudience: AUD }).token();
     expect(mintProofChallenge()).toBe("chal-abc");
     const pop = decodeJwt(seen.tokenHeaders!["oauth-client-attestation-pop"] as string);
     expect(pop.challenge).toBe("chal-abc");
   });
 
   it("false: the PoP JWT carries no challenge, the mint proof still does", async () => {
-    await new ClientAttestation(baseUrl, { evidence, challengeAtToken: false }).token();
+    await new ClientAttestation(baseUrl, { evidence, evidenceAudience: AUD, challengeAtToken: false }).token();
     expect(mintProofChallenge()).toBe("chal-abc");
     const pop = decodeJwt(seen.tokenHeaders!["oauth-client-attestation-pop"] as string);
     expect(pop).not.toHaveProperty("challenge");
   });
 
   it("false in dpop_combined mode: the DPoP proof carries no nonce, the mint proof still has the challenge", async () => {
-    await new ClientAttestation(baseUrl, { evidence, popMethod: "dpop_combined", challengeAtToken: false }).token();
+    await new ClientAttestation(baseUrl, { evidence, evidenceAudience: AUD, popMethod: "dpop_combined", challengeAtToken: false }).token();
     expect(mintProofChallenge()).toBe("chal-abc");
     const dpop = decodeJwt(seen.tokenHeaders!["dpop"] as string);
     expect(dpop).not.toHaveProperty("nonce");
@@ -127,7 +129,7 @@ describe("challengeAtToken", () => {
   });
 
   it("true in dpop_combined mode: the challenge rides as the DPoP nonce", async () => {
-    await new ClientAttestation(baseUrl, { evidence, popMethod: "dpop_combined" }).token();
+    await new ClientAttestation(baseUrl, { evidence, evidenceAudience: AUD, popMethod: "dpop_combined" }).token();
     expect(decodeJwt(seen.tokenHeaders!["dpop"] as string).nonce).toBe("chal-abc");
   });
 });

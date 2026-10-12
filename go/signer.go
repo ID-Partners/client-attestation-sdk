@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,10 +30,19 @@ type JwsSigner interface {
 	Sign(signingInput []byte) ([]byte, error)
 }
 
+// ecSignatureBytes is the length of a raw r||s JWS signature for each ECDSA algorithm.
+var ecSignatureBytes = map[string]int{"ES256": 64, "ES384": 96, "ES512": 132}
+
 // signExternal assembles a compact JWS whose signature is produced by an external signer. The header
 // carries the signer's kid (external signers hold issuing keys, referenced by id, never an embedded jwk).
+// The signer's algorithm must be one the SDK signs with (never "none"), and its signature must not be
+// empty and, for ES*, must be the fixed-width r||s (not DER, not truncated).
 func signExternal(claims map[string]any, signer JwsSigner, typ string) (string, error) {
-	headerJSON, err := json.Marshal(map[string]any{"alg": signer.Algorithm(), "typ": typ, "kid": signer.KeyID()})
+	alg := signer.Algorithm()
+	if !isSigningAlgorithm(alg) {
+		return "", fmt.Errorf("external signer algorithm %q is not allowed: use ES256/384/512, RS256/384/512 or PS256/384/512", alg)
+	}
+	headerJSON, err := json.Marshal(map[string]any{"alg": alg, "typ": typ, "kid": signer.KeyID()})
 	if err != nil {
 		return "", err
 	}
@@ -46,11 +56,22 @@ func signExternal(claims map[string]any, signer JwsSigner, typ string) (string, 
 	if err != nil {
 		return "", err
 	}
+	if len(sig) == 0 {
+		return "", fmt.Errorf("external signer returned an empty signature")
+	}
+	if want, ok := ecSignatureBytes[alg]; ok && len(sig) != want {
+		return "", fmt.Errorf("external signer returned a %d-byte %s signature; want the %d-byte raw r||s", len(sig), alg, want)
+	}
 	return signingInput + "." + enc.EncodeToString(sig), nil
 }
 
 var keyTypeAlg = map[string]string{"ecdsa-p256": "ES256", "ecdsa-p384": "ES384", "ecdsa-p521": "ES512"}
 var algHash = map[string]string{"ES256": "sha2-256", "ES384": "sha2-384", "ES512": "sha2-512"}
+var algCurve = map[string]string{"ES256": "P-256", "ES384": "P-384", "ES512": "P-521"}
+
+// transitKeyName is what a transit key name may contain. The name goes into the request path, so "/", "?",
+// "#", "%" and dot segments would point the vault token at another vault path.
+var transitKeyName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 // OpenBaoTransitSigner is a JwsSigner backed by an OpenBao / HashiCorp Vault transit engine: the attestation
 // is signed inside the vault (POST /v1/transit/sign/<key> with marshaling_algorithm=jws, which returns the
@@ -71,10 +92,37 @@ type OpenBaoTransitSigner struct {
 	client     *http.Client
 }
 
+// OpenBaoOption tunes NewOpenBaoTransitSigner.
+type OpenBaoOption func(*openBaoOptions)
+
+type openBaoOptions struct{ allowInsecure bool }
+
+// WithOpenBaoAllowInsecure permits a plain-http baoAddr on a non-loopback host. Without it baoAddr must be
+// https (localhost, 127.0.0.1 and ::1 are always allowed): the vault token rides on every call, and the
+// public key read from the vault becomes the attester's published JWK.
+func WithOpenBaoAllowInsecure() OpenBaoOption {
+	return func(o *openBaoOptions) { o.allowInsecure = true }
+}
+
 // NewOpenBaoTransitSigner builds a signer for the transit key keyName, reachable at baoAddr with token.
-func NewOpenBaoTransitSigner(baoAddr, token, keyName string) (*OpenBaoTransitSigner, error) {
+// baoAddr must be https unless it is loopback or WithOpenBaoAllowInsecure() is given. keyName may contain
+// only letters, digits, "_", "." and "-" (and is not "." or "..").
+func NewOpenBaoTransitSigner(baoAddr, token, keyName string, opts ...OpenBaoOption) (*OpenBaoTransitSigner, error) {
+	var o openBaoOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	base := strings.TrimRight(baoAddr, "/")
+	if !o.allowInsecure {
+		if err := requireSecureURL(base, "WithOpenBaoAllowInsecure()"); err != nil {
+			return nil, err
+		}
+	}
+	if !transitKeyName.MatchString(keyName) || keyName == "." || keyName == ".." {
+		return nil, fmt.Errorf("invalid transit key name %q: use only letters, digits, '_', '.' and '-'", keyName)
+	}
 	s := &OpenBaoTransitSigner{
-		base:    strings.TrimRight(baoAddr, "/"),
+		base:    base,
 		token:   token,
 		keyName: keyName,
 		client:  safeClient(nil, 5*time.Second),
@@ -97,6 +145,9 @@ func NewOpenBaoTransitSigner(baoAddr, token, keyName string) (*OpenBaoTransitSig
 	jwkMap, kid, err := ecJWKFromPEM(pemStr)
 	if err != nil {
 		return nil, err
+	}
+	if crv := asString(jwkMap["crv"]); crv != algCurve[alg] {
+		return nil, fmt.Errorf("transit key %q is type %s but its public key is on %s", keyName, keyType, crv)
 	}
 	jwkMap["kid"] = kid
 	jwkMap["alg"] = alg

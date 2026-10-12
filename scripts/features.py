@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render docs/features.json, the one feature matrix, into the three places that show it.
+"""Render docs/features.json, the one feature matrix, into the two places that show it.
 
     python3 scripts/features.py          # rewrite README.md and docs/explainer.html
     python3 scripts/features.py --check  # exit 1 if any of them differs from what would be generated (CI)
@@ -57,7 +57,8 @@ def render_explainer(data, indent="          "):
         for row in group["rows"]:
             cells = "".join(
                 f"<td>{YES_EXPLAINER if p in row['ports'] else NO_EXPLAINER}</td>" for p in data["ports"])
-            lines.append(f'{indent}<tr class="cap-row"><td>{label_html(row)}</td>\n{indent}  {cells}</tr>')
+            label = html.escape(row["explainer_label"]) if "explainer_label" in row else label_html(row)
+            lines.append(f'{indent}<tr class="cap-row"><td>{label}</td>\n{indent}  {cells}</tr>')
     return "\n".join(lines)
 
 

@@ -196,7 +196,8 @@ def test_verify_resume_age_is_configurable_and_can_be_disabled():
 def test_verify_resume_age_falls_back_to_created_at_without_approved_at():
     clock = Clock()
     cer = Ceremony(code="PAY-x", kind=RESOURCE_AUTHORISATION, channel=CHANNEL_DEVICE, subject="alice",
-                   txn_hash="", instruction=dict(INSTR), initiator="a", created_at=clock.t, status=APPROVED)
+                   txn_hash="", instruction=dict(INSTR), initiator="a", created_at=clock.t, status=APPROVED,
+                   resolver="ciba", approved_via="ciba_poll")
     from client_attestation_sdk.authz_challenge.resolver import _bound_hash
     cer.txn_hash = _bound_hash("alice", INSTR)
     store = MemoryStore()
@@ -209,7 +210,7 @@ def test_verify_resume_age_falls_back_to_created_at_without_approved_at():
 
 def test_proofing_verify_resume_is_single_use_and_age_limited():
     world, fake, clock = Proofer(), FakeAS(), Clock()
-    r = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock)
+    r = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock, doctypes=(MDL,))
     instr = {"account": "savings"}
     res = r.resolve(PROOF, subject="alice", instruction=instr, initiator="a")
     world.status = APPROVED
@@ -219,7 +220,8 @@ def test_proofing_verify_resume_is_single_use_and_age_limited():
     assert not ok and "already been used" in why
 
     world2, clock2 = Proofer(), Clock()
-    r2 = ProofingResolver(world2.hooks(), _client(FakeAS(), clock2), clock=clock2, max_approval_age=60)
+    r2 = ProofingResolver(world2.hooks(), _client(FakeAS(), clock2), clock=clock2, max_approval_age=60,
+                          doctypes=(MDL,))
     res2 = r2.resolve(PROOF, subject="alice", instruction=instr, initiator="a")
     world2.status = APPROVED
     assert r2.poll(res2.code).status == APPROVED
@@ -261,7 +263,7 @@ def test_web_and_proofing_codes_are_handles_too():
     p = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
     assert len(p.code) == len("WEB-") + 22 and p.reference.startswith("WEB-")
     world = Proofer()
-    pr = ProofingResolver(world.hooks(), _client(FakeAS(), clock), clock=clock)
+    pr = ProofingResolver(world.hooks(), _client(FakeAS(), clock), clock=clock, doctypes=(MDL,))
     q = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
     assert len(q.code) == len("MDL-") + 22 and q.reference.startswith("MDL-")
 
@@ -278,7 +280,7 @@ def test_instruction_may_not_carry_subject(which):
         r = WebConsentResolver(Hooks(consent_url_for=lambda c: "https://c"), clock=clock)
         challenge = CHALLENGE
     else:
-        r = ProofingResolver(Proofer().hooks(), _client(FakeAS(), clock), clock=clock)
+        r = ProofingResolver(Proofer().hooks(), _client(FakeAS(), clock), clock=clock, doctypes=(MDL,))
         challenge = PROOF
     with pytest.raises(ValueError, match="reserved key 'subject'"):
         r.resolve(challenge, subject="alice", instruction=evil, initiator="a")
@@ -289,7 +291,7 @@ def test_verify_resume_rejects_a_subject_key():
     with pytest.raises(ValueError):
         r.verify_resume(res.code, subject="alice", instruction={**INSTR, "subject": "alice"})
     world, clock = Proofer(), Clock()
-    pr = ProofingResolver(world.hooks(), _client(FakeAS(), clock), clock=clock)
+    pr = ProofingResolver(world.hooks(), _client(FakeAS(), clock), clock=clock, doctypes=(MDL,))
     with pytest.raises(ValueError):
         pr.verify_resume("MDL-x", subject="alice", instruction={"subject": "alice"})
 
@@ -321,7 +323,7 @@ def test_web_and_proofing_claims_are_atomic():
     assert b.reused and b.code == a.code and minted == [a.code]
 
     fake, world = FakeAS(), Proofer()
-    pr = ProofingResolver(world.hooks(), _client(fake, clock), BlindStore(), clock=clock)
+    pr = ProofingResolver(world.hooks(), _client(fake, clock), BlindStore(), clock=clock, doctypes=(MDL,))
     a = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
     b = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
     assert b.reused and b.code == a.code and len(fake.pushes) == 1 and world.n == 1
@@ -370,7 +372,7 @@ def test_concurrent_resolves_push_once(store_factory):
 
 def test_failed_verifier_start_releases_the_claim():
     clock, world, fake = Clock(), Proofer(), FakeAS()
-    pr = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock)
+    pr = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock, doctypes=(MDL,))
     world.start_error = RuntimeError("verifier down")
     res = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
     assert isinstance(res, Unavailable) and "verifier down" in res.reason
@@ -384,7 +386,7 @@ def test_no_session_id_releases_the_claim_and_plain_stores_mark_it_expired():
     clock, fake = Clock(), FakeAS()
     store = PlainStore()
     hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, proofing_start=lambda c: {})
-    pr = ProofingResolver(hooks, _client(fake, clock), store, clock=clock)
+    pr = ProofingResolver(hooks, _client(fake, clock), store, clock=clock, doctypes=(MDL,))
     res = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
     assert isinstance(res, Unavailable) and "session_id" in res.reason
     assert [c.status for c in store.d.values()] == [EXPIRED]
@@ -444,3 +446,509 @@ def test_dangerously_disable_tls_verification_turns_verification_off_without_war
 def test_insecure_tls_alias_is_gone(monkeypatch):
     with pytest.raises(TypeError):
         _captured_context(monkeypatch, insecure_tls=True)
+
+# ---- the handle never reaches Hooks.log ----------------------------------------------------------
+def _boom(*a):
+    raise RuntimeError("hook down")
+
+
+def _assert_no_handle(lines, codes):
+    assert lines, "the scenario should have logged something"
+    for code in codes:
+        assert code
+        for line in lines:
+            assert code not in line, line
+
+
+def test_ciba_resolver_logs_name_the_reference_never_the_handle():
+    fake, clock = FakeAS(), Clock()
+    logs, durable = [], {}
+
+    def persist(c):
+        durable[c.code] = c.to_dict()
+        raise RuntimeError("disk full")
+    hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=0, persist=persist,
+                  rehydrate=durable.get, register_for_device=_boom, on_outcome=_boom, log=logs.append)
+    r = CibaResolver(_client(fake, clock), hooks, clock=clock)
+    res = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    fake.answers = [(200, json.dumps({"access_token": "at-secret"}))]
+    clock.t += 4
+    assert r.poll(res.code).status == APPROVED                       # on_outcome fails -> logged
+    # a fresh resolver rehydrates it (logged), and a persisted record with no reference is fingerprinted
+    r2 = CibaResolver(_client(fake, clock), hooks, clock=clock)
+    assert r2.poll(res.code) is not None
+    legacy = {**durable[res.code], "code": "PAY-legacy-handle", "reference": None}
+    durable["PAY-legacy-handle"] = legacy
+    assert r2.poll("PAY-legacy-handle") is not None
+    _assert_no_handle(logs, [res.code, "PAY-legacy-handle"])
+    assert any(res.reference in line and "rehydrated" in line for line in logs)
+    assert any("#" in line and "rehydrated" in line for line in logs)
+    for word in ("persist failed", "register_for_device failed", "on_outcome(approved) failed"):
+        assert any(word in line and res.reference in line for line in logs), word
+    # the CIBA auth_req_id is a bearer handle at the token endpoint: no part of it is logged
+    assert any("pushed to" in line for line in logs)
+    assert not any("auth_req_id" in line or "secret-r" in line for line in logs)
+
+
+@pytest.mark.parametrize("which", ["ciba", "proofing"])
+def test_push_failure_does_not_hand_back_the_handle(which):
+    clock, raised = Clock(), []
+
+    def http(method, url, form, headers):
+        return 503, "down"
+    if which == "ciba":
+        hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, register_for_device=raised.append)
+        res = CibaResolver(_client(http, clock), hooks, clock=clock).resolve(
+            CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    else:
+        hooks = Proofer().hooks()
+        hooks.register_for_device = raised.append
+        res = ProofingResolver(hooks, _client(http, clock), clock=clock, doctypes=(MDL,)).resolve(
+            PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
+    assert isinstance(res, Unavailable) and "push failed" in res.reason
+    assert raised[0].code not in json.dumps(res.to_dict())
+    assert res.detail["reference"] == raised[0].reference
+
+
+def test_web_resolver_logs_never_carry_the_handle():
+    clock, logs, status = Clock(), [], [_boom]
+
+    def web_status(c):
+        return status[0](c)
+    hooks = Hooks(consent_url_for=lambda c: "https://consent", persist=_boom, web_status=web_status,
+                  on_outcome=_boom, log=logs.append)
+    web = WebConsentResolver(hooks, clock=clock)
+    p = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert web.poll(p.code).status == PENDING                         # web_status fails -> logged
+    status[0] = lambda c: APPROVED
+    assert web.poll(p.code).status == APPROVED                        # on_outcome fails -> logged
+    _assert_no_handle(logs, [p.code])
+    assert len(logs) == 3 and all(p.reference in line for line in logs)
+
+
+def test_proofing_resolver_logs_never_carry_the_handle():
+    clock, fake, world, logs = Clock(), FakeAS(), Proofer(), []
+    hooks = world.hooks()
+    status = [_boom]
+    hooks.proofing_status = lambda c: status[0](c)
+    hooks.persist, hooks.register_for_device, hooks.on_outcome, hooks.log = _boom, _boom, _boom, logs.append
+    pr = ProofingResolver(hooks, _client(fake, clock), clock=clock, doctypes=(MDL,))
+    p = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="a")
+    assert pr.poll(p.code).status == PENDING                          # proofing_status fails -> logged
+    status[0] = lambda c: APPROVED
+    assert pr.poll(p.code).status == APPROVED
+    _assert_no_handle(logs, [p.code])
+    for word in ("register_for_device failed", "persist failed", "pushed", "proofing_status failed",
+                 "on_outcome(approved) failed", "-> approved"):
+        assert any(word in line and p.reference in line for line in logs), word
+
+
+# ---- a live ceremony is reused only by the initiator that raised it ------------------------------
+def test_another_initiator_is_not_handed_a_live_ceremony():
+    fake, clock = FakeAS(), Clock()
+    r = CibaResolver(_client(fake, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=0),
+                     clock=clock)
+    a = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-a")
+    b = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-b")
+    assert isinstance(b, Unavailable) and "another initiator" in b.reason
+    assert a.code not in json.dumps(b.to_dict()) and len(fake.pushes) == 1
+    again = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-a")
+    assert again.reused and again.code == a.code
+    # agent-a's approval still resumes; the audit record names agent-a
+    fake.answers = [(200, json.dumps({"access_token": "at"}))]
+    clock.t += 4
+    assert r.poll(a.code).status == APPROVED
+    assert r.store.get(a.code).initiator == "agent-a"
+    assert r.verify_resume(a.code, subject="alice", instruction=INSTR)[0]
+
+
+def test_initiator_check_covers_the_atomic_claim():
+    fake, clock = FakeAS(), Clock()
+    r = CibaResolver(_client(fake, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE), BlindStore(), clock=clock)
+    a = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-a")
+    b = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-b")
+    assert isinstance(b, Unavailable) and a.code not in json.dumps(b.to_dict()) and len(fake.pushes) == 1
+
+
+def test_initiator_survives_persist_and_rehydrate():
+    """A replica that only knows the ceremony from the durable store applies the same rule."""
+    durable = {}
+    fake, clock = FakeAS(), Clock()
+
+    def find_live_persisted(subject, txn_hash):
+        return next((d for d in durable.values() if d["subject"] == subject and d["txn_hash"] == txn_hash), None)
+    hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, persist=lambda c: durable.__setitem__(c.code, c.to_dict()),
+                  rehydrate=durable.get, find_live_persisted=find_live_persisted)
+    a = CibaResolver(_client(fake, clock), hooks, clock=clock).resolve(
+        CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-a")
+    other = CibaResolver(_client(fake, clock), hooks, clock=clock)    # fresh process, empty memory
+    b = other.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-b")
+    assert isinstance(b, Unavailable) and a.code not in json.dumps(b.to_dict())
+    same = CibaResolver(_client(fake, clock), hooks, clock=clock).resolve(
+        CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-a")
+    assert same.reused and same.code == a.code and len(fake.pushes) == 1
+
+
+def test_web_and_proofing_refuse_another_initiators_live_ceremony():
+    clock = Clock()
+    web = WebConsentResolver(Hooks(consent_url_for=lambda c: "https://c/?t=one-time"), clock=clock)
+    a = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-a")
+    b = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent-b")
+    assert isinstance(b, Unavailable)
+    assert a.code not in json.dumps(b.to_dict()) and "one-time" not in json.dumps(b.to_dict())
+
+    for store in (MemoryStore(), BlindStore()):                    # the fast-path dedupe, then the claim
+        fake, world = FakeAS(), Proofer()
+        pr = ProofingResolver(world.hooks(), _client(fake, clock), store, clock=clock, doctypes=(MDL,))
+        a = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="agent-a")
+        b = pr.resolve(PROOF, subject="alice", instruction={"account": "s"}, initiator="agent-b")
+        assert isinstance(b, Unavailable) and a.code not in json.dumps(b.to_dict())
+        assert len(fake.pushes) == 1 and world.n == 1
+
+
+# ---- the resolver does not take a 200 that is not a token response as approval -------------------
+def test_resolver_does_not_approve_on_a_200_without_an_access_token():
+    fake, clock = FakeAS(), Clock()
+    r = CibaResolver(_client(fake, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=0),
+                     clock=clock)
+    res = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    fake.answers = [(200, "<html>proxy login</html>")]
+    clock.t += 4
+    assert r.poll(res.code).status == PENDING
+    assert not r.verify_resume(res.code, subject="alice", instruction=INSTR)[0]
+
+
+# ---- a resolver resumes only the ceremonies it raised and approved --------------------------------
+def _shared_world():
+    """Every resolver on ONE store and ONE set of hooks, as a deployment that wires them once would."""
+    clock, fake, world = Clock(), FakeAS(), Proofer()
+    hooks = world.hooks()
+    hooks.settle_seconds = 0
+    hooks.consent_url_for = lambda c: "https://consent"
+    hooks.web_status = lambda c: APPROVED
+    store = MemoryStore()
+    client = _client(fake, clock)
+    return (clock, fake, world, CibaResolver(client, hooks, store, clock=clock),
+            WebConsentResolver(hooks, store, clock=clock),
+            ProofingResolver(hooks, client, store, clock=clock))
+
+
+def test_a_tap_or_a_click_never_satisfies_a_proofing():
+    clock, fake, world, ciba, web, proof = _shared_world()
+    instr = {"account": "savings", "doctype": MDL}
+    tap = ciba.resolve(PROOF, subject="alice", instruction=instr, initiator="a")
+    fake.answers = [(200, json.dumps({"access_token": "at"}))]
+    clock.t += 4
+    assert ciba.poll(tap.code).status == APPROVED
+    assert proof.poll(tap.code) is None
+    assert proof.verify_resume(tap.code, subject="alice", instruction=instr) == (False, "unknown proofing code")
+
+    click = web.resolve(PROOF, subject="alice", instruction={"account": "current", "doctype": MDL}, initiator="a")
+    assert web.poll(click.code).status == APPROVED
+    assert not proof.verify_resume(click.code, subject="alice",
+                                   instruction={"account": "current", "doctype": MDL})[0]
+    # each still resumes through the resolver that raised it, as a tap / a click, and only once its own
+    # poll saw the approval
+    ciba.store.get(tap.code).approved_via = None
+    assert ciba.verify_resume(tap.code, subject="alice", instruction=instr) == \
+        (False, "ceremony was not approved through this resolver")
+    ciba.store.get(tap.code).approved_via = "ciba_poll"
+    assert ciba.verify_resume(tap.code, subject="alice", instruction=instr) == (True, "device-approved")
+    assert web.verify_resume(click.code, subject="alice",
+                             instruction={"account": "current", "doctype": MDL}) == (True, "app-asserted")
+
+
+def test_a_tap_never_satisfies_a_proofing_through_shared_durable_hooks():
+    durable = {}
+    clock, fake = Clock(), FakeAS()
+    hooks = Proofer().hooks()
+    hooks.settle_seconds = 0
+    hooks.persist = hooks.on_outcome = lambda c, *_: durable.__setitem__(c.code, c.to_dict())
+    hooks.rehydrate = durable.get
+    ciba = CibaResolver(_client(fake, clock), hooks, clock=clock)              # own MemoryStore
+    proof = ProofingResolver(hooks, _client(fake, clock), clock=clock)
+    instr = {"account": "savings", "doctype": MDL}
+    p = ciba.resolve(CHALLENGE, subject="alice", instruction=instr, initiator="a")
+    fake.answers = [(200, json.dumps({"access_token": "at"}))]
+    clock.t += 4
+    assert ciba.poll(p.code).status == APPROVED
+    assert not proof.verify_resume(p.code, subject="alice", instruction=instr)[0]
+
+
+def test_a_proofing_is_approved_only_by_the_verifier():
+    clock, fake, world, ciba, web, proof = _shared_world()
+    instr = {"account": "s", "doctype": MDL}
+    p = proof.resolve(PROOF, subject="alice", instruction=instr, initiator="a")
+    # the CIBA resolver will not poll (and so tap-approve) the proofing's push
+    fake.answers = [(200, json.dumps({"access_token": "at"}))]
+    clock.t += 4
+    assert ciba.poll(p.code) is None and fake.calls[-1][0] == BC
+    assert not ciba.verify_resume(p.code, subject="alice", instruction=instr)[0]
+    # a record that says approved without the verifier's verdict (or a pre-upgrade record) is refused
+    cer = proof.store.get(p.code)
+    cer.status = APPROVED
+    for via in (None, "ciba_poll"):
+        cer.approved_via = via
+        assert proof.verify_resume(p.code, subject="alice", instruction=instr) == \
+            (False, "proofing was not verified by the verifier")
+    cer.status = PENDING
+    world.status = APPROVED
+    assert proof.poll(p.code).status == APPROVED
+    assert proof.verify_resume(p.code, subject="alice", instruction=instr) == (True, MDL)
+
+
+def test_a_live_ceremony_of_another_resolver_is_not_reused():
+    clock, fake, world, ciba, web, proof = _shared_world()
+    w = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    res = ciba.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert isinstance(res, Unavailable) and "another resolver" in res.reason
+    assert w.code not in json.dumps(res.to_dict()) and fake.pushes == []
+
+
+def test_durable_records_for_another_code_or_instruction_are_ignored():
+    clock, fake = Clock(), FakeAS()
+    r, res, _ = _approved()
+    stranger = r.store.get(res.code).to_dict()
+    hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, rehydrate=lambda code: stranger,
+                  find_live_persisted=lambda s, h: dict(stranger, status=PENDING))
+    other = CibaResolver(_client(fake, clock), hooks, clock=clock)
+    assert other.poll("PAY-something-else") is None
+    assert not other.verify_resume("PAY-something-else", subject="alice", instruction=INSTR)[0]
+    p = other.resolve(CHALLENGE, subject="bob", instruction=INSTR, initiator="a")
+    assert isinstance(p, Pending) and not p.reused and p.code != res.code and len(fake.pushes) == 1
+
+
+# ---- single use holds across replicas, and fails closed when it cannot be recorded --------------
+def _replicas(**hook_overrides):
+    durable = {}
+    clock, fake = Clock(), FakeAS()
+    hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=0,
+                  persist=lambda c: durable.__setitem__(c.code, c.to_dict()), rehydrate=durable.get,
+                  on_outcome=lambda c, s: durable.__setitem__(c.code, c.to_dict()))
+    for k, v in hook_overrides.items():
+        setattr(hooks, k, v)
+    a = CibaResolver(_client(fake, clock), hooks, clock=clock)
+    b = CibaResolver(_client(fake, clock), hooks, clock=clock)
+    p = a.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="agent")
+    fake.answers = [(200, json.dumps({"access_token": "at"}))]
+    clock.t += 4
+    assert a.poll(p.code).status == APPROVED
+    assert b.poll(p.code).status == APPROVED          # B now holds its own in-memory copy
+    return durable, a, b, p
+
+
+def test_a_replica_with_a_stale_copy_does_not_accept_a_used_approval():
+    durable, a, b, p = _replicas()
+    assert a.verify_resume(p.code, subject="alice", instruction=INSTR)[0]
+    assert durable[p.code]["consumed_at"] is not None
+    assert b.verify_resume(p.code, subject="alice", instruction=INSTR) == \
+        (False, "ceremony approval has already been used")
+
+
+def test_an_approval_whose_use_cannot_be_recorded_is_refused():
+    down = [True]
+
+    def persist(c):
+        if down[0] and c.consumed_at:
+            raise OSError("db down")
+        durable[c.code] = c.to_dict()
+    durable, a, b, p = _replicas(persist=persist)
+    assert a.verify_resume(p.code, subject="alice", instruction=INSTR) == \
+        (False, "ceremony approval could not be recorded as used")
+    down[0] = False                                    # storage back: the approval is still good, once
+    assert b.verify_resume(p.code, subject="alice", instruction=INSTR)[0]
+    assert not a.verify_resume(p.code, subject="alice", instruction=INSTR)[0]
+
+
+def test_an_unreadable_store_refuses_the_resume():
+    durable, a, b, p = _replicas()
+    a.hooks.rehydrate = _boom
+    assert a.verify_resume(p.code, subject="alice", instruction=INSTR) == (False, "ceremony state could not be read")
+
+
+def test_the_optional_consume_hook_is_the_atomic_single_use_write():
+    used, calls = set(), []
+
+    def consume(c):
+        calls.append(c.consumed_at)
+        if c.code in used:
+            return False
+        used.add(c.code)
+        return True
+    durable, a, b, p = _replicas(consume=consume)
+    assert a.verify_resume(p.code, subject="alice", instruction=INSTR)[0]
+    assert b.verify_resume(p.code, subject="alice", instruction=INSTR) == \
+        (False, "ceremony approval has already been used")
+    assert durable[p.code]["consumed_at"] is None       # consume replaced persist: the CAS alone decided
+    assert len(calls) == 2 and all(calls)
+
+    durable, a, b, p = _replicas(consume=_boom)
+    assert a.verify_resume(p.code, subject="alice", instruction=INSTR) == \
+        (False, "ceremony approval could not be recorded as used")
+
+
+# ---- a failed push never leaves a claimed ceremony behind ----------------------------------------
+class ConnectError(Exception):
+    """What a custom HttpFn (httpx, requests) raises: not a CibaError."""
+
+
+def test_any_push_exception_releases_the_claim():
+    fake, clock = FakeAS(), Clock()
+    r = CibaResolver(_client(fake, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE), clock=clock)
+    healthy = r.client.http
+
+    def reset(*a):
+        raise ConnectError("connection reset")
+    r.client.http = reset
+    with pytest.raises(ConnectError):
+        r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    r.client.http = healthy
+    p = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert isinstance(p, Pending) and not p.reused and len(fake.pushes) == 1
+
+    class BadAuth:
+        def apply(self, endpoint, form):
+            raise RuntimeError("signing key unavailable")
+    r2 = CibaResolver(_client(fake, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE), clock=clock)
+    r2.client.client_auth = BadAuth()
+    with pytest.raises(RuntimeError):
+        r2.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert r2.store.find_live("alice", p.txn_hash, clock()) is None
+
+
+def test_an_infinite_interval_does_not_leave_a_ceremony_that_never_expires():
+    clock = Clock()
+    http = lambda m, u, f, h: (200, '{"auth_req_id":"abc","interval":1e400,"expires_in":1e400}') if u == BC \
+        else (400, '{"error":"authorization_pending"}')
+    r = CibaResolver(_client(http, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE), clock=clock)
+    p = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert isinstance(p, Pending) and p.expires_in == 120
+    assert not r.store.get(p.code).is_live(clock() + 121)
+
+
+def test_a_ciba_ceremony_without_expires_in_gets_a_short_lifetime():
+    clock = Clock()
+    http = lambda m, u, f, h: (200, '{"auth_req_id":"abc","interval":3}') if u == BC \
+        else (400, '{"error":"authorization_pending"}')
+    r = CibaResolver(_client(http, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE), clock=clock)
+    p = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert p.expires_in == 120
+    clock.t += 121
+    again = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert isinstance(again, Pending) and not again.reused
+
+
+def test_a_failed_push_is_not_an_attempt():
+    fake, clock = FakeAS(), Clock()
+    r = CibaResolver(_client(fake, clock), Hooks(channel_for=lambda s: CHANNEL_DEVICE), clock=clock,
+                     max_attempts=1)
+    healthy = r.client.http
+    r.client.http = lambda *a: (503, "busy")
+    assert "push failed" in r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a").reason
+    r.client.http = healthy
+    p = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert isinstance(p, Pending) and p.attempt == 1
+
+
+def test_proofing_releases_the_claim_on_any_push_failure():
+    fake, clock, world = FakeAS(), Clock(), Proofer()
+    pr = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock, max_attempts=1)
+    instr = {"account": "s", "doctype": MDL}
+    healthy = pr.client.http
+
+    def reset(*a):
+        raise ConnectError("connection reset")
+    pr.client.http = reset
+    with pytest.raises(ConnectError):
+        pr.resolve(PROOF, subject="alice", instruction=instr, initiator="a")
+    pr.client.http = lambda *a: (503, "busy")
+    assert "push failed" in pr.resolve(PROOF, subject="alice", instruction=instr, initiator="a").reason
+    pr.client.http = healthy
+    p = pr.resolve(PROOF, subject="alice", instruction=instr, initiator="a")
+    assert isinstance(p, Pending) and not p.reused and p.attempt == 1 and len(fake.pushes) == 1
+
+
+# ---- the PEP does not choose the credential -----------------------------------------------------
+def test_a_pep_supplied_doctype_needs_the_callers_allowlist():
+    PID = "eu.europa.ec.eudi.pid.1"
+    pid_challenge = parse_challenge(401, {}, {"error": "identity_verification_required", "doctype": PID})
+    clock, fake, world = Clock(), FakeAS(), Proofer()
+    pr = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock)
+    res = pr.resolve(pid_challenge, subject="alice", instruction={"account": "s"}, initiator="a")
+    assert isinstance(res, Unavailable) and "doctype" in res.reason
+    pr2 = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock, doctypes=[MDL])
+    assert isinstance(pr2.resolve(pid_challenge, subject="alice", instruction={"account": "s"}, initiator="a"),
+                      Unavailable)
+    # a pinned doctype the challenge contradicts is refused too
+    res = pr.resolve(pid_challenge, subject="alice", instruction={"account": "s", "doctype": MDL}, initiator="a")
+    assert isinstance(res, Unavailable) and "different doctype" in res.reason
+    assert world.n == 0 and fake.pushes == []
+    # pinned by the caller, with or without the challenge naming it
+    no_doctype = parse_challenge(401, {}, {"error": "identity_verification_required"})
+    for ch in (PROOF, no_doctype):
+        p = pr.resolve(ch, subject="alice", instruction={"account": ch.error + str(ch.doctype), "doctype": MDL},
+                       initiator="a")
+        assert isinstance(p, Pending) and p.detail["doctype"] == MDL
+    with pytest.raises(ValueError):
+        ProofingResolver(world.hooks(), doctypes=MDL)
+
+
+def test_verify_resume_compares_the_proofed_doctype():
+    clock, fake, world = Clock(), FakeAS(), Proofer()
+    pr = ProofingResolver(world.hooks(), _client(fake, clock), clock=clock)
+    p = pr.resolve(PROOF, subject="alice", instruction={"account": "s", "doctype": MDL}, initiator="a")
+    world.status = APPROVED
+    assert pr.poll(p.code).status == APPROVED
+    ok, why = pr.verify_resume(p.code, subject="alice", instruction={"account": "s"})
+    assert not ok and "doctype" in why                  # not pinned, not allowed: not accepted
+    assert not pr.verify_resume(p.code, subject="alice",
+                                instruction={"account": "s", "doctype": "eu.europa.ec.eudi.pid.1"})[0]
+    assert pr.verify_resume(p.code, subject="alice", instruction={"account": "s", "doctype": MDL}) == (True, MDL)
+
+
+# ---- WebConsentResolver: verify_resume, a subject, and a consent URL that does not leak ------------
+def _web(clock, state, **kw):
+    hooks = Hooks(consent_url_for=lambda c: "https://as/consent?otp=SECRET123", web_status=lambda c: state[0])
+    return WebConsentResolver(hooks, clock=clock, **kw)
+
+
+def test_web_consent_verify_resume_is_bound_single_use_and_age_limited():
+    clock, state = Clock(), [PENDING]
+    web = _web(clock, state)
+    p = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert web.verify_resume(p.code, subject="alice", instruction=INSTR) == \
+        (False, "consent is pending, not approved")
+    state[0] = APPROVED
+    assert web.poll(p.code).status == APPROVED
+    assert not web.verify_resume(p.code, subject="alice", instruction={**INSTR, "amount": "90000"})[0]
+    assert not web.verify_resume(p.code, subject="mallory", instruction=INSTR)[0]
+    assert web.verify_resume(p.code, subject="alice", instruction=INSTR) == (True, "app-asserted")
+    assert web.verify_resume(p.code, subject="alice", instruction=INSTR) == \
+        (False, "consent approval has already been used")
+    assert web.verify_resume("WEB-nope", subject="alice", instruction=INSTR)[1] == "unknown consent code"
+
+    web2 = _web(clock, state, max_approval_age=60)
+    p2 = web2.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    web2.poll(p2.code)
+    clock.t += 61
+    ok, why = web2.verify_resume(p2.code, subject="alice", instruction=INSTR)
+    assert not ok and "older than" in why
+
+
+def test_web_consent_needs_a_subject():
+    res = _web(Clock(), [PENDING]).resolve(CHALLENGE, subject="", instruction=INSTR, initiator="a")
+    assert isinstance(res, Unavailable) and "subject" in res.reason
+
+
+def test_web_consent_url_is_out_of_reprs_and_gone_once_terminal():
+    clock, state = Clock(), [PENDING]
+    web = _web(clock, state)
+    p = web.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
+    assert p.consent_url and "SECRET123" not in repr(p)
+    pending = web.poll(p.code)
+    assert pending.consent_url == p.consent_url and "SECRET123" not in repr(pending)
+    assert "consent_url" not in pending.detail
+    state[0] = APPROVED
+    done = web.poll(p.code)
+    assert done.status == APPROVED and done.consent_url is None
+    assert "SECRET123" not in json.dumps(done.to_dict()) and "SECRET123" not in repr(done)

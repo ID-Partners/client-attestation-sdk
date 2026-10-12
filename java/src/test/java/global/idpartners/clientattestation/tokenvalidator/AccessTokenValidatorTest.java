@@ -48,8 +48,11 @@ class AccessTokenValidatorTest {
     void vectorsMatchExpected() {
         Map<String, Object> v = Fixtures.vectors();
         for (Map<String, Object> c : Fixtures.cases(v)) {
-            assertEquals(c.get("expect"), code(Fixtures.validatorFor(v, c).validate((String) c.get("token"))),
-                    (String) c.get("name"));
+            ValidationResult r = Fixtures.validatorFor(v, c).validate((String) c.get("token"));
+            assertEquals(c.get("expect"), code(r), (String) c.get("name"));
+            if (c.containsKey("expect_description")) {
+                assertEquals(c.get("expect_description"), r.errorDescription(), (String) c.get("name"));
+            }
         }
     }
 

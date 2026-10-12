@@ -37,13 +37,25 @@ describe("token validator", () => {
       if ("accepted_algorithms" in o) overrides.acceptedAlgorithms = o.accepted_algorithms;
       if ("accepted_token_types" in o) overrides.acceptedTokenTypes = o.accepted_token_types;
       if ("leeway_seconds" in o) overrides.leewaySeconds = o.leeway_seconds;
+      // a case's own key set replaces the shared one; a case with a fetch error gets a jwksUri instead
+      if (c.jwks !== undefined) overrides.jwks = c.jwks;
+      if (c.jwks_fetch_error !== undefined) {
+        overrides.jwks = undefined;
+        overrides.jwksUri = "https://keys.internal.example:8443/jwks";
+      }
       const validator = new AccessTokenValidator(
         { ...baseConfig(), ...overrides },
-        c.now === undefined ? {} : { clock: () => c.now * 1000 },
+        {
+          clock: c.now === undefined ? undefined : () => c.now * 1000,
+          httpGet: async () => {
+            throw new Error(c.jwks_fetch_error);
+          },
+        },
       );
       const result = await validator.validate(c.token);
       const got = result.valid ? "valid" : result.error;
       expect(got, c.name).toBe(c.expect);
+      if (c.expect_description !== undefined) expect(result.errorDescription, c.name).toBe(c.expect_description);
     }
   });
 

@@ -88,12 +88,12 @@ class AttestationIssuanceClientBootstrapTest {
 
     @Test
     void non2xxIsAnIssuanceExceptionWithStatusAndTruncatedBody() {
-        this.server.respond("/mint", 403, "{\"error\":\"" + "d".repeat(4000) + "\"}");
+        String body = "{\"error\":\"" + "d".repeat(4000) + "\"}";
+        this.server.respond("/mint", 403, body);
         AttestationIssuanceClient.IssuanceException e = assertThrows(
                 AttestationIssuanceClient.IssuanceException.class, () -> client("/mint").bootstrap(null, null));
         assertEquals(403, e.status());
-        assertTrue(e.getMessage().startsWith("attestation issuance failed: HTTP 403: "));
-        assertTrue(e.getMessage().length() < 600, "error body must be truncated");
+        assertEquals("attestation issuance failed: HTTP 403: " + body.substring(0, 512), e.getMessage());
     }
 
     @Test
@@ -131,5 +131,80 @@ class AttestationIssuanceClientBootstrapTest {
         AttestationIssuanceClient.IssuanceException e = assertThrows(
                 AttestationIssuanceClient.IssuanceException.class, () -> client("/mint").bootstrap(null, null));
         assertTrue(e.getMessage().contains("exceeds"), e.getMessage());
+    }
+
+    /** A profile that mints through the transport at a URL of its own choosing, as a custom profile may. */
+    private record OffsiteProfile(String target) implements AttesterProfile {
+        @Override
+        public AttesterMetadata discover(AttesterTransport transport, String attesterUrl) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public MintResult mint(AttesterTransport transport, AttesterMetadata metadata, MintRequest request)
+                throws Exception {
+            Map<String, Object> res = transport.requestJson("mint", "POST", this.target,
+                    Map.of("evidence", request.evidence()));
+            return new MintResult((String) res.get("attestation"), null);
+        }
+    }
+
+    @Test
+    void plainHttpEndpointIsRefusedAtConstruction() {
+        ClientAttestation.ClientAttestationException e = assertThrows(ClientAttestation.ClientAttestationException.class,
+                () -> new AttestationIssuanceClient("http://pf.invalid/federation/attestation", CLIENT_ID, ATTESTER,
+                        new SvidSource.Static("the-svid")));
+        assertTrue(e.getMessage().contains("must use https"), e.getMessage());
+        // Loopback stays allowed.
+        new AttestationIssuanceClient("http://localhost:9031/federation/attestation", CLIENT_ID, ATTESTER,
+                new SvidSource.Static("the-svid"));
+    }
+
+    @Test
+    void aCustomProfilesCallsKeepTheHttpsRule() {
+        AttestationIssuanceClient client = new AttestationIssuanceClient("https://pf.invalid/federation/attestation",
+                CLIENT_ID, ATTESTER, new SvidSource.Static("the-svid"), SigningKeyPair.generate("ES256"),
+                new OffsiteProfile("http://attester.invalid/mint"));
+        AttestationIssuanceClient.IssuanceException e = assertThrows(
+                AttestationIssuanceClient.IssuanceException.class, () -> client.bootstrap(null, null));
+        assertTrue(e.getMessage().contains("must use https"), e.getMessage());
+    }
+
+    @Test
+    void allowInsecureLiftsTheHttpsRule() throws Exception {
+        this.server.respond("/mint", 200, "{\"attestation\":\"h.p.s\"}");
+        AttestationIssuanceClient client = new AttestationIssuanceClient("http://pf.invalid/federation/attestation",
+                CLIENT_ID, ATTESTER, new SvidSource.Static("the-svid"), SigningKeyPair.generate("ES256"),
+                new OffsiteProfile(this.server.url("/mint")), true);
+        assertEquals("h.p.s", client.bootstrap(null, null).attestation());
+        // The profile's call to a non-loopback http host is attempted (and fails only because nothing is there).
+        AttestationIssuanceClient offsite = new AttestationIssuanceClient("http://pf.invalid/federation/attestation",
+                CLIENT_ID, ATTESTER, new SvidSource.Static("the-svid"), SigningKeyPair.generate("ES256"),
+                new OffsiteProfile("http://attester.invalid/mint"), true);
+        AttestationIssuanceClient.IssuanceException e = assertThrows(
+                AttestationIssuanceClient.IssuanceException.class, () -> offsite.bootstrap(null, null));
+        assertInstanceOf(TransportException.class, e.getCause());
+    }
+
+    @Test
+    void aProfileThatMintsNothingIsAnIssuanceException() {
+        for (MintResult result : new MintResult[]{null, new MintResult(null, null), new MintResult(" ", 5L)}) {
+            AttesterProfile empty = new AttesterProfile() {
+                @Override
+                public AttesterMetadata discover(AttesterTransport transport, String attesterUrl) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public MintResult mint(AttesterTransport transport, AttesterMetadata metadata, MintRequest request) {
+                    return result;
+                }
+            };
+            AttestationIssuanceClient client = new AttestationIssuanceClient(this.server.url("/mint"), CLIENT_ID,
+                    ATTESTER, new SvidSource.Static("the-svid"), SigningKeyPair.generate("ES256"), empty);
+            AttestationIssuanceClient.IssuanceException e = assertThrows(
+                    AttestationIssuanceClient.IssuanceException.class, () -> client.bootstrap(null, null));
+            assertTrue(e.getMessage().contains("no attestation"), e.getMessage());
+        }
     }
 }

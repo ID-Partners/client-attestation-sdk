@@ -5,8 +5,10 @@
 **/__pycache__/
 **/*.class
 **/*.egg-info/
-python/.venv/
-typescript/node_modules/
+.venv/
+venv/
+node_modules/
+*.tgz
 go/bin/
 interop/out/
 
@@ -18,10 +20,29 @@ validation/out/
 *.pem
 *.p12
 *.jks
-id_*
+*.key
+*.asc
+*.jwk
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+.env
+.env.*
+.npmrc
+.pypirc
+settings.xml
+credentials.json
 .DS_Store
 
-# coverage output
+# Local agent configuration
+.claude/
+CLAUDE.local.md
+
+# coverage output and tool caches
 .coverage
 coverage/
 coverage.out
+htmlcov/
+.pytest_cache/
+.mypy_cache/

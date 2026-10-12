@@ -1,4 +1,4 @@
-// Command validate-emit validates the shared vectors (tokens.json, introspection.json) and writes this
+// Command validate-emit validates the shared vectors (tokens.json, introspection.json, config.json) and writes this
 // port's verdicts for the cross-language agreement check.
 package main
 
@@ -28,14 +28,23 @@ type vectors struct {
 	AcceptedAlgorithms []string        `json:"accepted_algorithms"`
 	JWKS               json.RawMessage `json:"jwks"`
 	Cases              []struct {
-		Name   string     `json:"name"`
-		Token  string     `json:"token"`
-		Config *overrides `json:"config"`
-		Now    *int64     `json:"now"`
+		Name           string          `json:"name"`
+		Token          string          `json:"token"`
+		Config         *overrides      `json:"config"`
+		Now            *int64          `json:"now"`
+		JWKS           json.RawMessage `json:"jwks"`
+		JWKSFetchError *string         `json:"jwks_fetch_error"`
 	} `json:"cases"`
 }
 
+// jwksURI is what a case with a fetch error is given instead of a static key set.
+const jwksURI = "https://keys.internal.example:8443/jwks"
+
 type introspectionVectors struct {
+	Guard struct {
+		Resource  string   `json:"resource"`
+		Audiences []string `json:"audiences"`
+	} `json:"guard"`
 	Cases []struct {
 		Name           string         `json:"name"`
 		Response       map[string]any `json:"response"`
@@ -44,10 +53,23 @@ type introspectionVectors struct {
 	} `json:"cases"`
 }
 
+type configVectors struct {
+	Cases []struct {
+		Name   string `json:"name"`
+		Config struct {
+			JWKSURI               *string `json:"jwks_uri"`
+			IntrospectionEndpoint *string `json:"introspection_endpoint"`
+			AllowInsecure         bool    `json:"allow_insecure"`
+			LeewaySeconds         *int    `json:"leeway_seconds"`
+		} `json:"config"`
+	} `json:"cases"`
+}
+
 type outcome struct {
-	Name  string  `json:"name"`
-	Valid bool    `json:"valid"`
-	Error *string `json:"error"`
+	Name        string  `json:"name"`
+	Valid       bool    `json:"valid"`
+	Error       *string `json:"error"`
+	Description *string `json:"description,omitempty"`
 }
 
 func findValidationDir() (string, error) {
@@ -116,8 +138,8 @@ func configFor(v *vectors, o *overrides) *tv.Config {
 func row(name string, r tv.Result) outcome {
 	o := outcome{Name: name, Valid: r.Valid}
 	if !r.Valid {
-		code := r.Error
-		o.Error = &code
+		code, description := r.Error, r.ErrorDescription
+		o.Error, o.Description = &code, &description
 	}
 	return o
 }
@@ -137,7 +159,16 @@ func main() {
 			at := time.Unix(*c.Now, 0)
 			opts = append(opts, tv.WithClock(func() time.Time { return at }))
 		}
-		validator, err := tv.New(configFor(&v, c.Config), opts...)
+		cfg := configFor(&v, c.Config)
+		if c.JWKS != nil {
+			cfg.JWKS = c.JWKS
+		}
+		if c.JWKSFetchError != nil {
+			message := *c.JWKSFetchError
+			cfg.JWKS, cfg.JWKSURI = nil, jwksURI
+			opts = append(opts, tv.WithHTTPGet(func(string) ([]byte, error) { return nil, errors.New(message) }))
+		}
+		validator, err := tv.New(cfg, opts...)
 		if err != nil {
 			panic(err)
 		}
@@ -173,12 +204,68 @@ func main() {
 		introspection = append(introspection, row(c.Name, r))
 	}
 
+	guard := make([]outcome, 0, len(iv.Cases))
+	for _, c := range iv.Cases {
+		cfg := configFor(&v, nil)
+		cfg.Audiences = iv.Guard.Audiences
+		if !c.NoEndpoint {
+			cfg.Introspection = &tv.IntrospectionConfig{
+				Endpoint: "https://issuer.example.com/introspect", ClientID: "rs", ClientSecret: "secret",
+			}
+		}
+		post := func(string, string, map[string]string) (map[string]any, error) {
+			if c.TransportError {
+				return nil, errors.New("introspection: HTTP 503")
+			}
+			return c.Response, nil
+		}
+		validator, err := tv.New(cfg, tv.WithHTTPPost(post))
+		if err != nil {
+			panic(err)
+		}
+		resource, err := tv.NewProtectedResource(iv.Guard.Resource, []string{v.Issuer}, validator, nil)
+		if err != nil {
+			panic(err)
+		}
+		decision, err := resource.AuthenticateActive("Bearer opaque-token", nil)
+		if err != nil {
+			raises := "raises"
+			guard = append(guard, outcome{Name: c.Name, Error: &raises})
+			continue
+		}
+		guard = append(guard, row(c.Name, decision.Result))
+	}
+
+	var cv configVectors
+	load(valDir, "config.json", &cv)
+	configResults := make([]outcome, 0, len(cv.Cases))
+	for _, c := range cv.Cases {
+		cfg := configFor(&v, &overrides{LeewaySeconds: c.Config.LeewaySeconds})
+		if c.Config.JWKSURI != nil {
+			cfg.JWKS, cfg.JWKSURI = nil, *c.Config.JWKSURI
+		}
+		if c.Config.IntrospectionEndpoint != nil {
+			cfg.Introspection = &tv.IntrospectionConfig{
+				Endpoint: *c.Config.IntrospectionEndpoint, ClientID: "rs", ClientSecret: "secret",
+			}
+		}
+		cfg.AllowInsecure = c.Config.AllowInsecure
+		if _, err := tv.New(cfg); err != nil {
+			refused := "refused"
+			configResults = append(configResults, outcome{Name: c.Name, Error: &refused})
+			continue
+		}
+		configResults = append(configResults, outcome{Name: c.Name, Valid: true})
+	}
+
 	outDir := filepath.Join(valDir, "out")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		panic(err)
 	}
 	data, err := json.MarshalIndent(map[string]any{
 		"language": "go", "results": results, "introspection_results": introspection,
+		"guard_results":  guard,
+		"config_results": configResults,
 	}, "", "  ")
 	if err != nil {
 		panic(err)

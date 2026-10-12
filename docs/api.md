@@ -5,7 +5,9 @@ Every exported name is in one of three tiers:
 
 - **Stable.** Follows semver from 1.0.0. A breaking change needs a major release. Before something
   Stable is removed or renamed, it is deprecated for at least one minor release, and it goes in the next
-  major. New Stable API can arrive in any minor release.
+  major. New Stable API can arrive in any minor release. The one exception is the security exception in the
+  README's [versioning policy](../README.md#status-and-versioning): a minor or patch release may make the SDK
+  refuse something it used to accept when accepting it lets a credential reach the wrong party.
 - **Experimental.** Public and supported, but it may change or go in any minor release, with a CHANGELOG
   entry and no deprecation period. Each item is marked in its own doc comment and listed below with the
   reason. It is here because it exists in one port only, depends on someone else's API, or is an
@@ -36,32 +38,43 @@ Everything in the places above that is not listed under Experimental or Internal
   if it does.
 - **Keys and building credentials**: `SigningKeyPair` (Java: `generate`, `fromJwk(Map, String)`,
   `publicJwk()`); `ClientAttestationBuilder`, `PopBuilder`, `DpopProofBuilder`;
-  `ClientAttestationCredential`; the header and `typ` constants; the `JwsSigner` interface.
+  `ClientAttestationCredential`; the header constants and the `typ` constants (Java and Python keep the
+  attestation, PoP and DPoP `typ` constants internal); the `JwsSigner` interface.
 - **The one-call client**: `ClientAttestation` with its options (`pop_method`, `authorization_details`,
   `operator`, `evidence`, `challenge_at_token`, `require_challenge`, `allow_insecure`, `metadata`,
-  `profile`, `algorithm`, expiry skew, timeouts, the logger), its token and header methods and its
-  HTTP-client adapters, `discovery()` and `attester_metadata()`; `ClientAttestationError` and
-  `TransportError` (`ClientAttestationException`, `TransportException` in Java).
+  `profile`, `algorithm`, expiry skew, timeouts, the logger in Go, TypeScript and Java), its token and
+  header methods and its HTTP-client adapters, `discovery()` and `attester_metadata()`;
+  `ClientAttestationError` and `TransportError` (`ClientAttestationException`, `TransportException` in
+  Java).
 - **Choosing an attester**: `AttesterMetadata` and the `metadata` option; `PingFederateProfile` as the
   value you pass to `profile` (it is the default), with its path constants.
 - **Evidence**: the `SvidSource` interface; the static, file-token and GCP metadata sources; evidence
-  auto-detection and the `ENV_*` / `DEFAULT_*` names it reads.
-- **Resource server**: `AccessTokenValidator`, `ValidatorConfig`, `IntrospectionConfig`,
-  `ValidationResult`, the error codes, `DEFAULT_ALGORITHMS` and the other defaults, `ProtectedResource`,
-  `ProtectedResourceMetadata`, `AuthDecision`, `bearer_token`, and AS-metadata `discover` (Python, Java).
+  auto-detection, the environment variables and default paths it reads, and the constants that name them
+  (TypeScript and Java: `ENV_*` / `DEFAULT_*`; Go: `Env*` / `Default*`; Python keeps those constants out
+  of `__all__`).
+- **Resource server**: `AccessTokenValidator`, `ValidatorConfig` (including its allow-insecure opt-out),
+  `IntrospectionConfig`, `ValidationResult`, the error codes, `DEFAULT_ALGORITHMS` and the other defaults,
+  `ProtectedResource`, `ProtectedResourceMetadata` (TypeScript, Go; Python and Java return the metadata as
+  a map), `AuthDecision`, `bearer_token` (Java: `ProtectedResource.bearerToken`), and AS-metadata
+  `discover` (Python, Java), including its expected-issuer and allow-insecure arguments.
   The verdicts are pinned separately by [`validation/SEMANTICS.md`](../validation/SEMANTICS.md) and the
   shared vectors.
-- **Logging hooks**: the logger option in each port, the TypeScript `Logger` type and `NOOP_LOGGER`, and
+- **Logging hooks**: the logger option in Go, TypeScript and Java, the `client_attestation_sdk` logger
+  hierarchy in Python (which has no logger option), the TypeScript `Logger` type and `NOOP_LOGGER`, and
   `ClientAttestation.LOGGER_NAME` (Java). The hook is Stable and nothing secret will ever be logged; the
   events themselves are Experimental (below).
+- **String forms**: a value that holds a credential prints it redacted (Go `String`, `GoString` and
+  `LogValue`, Java `toString`, Python `repr`, TypeScript getters over private fields), and an error keeps
+  at most 512 characters of a non-2xx body and none of a 2xx one (see
+  [`logging.md`](logging.md#what-is-never-logged)). The redaction is Stable; the exact text is not.
 
 ## Experimental
 
 | Item | Ports | Why it is Experimental |
 | --- | --- | --- |
 | `AttesterProfile`, `AttesterTransport`, `MintRequest`, `MintResult` (writing a profile, or calling a profile's `discover` / `mint` yourself) | all four | New just before 1.0 and fitted to one real attester so far. You implement them, so a method added to them would break your profile. Choosing `PingFederateProfile` or passing static `metadata` is Stable. |
-| `OpenBaoTransitSigner` | all four | A client for a third-party API (OpenBao / Vault transit) that authenticates with a static token only. Its constructor will change when other auth methods are added. The `JwsSigner` interface it implements is Stable. |
-| `AttestationIssuanceClient`, `IssuedAttestation`, `IssuanceError` / `IssuanceException`, `INSTANCE_PROOF_TYP` | all four | They call a PingFederate demo issuance servlet (`/federation/attestation`) whose protocol is not standardised. |
+| `OpenBaoTransitSigner` | all four | A client for a third-party API (OpenBao / Vault transit) that authenticates with a static token only. Its constructor will change when other auth methods are added. Its allow-insecure option (`allow_insecure`, `allowInsecure`, `WithOpenBaoAllowInsecure` / `OpenBaoOption`, the `boolean` constructor) is part of it. The `JwsSigner` interface it implements is Stable. |
+| `AttestationIssuanceClient` (with its allow-insecure option: `allow_insecure`, `allowInsecure`, `AllowInsecure` / `WithIssuanceAllowInsecure` / `IssuanceOption`, the `boolean` constructor), `IssuedAttestation`, `IssuanceError` / `IssuanceException`, `INSTANCE_PROOF_TYP` | all four | They call a PingFederate demo issuance servlet (`/federation/attestation`) whose protocol is not standardised. |
 | `SpireWorkloadApiSvidSource` (`SpireWorkloadAPISvidSource`, `SvidSource.SpireWorkloadApi`) | all four | It shells out to the `spire-agent` CLI, and its constructor will change when it talks to the Workload API socket directly. Auto-detection returning it is Stable. |
 | `HttpSvidSource` (`HTTPSvidSource`, `SvidSource.Http`) | all four | A development and test source: the endpoint has no caller authentication. |
 | `SigningKeyPair.fromJwk(PublicJsonWebKey, String)`, `SigningKeyPair.publicJsonWebKey()` | Java | They take and return jose4j types, which would tie 1.x to jose4j. `fromJwk(Map, String)` and `publicJwk()` are the Stable equivalents. |
@@ -102,14 +115,16 @@ Differences that stay, because each is the language's own shape or would cost mo
 | Evidence sources | `FileTokenSvidSource`, `GoogleMetadataSvidSource`, `StaticSvidSource`, ... | same names | same, with Go initialisms | nested in the interface: `SvidSource.File`, `.GoogleMetadata`, `.Static`, ... |
 | Auto-detect evidence | `auto_detect_evidence()` | `autoDetectEvidence()` | `AutoDetectEvidence()` | `Evidence.autoDetect()` |
 | Evidence missing | `EvidenceNotFound` | `EvidenceNotFound` | `*EvidenceNotFound` | `Evidence.EvidenceNotFoundException` |
-| Transport failure | `TransportError` | `TransportError` (with `kind`) | `*ClientAttestationError` (no separate type) | `TransportException` |
+| Transport failure | `TransportError` | `TransportError` (with `kind`) | no separate type: a refused redirect arrives as a `*url.Error` wrapping `*ClientAttestationError` (use `errors.As`); oversize bodies and challenge-fetch failures are `*ClientAttestationError`; other network failures and timeouts are the `net/http` `*url.Error` | `TransportException` |
 | Authorization header | `authorization_header()` → `{"Authorization": ...}` | `authorizationHeader()` → header map | `AuthorizationHeader(ctx)` → the header value | `authorizationHeader()` → header map |
 | Attach to an HTTP client | `requests_auth()`, `httpx_auth()` | `fetch()` | `RoundTripper()`, `RoundTripperOver()` | `authorize(...)`, `send(...)` |
 | Validator config / result | `ValidatorConfig`, `ValidationResult` | `ValidatorConfig`, `ValidationResult` | `tokenvalidator.Config`, `tokenvalidator.Result` (Go avoids repeating the package name) | `ValidatorConfig`, `ValidationResult` |
 | Make a validator | `AccessTokenValidator(config, ...)` | `new AccessTokenValidator(config, opts)` | `tokenvalidator.New(config, opts...)` | `AccessTokenValidator.builder(config)...build()` |
 | Validator defaults | `DEFAULT_ALGORITHMS` (tuple) | `DEFAULT_ALGORITHMS` (readonly array) | `DefaultAlgorithms()` (returns a copy) | `ValidatorConfig.DEFAULT_ALGORITHMS` (unmodifiable list) |
 | Error codes | `token_validator.errors.EXPIRED` | `errors.EXPIRED` | `tokenvalidator.ErrExpired` | `ErrorCodes.EXPIRED` |
-| Introspection | `introspect(token, token_type_hint=...)` | `introspect(token, tokenTypeHint?)` | `Introspect(token)` (no hint) | `introspect(token[, hint])` |
+| Introspection | `introspect(token, token_type_hint=...)` | `introspect(token, tokenTypeHint?)` | `Introspect(token)` (always sends `token_type_hint=access_token`) | `introspect(token[, hint])` |
+| Plain-http validator endpoints | `ValidatorConfig(..., allow_insecure=True)` | `allowInsecure: true` in `ValidatorConfig` | `Config.AllowInsecure` (a field, like the rest of `Config`) | `ValidatorConfig.Builder.allowInsecure(true)` |
+| AS-metadata discovery | `discover(url, http_get=None, *, issuer=None, allow_insecure=False)` | none | none | `Discovery.discover(url)`, `(url, httpGet)`, `(url, issuer, httpGet)`, `(url, issuer, httpGet, allowInsecure)`; a null issuer or `httpGet` means derived or default |
 
 ## Changing the API
 

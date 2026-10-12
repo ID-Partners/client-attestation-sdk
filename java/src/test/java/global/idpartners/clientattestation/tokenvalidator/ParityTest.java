@@ -93,7 +93,7 @@ class ParityTest {
     @Test
     void strictReaderReadsWhatRfc8259Allows() throws Exception {
         Map<String, Object> o = parse(" {\"s\": \"q\\\"b\\\\s\\/f\\bn\\fr\\nt\\rt\\tu\\u00e9\\u0041\", \"t\": true, \"f\": false,"
-                + " \"n\": null, \"a\": [], \"o\": {}, \"i\": -0, \"l\": 12, \"b\": 99999999999999999999,"
+                + " \"n\": null, \"a\": [], \"o\": {}, \"i\": -0, \"l\": 12, \"b\": 9999999999999999999,"
                 + " \"d\": 1.5e-3, \"e\": 2E+2, \"x\": [1, [2], {\"y\": \"z\"}]}\r\n");
         assertEquals("q\"b\\s/f\bn\fr\nt\rt\tu\u00e9A", o.get("s"));
         assertEquals(Boolean.TRUE, o.get("t"));
@@ -103,17 +103,29 @@ class ParityTest {
         assertEquals(Map.of(), o.get("o"));
         assertEquals(0L, o.get("i"));
         assertEquals(12L, o.get("l"));
-        assertEquals(new BigInteger("99999999999999999999"), o.get("b"));
+        assertEquals(new BigInteger("9999999999999999999"), o.get("b"));
         assertEquals(1.5e-3, o.get("d"));
         assertEquals(200.0, o.get("e"));
         assertEquals(Double.POSITIVE_INFINITY, parse("{\"e\": 1e400}").get("e"));
     }
 
     @Test
+    void strictReaderReadsALongIntegerAsADouble() throws Exception {
+        // past 19 digits an integer is a double, as in Go and TypeScript (Python past 4000): new BigInteger is
+        // quadratic in the digits, and the reader runs on the unauthenticated header
+        assertEquals(1e20, parse("{\"n\": 100000000000000000000}").get("n"));
+        assertEquals(-1e20, parse("{\"n\": -100000000000000000000}").get("n"));
+        assertEquals(Double.POSITIVE_INFINITY, parse("{\"n\": " + "9".repeat(1_000_000) + "}").get("n"));
+        assertThrows(Strict.Malformed.class,
+                () -> Strict.numericDate(parse("{\"exp\": 100000000000000000000}"), "exp"));
+    }
+
+    @Test
     void strictReaderRefusesWhatJose4jWouldTake() {
         for (String bad : List.of("{\"a\":1,}", "{\"a\":[1,]}", "{\"a\":01}", "{\"a\":\"\u0001\"}", "{\"a\":1} x",
                 "{\"a\":NaN}", "{\"a\":-}", "{\"a\":1.}", "{\"a\":1e}", "{\"a\":tru}", "{\"a\":\"\\x\"}",
-                "{\"a\":\"\\u12\"}", "{\"a\":\"\\u12G4\"}", "{\"a\":\"open", "{a:1}", "{\"a\" 1}", "{\"a\":1 \"b\":2}",
+                "{\"a\":\"\\u12\"}", "{\"a\":\"\\u12G4\"}", "{\"a\":\"\\u\u0660\u066041\"}",
+                "{\"a\":\"\\u00\uff21\uff21\"}", "{\"a\":\"open", "{a:1}", "{\"a\" 1}", "{\"a\":1 \"b\":2}",
                 "[1 2]", "", "\"s\"", "{\"a\":{\"b\":1,\"b\":2}}", "{\"a\":" + "[".repeat(70) + "]".repeat(70) + "}")) {
             assertThrows(Strict.Malformed.class, () -> parse(bad), bad);
         }

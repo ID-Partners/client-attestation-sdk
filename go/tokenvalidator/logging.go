@@ -33,6 +33,12 @@ type tooLargeError struct{ msg string }
 
 func (e *tooLargeError) Error() string { return e.msg }
 
+// malformedError is a body that is not the JSON expected. It keeps the wrapped error's message.
+type malformedError struct{ err error }
+
+func (e *malformedError) Error() string { return e.err.Error() }
+func (e *malformedError) Unwrap() error { return e.err }
+
 // failureReason classifies a fetch error: timeout, redirect, too_large, status, malformed or network.
 func failureReason(err error) (reason string, status int) {
 	var se *statusError
@@ -42,6 +48,10 @@ func failureReason(err error) (reason string, status int) {
 	var tl *tooLargeError
 	if errors.As(err, &tl) {
 		return "too_large", 0
+	}
+	var me *malformedError
+	if errors.As(err, &me) {
+		return "malformed", 0
 	}
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError

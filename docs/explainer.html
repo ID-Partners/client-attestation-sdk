@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Client Attestation SDK</title>
+<title>Client Attestation SDK - software identity and access</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
@@ -179,7 +179,7 @@
   .chip.yes { background: var(--good-soft); color: var(--good); }
   .chip.partial { background: var(--issuer-soft); color: var(--issuer); }
   .chip.no { background: transparent; color: var(--muted); font-weight: 500; }
-  .chip.no::before { content: "—"; }
+  .chip.no::before { content: "Not available"; }
   .chip-note { display: block; font-size: 10.5px; color: var(--muted); margin-top: 3px; font-weight: 400; }
 
   /* ---------- standards ---------- */
@@ -232,6 +232,13 @@
   pre.tree .path { color: var(--accent); }
   pre.tree .desc { color: var(--muted); }
 
+  details { margin-top: 24px; }
+  summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+  details .table-scroll { margin-top: 16px; }
+  .steps { padding-left: 24px; max-width: 68ch; }
+  .steps li { padding-left: 6px; margin-bottom: 16px; }
+  .std-card p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+
   footer { padding: 40px 0 60px; border-top: 1px solid var(--line); }
   footer p { color: var(--muted); font-size: 13.5px; max-width: 60ch; }
   footer a { color: var(--muted); text-decoration-color: var(--line); }
@@ -247,388 +254,232 @@
 
 <div class="topbar">
   <div class="topbar-inner">
-    <div class="topbar-mark">client<span>·</span>attestation<span>·</span>sdk</div>
-    <nav class="topnav">
-      <a href="#architecture">Architecture</a>
-      <a href="#features">Feature support</a>
-      <a href="#standards">Standards</a>
-      <a href="#contract">Wire contract</a>
-      <a href="#tests">Test coverage</a>
-      <a href="#layout">Layout</a>
+    <div class="topbar-mark">Client Attestation SDK</div>
+    <nav class="topnav" aria-label="Page sections">
+      <a href="#problem">The problem</a>
+      <a href="#architecture">How it works</a>
+      <a href="#features">What it does</a>
+      <a href="#contract">Access controls</a>
+      <a href="#tests">Checks</a>
+      <a href="#layout">Getting started</a>
     </nav>
   </div>
 </div>
 
-<div class="wrap">
-
+<main class="wrap">
   <div class="intro">
-    <span class="eyebrow">draft-ietf-oauth-attestation-based-client-auth · four languages, one contract</span>
-    <h1>The client's credential is what it is, not a secret it holds.</h1>
+    <span class="eyebrow">Identity and access for AI agents and applications</span>
+    <h1>Help software prove its identity before it gets access.</h1>
     <p class="lede">
-      client-attestation-sdk builds and verifies OAuth attestation-based client authentication
-      in Go, Java, Python, and TypeScript. A workload proves its platform identity once; every port turns
-      that into the same two artifacts — an attestation JWT and a proof of possession — and the same Java
-      verifier accepts all four.
+      AI agents and applications need permission to use company systems.
+      Client Attestation SDK helps them prove which application is making a request.
+      A software development kit (SDK) is code that developers add to an application.
+      Your company sets the rules for what that application can do.
     </p>
     <div class="badges">
       <span class="badge">Go · Java · Python · TypeScript</span>
-      <span class="badge">ES256 <b>·</b> RFC 7638 <code>kid</code></span>
-      <span class="badge">PoP <b>+</b> DPoP-combined</span>
-      <span class="badge">Interop-verified against a real AS</span>
+      <span class="badge">Uses the application's platform identity</span>
     </div>
   </div>
 
-  <section id="architecture">
-    <div class="section-head">
-      <h2>Architecture</h2>
-      <span class="section-num">01</span>
-    </div>
+  <section id="problem">
+    <div class="section-head"><h2>The problem with shared secrets</h2><span class="section-num">01</span></div>
     <p class="section-dek">
-      Two shapes, one contract. Every request-time flow ends the same way — an attestation plus a fresh
-      proof, sent to the token endpoint — whichever proof-of-possession method produced it.
+      Applications often identify themselves with a shared secret - a password held by the application
+      and the service that checks it. Anyone who obtains that secret can use it to impersonate the application.
+      Teams must protect these secrets and replace them when needed.
     </p>
+    <p>
+      This SDK uses identity evidence from the platform where the application runs.
+      An attester is a trusted service that checks identity evidence and issues a signed statement called a Client Attestation.
+      The application presents that statement with proof that it holds the matching private key.
+      A private key is secret data the application uses to sign its proof.
+      This authentication flow uses no shared client secret.
+    </p>
+  </section>
 
+  <section id="architecture">
+    <div class="section-head"><h2>How it works</h2><span class="section-num">02</span></div>
+    <p class="section-dek">
+      An access token is a credential that an application presents when it calls a protected service.
+      The Authorization Server is the service that checks token requests and issues access tokens.
+      The SDK handles the steps needed to request one.
+    </p>
     <figure class="diagram">
       <div class="scroller">
-        <svg viewBox="0 0 860 420" role="img" aria-label="Sequence diagram: the attester mints a Client Attestation JWT bound to the client's instance key; the client fetches a challenge, then builds either a dedicated PoP JWT carrying the challenge or a DPoP proof carrying it as a nonce; either path is verified by the same AS and returns an access token.">
-          <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
-            </marker>
-          </defs>
-
-          <!-- lane rules -->
-          <line x1="140" y1="60"  x2="820" y2="60"  stroke="currentColor" stroke-opacity="0.22"></line>
-          <line x1="140" y1="200" x2="820" y2="200" stroke="currentColor" stroke-opacity="0.22"></line>
-          <line x1="140" y1="340" x2="820" y2="340" stroke="currentColor" stroke-opacity="0.22"></line>
-
-          <text x="18" y="56" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">ATTESTER</text>
-          <text x="18" y="196" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">CLIENT</text>
-          <text x="18" y="336" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">AUTH</text>
-          <text x="18" y="349" font-size="11" letter-spacing="0.06em" fill="currentColor" opacity="0.6">SERVER</text>
-
-          <!-- step 1: mint -->
-          <rect x="140" y="40" width="120" height="40" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="200" y="65" text-anchor="middle" font-size="10.5" fill="currentColor">Builder.build()</text>
-
-          <line x1="200" y1="80" x2="200" y2="176" stroke="currentColor" stroke-opacity="0.6" marker-end="url(#arrow)"></line>
-
-          <rect x="140" y="180" width="120" height="40" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.4"></rect>
-          <text x="200" y="197" text-anchor="middle" font-size="10.2" fill="currentColor">Client Attestation</text>
-          <text x="200" y="211" text-anchor="middle" font-size="10.2" fill="currentColor">JWT</text>
-          <text x="200" y="236" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.6">cnf.jwk = instance pub</text>
-
-          <!-- step 2: challenge round trip -->
-          <line x1="374" y1="200" x2="374" y2="336" stroke="currentColor" stroke-opacity="0.55" stroke-dasharray="4 4" marker-end="url(#arrow)"></line>
-          <line x1="396" y1="340" x2="396" y2="204" stroke="currentColor" stroke-opacity="0.55" stroke-dasharray="4 4" marker-end="url(#arrow)"></line>
-          <text x="404" y="270" font-size="9.5" fill="currentColor" opacity="0.65">GET challenge_endpoint</text>
-          <text x="404" y="282" font-size="9.5" fill="currentColor" opacity="0.65">→ challenge</text>
-
-          <!-- branch point -->
-          <circle cx="480" cy="200" r="3" fill="currentColor"></circle>
-          <line x1="483" y1="197" x2="518" y2="153" stroke="currentColor" stroke-opacity="0.55"></line>
-          <line x1="483" y1="203" x2="518" y2="253" stroke="currentColor" stroke-opacity="0.55"></line>
-
-          <!-- pop path -->
-          <rect x="518" y="103" width="172" height="20" rx="10" fill="var(--accent-soft)"></rect>
-          <text x="604" y="117" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent)">attestation_pop_jwt</text>
-          <rect x="518" y="130" width="172" height="46" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="604" y="149" text-anchor="middle" font-size="10.5" fill="currentColor">PoP JWT</text>
-          <text x="604" y="163" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">challenge claim</text>
-
-          <!-- dpop path -->
-          <rect x="518" y="230" width="172" height="46" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="604" y="249" text-anchor="middle" font-size="10.5" fill="currentColor">DPoP proof</text>
-          <text x="604" y="263" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">nonce claim</text>
-          <rect x="518" y="278" width="172" height="20" rx="10" fill="var(--accent-soft)"></rect>
-          <text x="604" y="292" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent)">dpop_combined</text>
-
-          <!-- converge to AS -->
-          <line x1="690" y1="152" x2="738" y2="322" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow)"></line>
-          <line x1="690" y1="253" x2="782" y2="322" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow)"></line>
-          <text x="700" y="220" font-size="9.5" fill="currentColor" opacity="0.65">POST /as/token.oauth2</text>
-
-          <rect x="690" y="320" width="140" height="40" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="760" y="345" text-anchor="middle" font-size="10.2" fill="currentColor">Verifier.verify()</text>
-
-          <!-- token back -->
-          <line x1="760" y1="320" x2="760" y2="224" stroke="currentColor" stroke-opacity="0.6" marker-end="url(#arrow)"></line>
-          <text x="770" y="278" font-size="9.5" fill="currentColor" opacity="0.65">200 OK</text>
-
-          <rect x="690" y="180" width="140" height="40" rx="6" fill="var(--accent)"></rect>
-          <text x="760" y="205" text-anchor="middle" font-size="11" font-weight="600" fill="var(--accent-ink)">access_token</text>
+        <svg viewBox="0 0 860 140" role="img" aria-label="The application supplies identity evidence. The attester issues a Client Attestation. The application proves it holds the matching private key. The Authorization Server checks the request and issues an access token if it accepts it.">
+          <defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path></marker></defs>
+          <g fill="var(--paper-raised)" stroke="currentColor" stroke-opacity="0.4">
+            <rect x="10" y="30" width="180" height="80" rx="6"></rect>
+            <rect x="230" y="30" width="180" height="80" rx="6"></rect>
+            <rect x="450" y="30" width="180" height="80" rx="6"></rect>
+          </g>
+          <rect x="670" y="30" width="180" height="80" rx="6" fill="var(--accent)"></rect>
+          <g stroke="currentColor" stroke-opacity="0.6" marker-end="url(#arrow)">
+            <line x1="194" y1="70" x2="222" y2="70"></line>
+            <line x1="414" y1="70" x2="442" y2="70"></line>
+            <line x1="634" y1="70" x2="662" y2="70"></line>
+          </g>
+          <g fill="currentColor" text-anchor="middle" font-size="14">
+            <text x="100" y="63">Supply identity</text><text x="100" y="83">evidence</text>
+            <text x="320" y="63">Get a Client</text><text x="320" y="83">Attestation</text>
+            <text x="540" y="63">Prove possession</text><text x="540" y="83">of the private key</text>
+          </g>
+          <g fill="var(--accent-ink)" text-anchor="middle" font-size="14">
+            <text x="760" y="63">Request an</text><text x="760" y="83">access token</text>
+          </g>
         </svg>
       </div>
-      <figcaption>
-        <strong>One call, two ways to prove possession.</strong> The attestation is minted once and cached;
-        <code>pop_method</code> picks which proof travels with it on every request. A fetched challenge is
-        threaded into whichever one is active: as the PoP JWT's challenge claim, or the DPoP proof's nonce.
-      </figcaption>
+      <figcaption>The Authorization Server checks the attestation and the proof before issuing an access token.</figcaption>
     </figure>
-
-    <figure class="diagram" style="margin-top: 22px;">
-      <div class="scroller">
-        <svg viewBox="0 0 860 190" role="img" aria-label="Flow diagram: a workload proves its SPIFFE identity as a JWT-SVID, AttestationIssuanceClient sends it to the AS's federation attestation endpoint, the AS mints a Client Attestation bound to the workload's own instance key, and the client presents the issued attestation exactly like a self-built one.">
-          <defs>
-            <marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
-            </marker>
-          </defs>
-          <rect x="20" y="70" width="168" height="50" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="104" y="91" text-anchor="middle" font-size="11" fill="currentColor">Workload</text>
-          <text x="104" y="106" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">SPIFFE identity</text>
-
-          <line x1="188" y1="95" x2="248" y2="95" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow2)"></line>
-          <text x="192" y="82" font-size="9.5" fill="currentColor" opacity="0.65">JWT-SVID</text>
-
-          <rect x="250" y="60" width="200" height="70" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="350" y="88" text-anchor="middle" font-size="11" fill="currentColor">AttestationIssuanceClient</text>
-          <text x="350" y="103" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.65">.bootstrap()</text>
-          <text x="350" y="117" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="currentColor" opacity="0.55">SvidSource: static · http · SPIRE</text>
-
-          <line x1="450" y1="95" x2="510" y2="95" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow2)"></line>
-          <text x="454" y="82" font-size="9.5" fill="currentColor" opacity="0.65">mint request</text>
-
-          <rect x="512" y="60" width="200" height="70" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-opacity="0.6"></rect>
-          <text x="612" y="86" text-anchor="middle" font-size="11" fill="currentColor">Authorization Server</text>
-          <text x="612" y="101" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.7">/federation/attestation</text>
-          <text x="612" y="115" text-anchor="middle" font-size="9.5" fill="currentColor" opacity="0.7">mints, binds instance key</text>
-
-          <line x1="712" y1="95" x2="772" y2="95" stroke="currentColor" stroke-opacity="0.55" marker-end="url(#arrow2)"></line>
-          <text x="712" y="82" font-size="9.5" fill="currentColor" opacity="0.65">attestation</text>
-
-          <rect x="774" y="60" width="66" height="70" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"></rect>
-          <text x="807" y="90" text-anchor="middle" font-size="10" fill="currentColor">Client</text>
-          <text x="807" y="103" text-anchor="middle" font-size="9" fill="currentColor" opacity="0.65">.pop()</text>
-          <text x="807" y="115" text-anchor="middle" font-size="9" fill="currentColor" opacity="0.65">.dpop()</text>
-        </svg>
-      </div>
-      <figcaption>
-        <strong>The inverse of the builder.</strong> No attester key lives in the client at all — the AS
-        mints an attestation bound to the workload's own instance key, and the result is presented exactly
-        like a self-built one, via the same symmetric <code>.pop()</code> / <code>.dpop()</code> pair.
-      </figcaption>
-    </figure>
+    <ol class="steps">
+      <li>The SDK obtains identity evidence from the application's platform.</li>
+      <li>The attester checks the evidence and issues a Client Attestation linked to the application's key.</li>
+      <li>The application signs a fresh proof with its private key when it requests an access token.</li>
+      <li>The application sends the access token to the protected service. That service checks the token against its access rules.</li>
+    </ol>
   </section>
 
   <section id="features">
-    <div class="section-head">
-      <h2>Feature support</h2>
-      <span class="section-num">02</span>
+    <div class="section-head"><h2>What the SDK does</h2><span class="section-num">03</span></div>
+    <p class="section-dek">Developers can use it in Go, Java, Python and TypeScript. Some features are available only in Python.</p>
+    <div class="std-grid">
+      <div class="std-card"><h3>Requests access tokens</h3><p>Handles identity checks and token requests. Reuses tokens until they need refreshing.</p></div>
+      <div class="std-card"><h3>Proves possession of a key</h3><p>Signs a fresh proof for the Authorization Server to check. Copying the Client Attestation alone does not provide this proof.</p></div>
+      <div class="std-card"><h3>Checks incoming access tokens</h3><p>Checks who issued a token, whether it has expired, which service it is for and which permissions it carries.</p></div>
+      <div class="std-card"><h3>Handles requests for human approval</h3><p>The Python version can handle an approval request through a paired device or a web consent link. Your team supplies the approval application and records the decision.</p></div>
     </div>
-    <p class="section-dek">
-      All four ports share the request-time core. Evidence sources and the authorization-challenge package
-      are where the fleet still diverges by design or by sequencing.
-    </p>
-
-    <div class="table-scroll">
-      <table class="matrix">
-        <thead>
-          <tr><th>Capability</th><th>Go</th><th>Java</th><th>Python</th><th>TypeScript</th></tr>
-        </thead>
-        <tbody>
-          <!-- features:begin -->
-          <tr class="cap-row"><td>One-call token source</td>
+    <details>
+      <summary>Compare features by programming language</summary>
+      <p class="diagram-note">
+        Proof of possession means proving that the application holds the private key linked to its attestation.
+        DPoP (Demonstrating Proof of Possession) is a standard for signing proofs for individual requests.
+        JWT (JSON Web Token) is a format for carrying claims in a token.
+        A challenge is a value from the server that the application must include in its proof.
+        SPIFFE is a standard for identifying software services.
+      </p>
+      <div class="table-scroll">
+        <table class="matrix">
+          <caption>Feature availability in each language</caption>
+          <thead><tr><th scope="col">Capability</th><th scope="col">Go</th><th scope="col">Java</th><th scope="col">Python</th><th scope="col">TypeScript</th></tr></thead>
+          <tbody>
+<!-- features:begin -->
+          <tr class="cap-row"><td>Request and refresh access tokens automatically</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>DPoP-combined mode</td>
+          <tr class="cap-row"><td>Use DPoP for client authentication (DPoP-combined mode)</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>DPoP-bound tokens at a resource</td>
+          <tr class="cap-row"><td>Use DPoP to prove key possession when calling a service</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Fail-closed defaults</td>
+          <tr class="cap-row"><td>Stop when required security checks fail (fail-closed defaults)</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Name the operator on the one-call class</td>
+          <tr class="cap-row"><td>Name the responsible person or organisation when requesting access</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Drop the token-endpoint challenge</td>
+          <tr class="cap-row"><td>Omit the token-request challenge where the identity service allows it</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Logging hooks</td>
+          <tr class="cap-row"><td>Record SDK events without logging credentials</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Attester profiles</td>
+          <tr class="cap-row"><td>Configure the connection to an attestation issuer (attester profiles)</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Trace every call as curl</td>
+          <tr class="cap-row"><td>Show requests as curl commands for troubleshooting</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
-          <tr class="cap-row"><td>Asserted context at mint</td>
+          <tr class="cap-row"><td>Send extra context for the attestation issuer to check</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
-          <tr class="cap-row"><td>Client Attestation builder</td>
+          <tr class="cap-row"><td>Create a Client Attestation</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>PoP JWT and DPoP proof builders</td>
+          <tr class="cap-row"><td>Create proof-of-possession JWTs and DPoP proofs</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>ES, RS and PS keys at 256, 384 and 512</td>
+          <tr class="cap-row"><td>Choose the digital signature algorithm</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td><code>operator</code> claim on the builder</td>
+          <tr class="cap-row"><td>Include the responsible person or organisation in a Client Attestation</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td><code>workload</code> and <code>authorization_details</code> claims</td>
+          <tr class="cap-row"><td>Include application details and requested permissions in a Client Attestation</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>External signer</td>
+          <tr class="cap-row"><td>Sign with a key held in OpenBao or HashiCorp Vault</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Evidence auto-detect</td>
+          <tr class="cap-row"><td>Find available platform identity evidence automatically</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Azure IMDS evidence</td>
+          <tr class="cap-row"><td>Use identity evidence from Microsoft Azure</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
-          <tr class="cap-row"><td>AWS web-identity evidence</td>
+          <tr class="cap-row"><td>Use web-identity evidence from AWS</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
-          <tr class="cap-row"><td>SPIFFE issuance bootstrap</td>
+          <tr class="cap-row"><td>Obtain a Client Attestation using SPIFFE platform identity</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Token validator</td>
+          <tr class="cap-row"><td>Check incoming access tokens</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>MCP and A2A protected-resource helper</td>
+          <tr class="cap-row"><td>Add access checks to Model Context Protocol (MCP) and Agent2Agent (A2A) services</td>
             <td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td></tr>
-          <tr class="cap-row"><td>Authorization-server metadata discovery</td>
+          <tr class="cap-row"><td>Find the Authorization Server configuration automatically</td>
             <td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
-          <tr class="cap-row"><td>Challenge handling</td>
+          <tr class="cap-row"><td>Handle requests for further authentication or human approval</td>
             <td><span class="chip no"></span></td><td><span class="chip no"></span></td><td><span class="chip yes">Yes</span></td><td><span class="chip no"></span></td></tr>
 <!-- features:end -->
-        </tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="standards">
-    <div class="section-head">
-      <h2>Standards supported</h2>
-      <span class="section-num">03</span>
-    </div>
-    <p class="section-dek">
-      Grouped by what each one governs, not by where it's implemented.
-    </p>
-    <div class="std-grid">
-      <div class="std-card">
-        <h3>Attestation &amp; possession</h3>
-        <ul>
-          <li><span class="std-tag">ABCA</span><span class="desc">draft-ietf-oauth-attestation-based-client-auth — the attestation JWT, PoP JWT, and <code>attest_jwt_client_auth</code></span></li>
-          <li><span class="std-tag">RFC 9449</span><span class="desc">DPoP — the combined proof-of-possession mode</span></li>
-          <li><span class="std-tag">RFC 7638</span><span class="desc">JWK Thumbprint — every <code>kid</code> in this SDK</span></li>
-        </ul>
+          </tbody>
+        </table>
       </div>
-      <div class="std-card">
-        <h3>Authorization</h3>
-        <ul>
-          <li><span class="std-tag">RFC 9396</span><span class="desc">Rich Authorization Requests — <code>authorization_details</code></span></li>
-          <li><span class="std-tag">RFC 8693</span><span class="desc">Token Exchange — the <code>may_act</code> shape behind the <code>operator</code> claim</span></li>
-          <li><span class="std-tag">RFC 9470</span><span class="desc">Step-Up Authentication Challenge — <code>resource_authorisation</code></span></li>
-        </ul>
-      </div>
-      <div class="std-card">
-        <h3>Resource server</h3>
-        <ul>
-          <li><span class="std-tag">RFC 6750</span><span class="desc">Bearer Token Usage — extraction and challenge headers</span></li>
-          <li><span class="std-tag">RFC 9728</span><span class="desc">Protected Resource Metadata — served at <code>/.well-known/oauth-protected-resource</code></span></li>
-          <li><span class="std-tag">RFC 8707</span><span class="desc">Resource Indicators — binds a token to the resource that validates it</span></li>
-          <li><span class="std-tag">RFC 7662</span><span class="desc">Token Introspection — opaque-token / revocation checks</span></li>
-        </ul>
-      </div>
-      <div class="std-card">
-        <h3>Identity bootstrap &amp; ceremonies</h3>
-        <ul>
-          <li><span class="std-tag">SPIFFE</span><span class="desc">Workload API + JWT-SVID — the input to attestation issuance</span></li>
-          <li><span class="std-tag">CIBA</span><span class="desc">OpenID back-channel authentication — the push a <code>CibaResolver</code> polls (Python)</span></li>
-        </ul>
-      </div>
-    </div>
+    </details>
   </section>
 
   <section id="contract">
-    <div class="section-head">
-      <h2>Wire contract</h2>
-      <span class="section-num">04</span>
-    </div>
+    <div class="section-head"><h2>Your company controls access</h2><span class="section-num">04</span></div>
     <p class="section-dek">
-      All four ports emit these shapes byte-for-byte identically. ES256; <code>iat</code>/<code>exp</code> are integer epoch seconds.
+      A verified application identity is one input to an access decision.
+      Your services enforce the permissions your company grants.
     </p>
-    <div class="table-scroll">
-      <table class="contract">
-        <thead><tr><th>Artifact</th><th><code>typ</code></th><th>Key in header</th><th>Key claims</th></tr></thead>
-        <tbody>
-          <tr>
-            <td>Attestation</td>
-            <td class="typ">oauth-client-attestation+jwt</td>
-            <td class="key">kid (attester)</td>
-            <td class="claims"><b>iss, sub, iat, exp, cnf.jwk</b> (instance pub, +kid)</td>
-          </tr>
-          <tr>
-            <td>PoP</td>
-            <td class="typ">oauth-client-attestation-pop+jwt</td>
-            <td class="key">kid (instance)</td>
-            <td class="claims"><b>aud, jti, iat</b> (+ optional iss, challenge)</td>
-          </tr>
-          <tr>
-            <td>DPoP</td>
-            <td class="typ">dpop+jwt</td>
-            <td class="key">jwk (instance pub, −kid)</td>
-            <td class="claims"><b>htm, htu, jti, iat</b> (+ optional nonce)</td>
-          </tr>
-        </tbody>
-      </table>
+    <div class="layer-list">
+      <div class="layer"><div class="name">Identity</div><p>The Client Attestation identifies the application. It can also name the person or organisation responsible for running it. Naming that operator does not grant permission.</p></div>
+      <div class="layer"><div class="name">Permissions</div><p>An application can request specific permissions. The service issuing the token decides which permissions to grant. The protected service checks whether they allow the requested action.</p></div>
+      <div class="layer"><div class="name">Key protection</div><p>The application still needs a private key. The SDK supports signing Client Attestations with a key held in OpenBao or HashiCorp Vault.</p></div>
+      <div class="layer"><div class="name">Human approval</div><p>Your access rules decide when a person must approve an action. The Python version includes a check that developers can use to confirm a retried request matches the approved instruction.</p></div>
     </div>
   </section>
 
   <section id="tests">
-    <div class="section-head">
-      <h2>Test coverage</h2>
-      <span class="section-num">05</span>
-    </div>
-    <p class="section-dek">
-      Two layers, deliberately different in scope — cross-language agreement on the low-level builder shapes,
-      and per-language unit coverage of everything the orchestration class decides on its own.
-    </p>
-
+    <div class="section-head"><h2>What the checks cover</h2><span class="section-num">05</span></div>
+    <p class="section-dek">The repository includes checks for compatibility between languages and for errors within each version.</p>
     <div class="layer-list">
-      <div class="layer">
-        <div class="name">Cross-language</div>
-        <p>
-          <code>verify-interop.sh</code> builds a credential in every language from one shared vector and
-          runs each through the real Java <code>ClientAttestationVerifier</code>, in both PoP and DPoP modes.
-          <code>verify-validation.sh</code> has every port's validator agree on the same pre-signed token
-          vectors — valid, expired, wrong issuer/audience, missing scope, bad signature.
-        </p>
-      </div>
-      <div class="layer">
-        <div class="name">Per-language</div>
-        <p>
-          Each suite covers what the shared vectors can't reach: evidence auto-detect precedence, signer and
-          network failures, malformed tokens, and that a fetched challenge actually
-          lands in the token-endpoint PoP JWT's <code>challenge</code> claim or the DPoP proof's
-          <code>nonce</code> claim, in both the one-call flow and the SPIFFE issuance bootstrap.
-        </p>
-      </div>
+      <div class="layer"><div class="name">Compatibility</div><p>Shared examples check that credentials made in each language are accepted by the same Java verifier. Other examples check that all four versions agree when accepting or rejecting access tokens.</p></div>
+      <div class="layer"><div class="name">Error handling</div><p>Each language has tests for failures such as invalid tokens and network errors. These tests also cover how the SDK uses identity evidence and responds to requests for a fresh proof.</p></div>
     </div>
+    <p class="diagram-note">These checks cover the SDK and shared examples. Your team needs to test its own identity service, access rules and application together.</p>
+  </section>
 
-    <div class="stat-grid">
-      <div class="stat"><div class="lang">Go</div><div class="count">89<small>tests</small></div></div>
-      <div class="stat"><div class="lang">Java</div><div class="count">80<small>tests</small></div></div>
-      <div class="stat"><div class="lang">Python</div><div class="count">151<small>tests</small></div></div>
-      <div class="stat"><div class="lang">TypeScript</div><div class="count">90<small>tests</small></div></div>
-    </div>
-
-    <div class="gate-row">
-      <span class="gate"><span class="dot"></span>Interop — every port accepted by the AS</span>
-      <span class="gate"><span class="dot"></span>Validation — all ports agree on every case</span>
-    </div>
-    <div class="asof">as verified · 2026-09-27</div>
+  <section id="standards">
+    <div class="section-head"><h2>Uses OAuth standards</h2><span class="section-num">06</span></div>
+    <p class="section-dek">
+      OAuth is a set of standards for granting applications access to protected services.
+      This SDK implements revision 10 of the OAuth attestation-based client authentication draft.
+      The specification is still a draft.
+    </p>
+    <p>
+      The default integration uses PingFederate.
+      Connecting to another identity service requires configuration or integration code.
+      The <a href="../README.md">developer documentation</a> lists the standards and supported features.
+    </p>
   </section>
 
   <section id="layout">
-    <div class="section-head">
-      <h2>Repo layout</h2>
-      <span class="section-num">06</span>
-    </div>
-    <p class="section-dek">Four ports, plus what keeps them honest with each other.</p>
-    <pre class="tree"><span class="path">go/</span>           <span class="desc">builder package + tokenvalidator/                    (lestrrat-go/jwx)</span>
-<span class="path">java/</span>         <span class="desc">builder + one-call client + tokenvalidator           (jose4j)</span>
-<span class="path">python/</span>       <span class="desc">client_attestation_sdk (+ .token_validator, .authz_challenge)  (PyJWT + cryptography)</span>
-<span class="path">typescript/</span>   <span class="desc">src/ builder + src/validator/                        (panva jose; Node 20+ or edge)</span>
-<span class="path">vectors/</span>      <span class="desc">client-builder shared vectors + outputs</span>
-<span class="path">validation/</span>   <span class="desc">token-validator + challenge-parser shared vectors + agreement checker</span>
-<span class="path">interop/</span>      <span class="desc">Java cross-language verifier (builder side)</span></pre>
+    <div class="section-head"><h2>What your team needs</h2><span class="section-num">07</span></div>
+    <p class="section-dek">Your developers add the SDK to the application and connect it to your identity and access services.</p>
+    <ul class="steps">
+      <li>A supported source of application identity evidence from the platform where it runs.</li>
+      <li>An attester that issues Client Attestations and an Authorization Server that accepts them.</li>
+      <li>Access rules for the systems and actions the application can use.</li>
+      <li>A way to protect the private keys used by the application and the attestation issuer.</li>
+    </ul>
+    <p>
+      Your identity and security team can confirm whether your existing services support this flow.
+      Developers can find installation instructions in the
+      <a href="../README.md">repository README</a>.
+    </p>
   </section>
 
   <footer>
     <p>
-      Generated from the current state of <code>client-attestation-sdk</code>. The AS-side
-      verifier that accepts every artifact shown here is a separate project,
-      <a href="https://github.com/dphhyland/client-attestation">client-attestation</a>.
+      Client Attestation SDK provides application code in four languages.
+      The Java verifier used for compatibility checks is in the separate
+      <a href="https://github.com/dphhyland/client-attestation">client-attestation project</a>.
     </p>
   </footer>
-
-</div>
+</main>
 </body>
 </html>

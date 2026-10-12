@@ -10,7 +10,7 @@ from the identity its runtime already gives it (auto-detected; see `evidence.py`
 
     from client_attestation_sdk import ClientAttestation
 
-    ca = ClientAttestation("pf.example.com")
+    ca = ClientAttestation("pf.example.com", evidence_audience="https://attester.example.com/evidence")
     token = ca.token()                                   # access token, cached until it nears expiry
 
     import requests
@@ -24,18 +24,20 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import re
 import shlex
 import threading
 import time
 import urllib.parse
+import zlib
 
 from . import _http, _log
 from .attester import AttesterMetadata, AttesterProfile, MintRequest, PingFederateProfile
 from ._redact import PRIVATE_JWK_MEMBERS as _PRIVATE_JWK_MEMBERS  # noqa: F401 - kept importable
 from ._redact import SECRET_FIELDS as _SECRET_FIELDS  # noqa: F401 - kept importable
 from ._redact import redact_json as _redact_json, redacted as _redacted
-from .builders import DpopProofBuilder, PopBuilder, _url_origin as _origin
+from .builders import DpopProofBuilder, PopBuilder, _check_htu, _normalize_htu, _url_origin as _origin
 from .errors import ClientAttestationError, TransportError  # noqa: F401 - re-exported
 from .evidence import auto_detect_evidence
 from .keys import SigningKeyPair
@@ -50,13 +52,23 @@ WELL_KNOWN_PATH = PingFederateProfile.WELL_KNOWN_PATH
 # Refresh this many seconds before the token actually expires, so a token is never used at the edge.
 DEFAULT_EXPIRY_SKEW_SECONDS = 30
 DPOP_NONCE_HEADER = "DPoP-Nonce"
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# A token is cached for at most this long (seconds), whatever `expires_in` the token endpoint gives.
+_MAX_TOKEN_LIFETIME = 24 * 60 * 60
+# At most this much of a 400 body is read to look for `use_dpop_nonce`; a longer body is not a challenge.
+_MAX_NONCE_CHALLENGE_BODY = 64 * 1024
+# RFC 9449 nonces are short opaque strings: a longer `DPoP-Nonce` is ignored, as if there were none.
+_MAX_DPOP_NONCE_LENGTH = 1024
+# At most this many origins' nonces are remembered; a new origin over the cap replaces the one stored
+# longest ago (it costs that origin one challenge).
+_MAX_DPOP_NONCE_ORIGINS = 256
 # What the https check calls the URL a profile's call goes to, by step.
 _STEP_LABELS = {"discover": "attester_url", "mint": "attestation_endpoint", "challenge": "challenge_endpoint"}
 
 # Trace redaction (see `trace_redact`): header names whose values are credentials. The JSON/form members
 # and private JWK members live in `_redact`, shared with the loggers.
 _SECRET_HEADERS = frozenset(h.lower() for h in ("Authorization", DPOP_HEADER, ATTESTATION_HEADER, POP_HEADER))
+_PIN_REQUIRED = ("evidence_audience is required: set it to the audience your attester expects the workload's "
+                 "identity token for, so the attester's discovery document can't choose it")
 
 # Logs the flow's lifecycle (docs/logging.md). Silent unless the application configures logging.
 _logger = _log.get("token_source")
@@ -81,7 +93,7 @@ class ClientAttestation:
         authorization_details: optional RFC 9396 access request sent at mint time; the attester grants
             at most what the workload is entitled to.
         algorithm: instance-key signature algorithm (default ES256).
-        expiry_skew_seconds: refresh this long before the token expires.
+        expiry_skew_seconds: refresh this long before the token expires (finite, not negative).
         timeout: per-request HTTP timeout in seconds.
         pop_method: how the instance key proves possession at the token endpoint.
             `"attestation_pop_jwt"` (default) sends a Client Attestation PoP JWT under the
@@ -106,7 +118,8 @@ class ClientAttestation:
         trace_redact: with a `trace`, replace every credential in a record with `<redacted:N bytes>`
             (default `True`): the Authorization, DPoP, OAuth-Client-Attestation and
             OAuth-Client-Attestation-PoP header values, the svid/proof/assertion members (and any
-            private JWK members) of a request body, and the `value` and `jwt` keys. `False` records
+            private JWK members) of a request body, any other body value that looks like a JWT (so a
+            custom profile's own member names are covered), and the `value` and `jwt` keys. `False` records
             them verbatim — for local debugging only; a trace kept that way holds live credentials.
         require_challenge: when the discovery document advertises a `challenge_endpoint` and the
             challenge cannot be fetched (network, HTTP status, bad JSON, no `attestation_challenge`),
@@ -114,6 +127,13 @@ class ClientAttestation:
             minting without a challenge. No advertised endpoint means no challenge and no error.
         allow_insecure: allow plain-http `attester_url` and discovery endpoints for non-loopback hosts
             (default `False`). Loopback (`localhost`, `127.0.0.1`, `::1`) is always allowed.
+        evidence_audience: the audience the workload's platform identity token is requested for, which
+            the attester's discovery document must name. Required unless `metadata` is given: every
+            evidence source (GCP, AWS, Azure, SPIRE) fetches a token for whatever audience it is asked
+            for, so without a pin an attester could have the workload mint a token for another service
+            that trusts it. A missing pin or a different discovered audience raises
+            `ClientAttestationError` before any evidence is fetched. With static `metadata`, the pin is
+            optional and, when given, must match `metadata.evidence_audience`.
     """
 
     def __init__(self, attester_url: str = None, *, evidence: SvidSource = None,
@@ -124,7 +144,12 @@ class ClientAttestation:
                  challenge_at_token: bool = True,
                  trace: list = None, trace_redact: bool = True,
                  require_challenge: bool = True, allow_insecure: bool = False,
-                 profile: AttesterProfile = None, metadata: AttesterMetadata = None):
+                 profile: AttesterProfile = None, metadata: AttesterMetadata = None,
+                 evidence_audience: str = None):
+        if isinstance(expiry_skew_seconds, bool) or not isinstance(expiry_skew_seconds, (int, float)) \
+                or not math.isfinite(expiry_skew_seconds) or expiry_skew_seconds < 0:
+            raise ValueError("expiry_skew_seconds must be a finite number, not negative: "
+                             f"{expiry_skew_seconds!r}")
         self._profile = profile if profile is not None else PingFederateProfile()
         self._allow_insecure = allow_insecure
         if attester_url is None and (metadata is not None or profile is not None):
@@ -133,6 +158,8 @@ class ClientAttestation:
             self.base_url = _normalize_base_url(attester_url)
             _require_https(self.base_url, "attester_url", allow_insecure)
         self._metadata = metadata
+        self._static_metadata = metadata is not None
+        self._evidence_audience = evidence_audience
         self._evidence = evidence
         self._authorization_details = authorization_details
         self._operator = operator
@@ -149,9 +176,9 @@ class ClientAttestation:
         self._cached_token = None
         self._token_type = "Bearer"
         self._token_key = None   # the instance key the cached token is bound to (cnf); same lock
-        self._expires_at = 0.0
+        self._expires_at = 0.0   # time.monotonic() deadline; a wall-clock step cannot extend it
         self._nonce_lock = threading.Lock()
-        self._dpop_nonces = {}   # origin -> last DPoP-Nonce that origin returned
+        self._dpop_nonces = {}   # origin -> last DPoP-Nonce that origin returned, oldest first
 
     # ── public API ────────────────────────────────────────────────────────────────────────────────
     def token(self, *, force_refresh: bool = False, asserted_context: dict = None) -> str:
@@ -171,7 +198,7 @@ class ClientAttestation:
         """`(access_token, token_type, instance_key)`, read or minted together under one lock so a
         DPoP-bound token is never paired with a key other than the one it was bound to."""
         with self._lock:
-            now = time.time()
+            now = time.monotonic()
             if asserted_context is None and not force_refresh \
                     and self._cached_token and now < self._expires_at:
                 _log.emit(_logger, logging.DEBUG, "token.cache_hit", expires_in=int(self._expires_at - now))
@@ -183,11 +210,12 @@ class ClientAttestation:
             access_token = response["access_token"]
             token_type = _token_type(response)
             if asserted_context is None:
+                lifetime = _token_lifetime(response.get("expires_in"))
+                expires_at = time.monotonic() + lifetime - self._skew if lifetime is not None else 0.0
                 self._cached_token = access_token
                 self._token_type = token_type
                 self._token_key = instance_key
-                expires_in = response.get("expires_in")
-                self._expires_at = time.time() + (float(expires_in) - self._skew) if expires_in else 0.0
+                self._expires_at = expires_at
             return access_token, token_type, instance_key
 
     def authorization_header(self, *, force_refresh: bool = False) -> dict:
@@ -208,12 +236,42 @@ class ClientAttestation:
           fresh for this call, signed by the instance key the token is bound to, and carries `htm`,
           `htu` (the URL without query or fragment), `ath` and the last `DPoP-Nonce` the URL's origin
           returned, if any.
+
+        `url` must be https, like every other URL the client sends a credential to (loopback hosts
+        and `allow_insecure=True` excepted).
+
+        Pass the exact URL your HTTP client sends (after any normalisation it does): the proof is only
+        valid for the `htu` it names. A URL with a backslash, ASCII whitespace or a control character
+        before its query or fragment raises `ClientAttestationError`, because parsers disagree on where
+        it goes - `requests` sends `https://evil.example\\@as.example/t` to evil.example, but its `htu`
+        would name as.example. For a DPoP-bound token, so does a URL that is not an absolute http(s) URL
+        with a valid ASCII host, port and path (the rule is in vectors/README.md); with
+        `pop_method="dpop_combined"` that is checked before the token is fetched. `requests_auth()` and
+        `httpx_auth()` use the prepared URL for you.
         """
+        return self._request_headers(method, url)
+
+    def _request_headers(self, method: str, url: str, nonce=None) -> dict:
+        """:meth:`request_headers`, with the proof carrying `nonce` when given (the nonce of the
+        challenge being answered) instead of the origin's remembered one."""
+        _require_https(url, "resource URL", self._allow_insecure)
+        # A client configured for DPoP checks the whole htu before fetching the token, so a URL with no
+        # htu never costs a mint and token request on a cold cache. Otherwise only what parsers disagree
+        # on is refused up front: a Bearer token carries no htu.
+        check = _normalize_htu if self._pop_method == "dpop_combined" else _check_htu
+        try:
+            check(url)
+        except ValueError as error:
+            raise ClientAttestationError(str(error)) from None
         access_token, token_type, instance_key = self._token_state()
         if token_type != "DPoP":
             return {"Authorization": f"{token_type} {access_token}"}
+        try:   # also for a DPoP token from a client not configured for DPoP (the AS chose the type)
+            _normalize_htu(url)
+        except ValueError as error:
+            raise ClientAttestationError(str(error)) from None
         proof = (DpopProofBuilder(instance_key).method(method).uri(url).access_token(access_token)
-                 .nonce(self._nonce_for(url)).build())
+                 .nonce(nonce if nonce is not None else self._nonce_for(url)).build())
         return {"Authorization": "DPoP " + access_token, DPOP_HEADER: proof}
 
     def requests_auth(self):
@@ -222,7 +280,15 @@ class ClientAttestation:
         For a DPoP-bound token it also attaches a fresh proof, and when the resource answers with a
         DPoP nonce challenge (`use_dpop_nonce` plus a `DPoP-Nonce` header) it remembers the nonce and
         re-sends the request once with a proof carrying it. A request whose body cannot be replayed
-        (a stream or generator) is not re-sent."""
+        (a stream or generator) is not re-sent. At most 64 KiB of a 400 body is read to look for the
+        challenge (a longer body is not one), and the response still hands back the whole body.
+
+        For a DPoP-bound token, the token and proof never follow a redirect. Once a response comes
+        back, the hook takes `Authorization` and `DPoP` off the request that `requests` copies to build
+        each redirect hop, including after a nonce retry. The hook does nothing (no retry, no nonce
+        memory) for a response from any origin other than the one the request was sent to. For a
+        Bearer token no hook is registered, and `requests` applies its own rule: it drops
+        `Authorization` when a redirect changes the host, but keeps it on a same-host hop."""
         source = self
 
         class _Auth:
@@ -230,21 +296,40 @@ class ClientAttestation:
                 headers = source.request_headers(request.method, request.url)
                 request.headers.update(headers)
                 if DPOP_HEADER in headers:
-                    request.register_hook("response", self._on_response)
+                    origin = _origin(request.url)
+                    request.register_hook("response", lambda response, **kwargs:
+                                          self._on_response(response, origin, **kwargs))
                 return request
 
-            def _on_response(self, response, **kwargs):
-                nonce = source._observe_response(response.request.url, response.status_code,
-                                                 response.headers, lambda: response.content)
-                if nonce is None or not _replayable(response.request.body):
+            def _on_response(self, response, origin, **kwargs):
+                # requests copies this request (headers and hooks) for each redirect hop, and it only
+                # drops Authorization when the host changes. The hook therefore also runs on every hop,
+                # so it must leave a response from another origin alone. A nonce retry there would sign
+                # a proof for the redirect target and attach the token to it.
+                request = response.request
+                if _origin(request.url) != origin or DPOP_HEADER not in request.headers:
+                    _strip_credentials(request)
                     return response
-                _log_nonce_retry(response.request.url, response.status_code, "resource")
-                retry = response.request.copy()
+                nonce = None
+                if not response.is_redirect:
+                    nonce = source._observe_response(request.url, response.status_code,
+                                                     response.headers,
+                                                     lambda: _requests_body(response))
+                if nonce is None or not _replayable(request.body):
+                    _strip_credentials(request)
+                    return response
+                _log_nonce_retry(request.url, response.status_code, "resource")
+                retry = request.copy()
                 retry.hooks = {"response": []}
-                retry.headers.update(source.request_headers(retry.method, retry.url))
+                # Answer this challenge with its own nonce, not one a concurrent response stored since.
+                retry.headers.update(source._request_headers(retry.method, retry.url, nonce))
+                # Session.send builds any redirect hop from the ORIGINAL request, even when this hook
+                # returns the retry's response. Take the credentials off both before handing it back.
+                _strip_credentials(request)
                 response.content  # drain, so the connection can be reused  # noqa: B018
                 response.close()
                 second = response.connection.send(retry, **kwargs)
+                _strip_credentials(retry)
                 second.history.append(response)
                 second.request = retry
                 return second
@@ -254,7 +339,13 @@ class ClientAttestation:
     def httpx_auth(self):
         """An `httpx.Auth` that attaches the token (and refreshes it) on every call. For a DPoP-bound
         token it behaves as :meth:`requests_auth` does: fresh proof per request, one re-send on a DPoP
-        nonce challenge (only when the request body is in memory)."""
+        nonce challenge (only when the request body is in memory). A 400 body is looked at only with a
+        sync client; with an async one only a 401 challenge is retried. With `follow_redirects=True`, a
+        response whose redirect chain left the request's origin is never answered with a retry, and its
+        `DPoP-Nonce` is not remembered. httpx follows redirects itself, after this auth has attached the
+        headers, so it cannot strip them per hop. httpx drops Authorization on a cross-origin redirect
+        but forwards the original DPoP proof (signed for the original URL), so leave `follow_redirects`
+        off (the httpx default) with this auth."""
         import httpx  # imported lazily so httpx is not a hard dependency
 
         source = self
@@ -267,12 +358,15 @@ class ClientAttestation:
                 response = yield request
                 if DPOP_HEADER not in headers:
                     return
+                if response.history and any(_origin(str(hop.url)) != _origin(url)
+                                            for hop in (*response.history, response)):
+                    return
                 nonce = source._observe_response(url, response.status_code, response.headers,
                                                  lambda: _httpx_body(response))
                 if nonce is None or not isinstance(request.stream, httpx.ByteStream):
                     return
                 _log_nonce_retry(url, response.status_code, "resource")
-                request.headers.update(source.request_headers(request.method, url))
+                request.headers.update(source._request_headers(request.method, url, nonce))
                 yield request
 
         return _Auth()
@@ -283,14 +377,21 @@ class ClientAttestation:
             return self._dpop_nonces.get(_origin(url))
 
     def _remember_nonce(self, url: str, nonce: str) -> None:
+        """Store `nonce` as the origin's latest, forgetting the origin stored longest ago when a new
+        one would go over `_MAX_DPOP_NONCE_ORIGINS`."""
+        key = _origin(url)
         with self._nonce_lock:
-            self._dpop_nonces[_origin(url)] = nonce
+            self._dpop_nonces.pop(key, None)
+            if len(self._dpop_nonces) >= _MAX_DPOP_NONCE_ORIGINS:
+                del self._dpop_nonces[next(iter(self._dpop_nonces))]
+            self._dpop_nonces[key] = nonce
 
     def _observe_response(self, url: str, status: int, headers, body) -> "str | None":
         """Remember any `DPoP-Nonce` the response carries; return it when the response is a nonce
-        challenge (a request worth re-sending with a proof that carries it), else None."""
+        challenge (a request worth re-sending with a proof that carries it), else None. A nonce longer
+        than `_MAX_DPOP_NONCE_LENGTH` is ignored."""
         nonce = headers.get(DPOP_NONCE_HEADER)
-        if not nonce:
+        if not nonce or len(nonce) > _MAX_DPOP_NONCE_LENGTH:
             return None
         self._remember_nonce(url, nonce)
         return nonce if _is_nonce_challenge(status, headers, body) else None
@@ -355,10 +456,16 @@ class ClientAttestation:
     # ── the flow ──────────────────────────────────────────────────────────────────────────────────
     def _run_flow(self, *, asserted_context: dict = None):
         """Run the flow once; returns `(token_response, instance_key)`."""
+        if not self._evidence_audience and not self._static_metadata:
+            raise ClientAttestationError(_PIN_REQUIRED)
         meta = self.attester_metadata()
         audience = meta.evidence_audience
         if not audience:
             raise ClientAttestationError("attester discovery document has no evidence_audience")
+        if self._evidence_audience and audience != self._evidence_audience:
+            raise ClientAttestationError(
+                f"the attester asks for evidence for {audience!r}, but evidence_audience is "
+                f"{self._evidence_audience!r}")
 
         evidence_source = self._evidence or auto_detect_evidence()
         svid = evidence_source.fetch(audience)
@@ -411,10 +518,10 @@ class ClientAttestation:
 
         response = self._call_token_endpoint(token_endpoint, attestation, proof, proof_header,
                                              operator=self._operator, retry_proof=retry_proof)
-        expires_in = response.get("expires_in")
+        lifetime = _token_lifetime(response.get("expires_in"))
         _log.emit(_logger, logging.INFO, "token.obtained", host=_log.host(token_endpoint), client_id=client_id,
-                  token_type=_token_type(response), expires_in=_int_or_none(expires_in),
-                  pop_method=self._pop_method)
+                  token_type=_token_type(response),
+                  expires_in=int(lifetime) if lifetime is not None else None, pop_method=self._pop_method)
         return response, instance_key
 
     def _fetch_challenge(self, endpoint):
@@ -468,7 +575,8 @@ class ClientAttestation:
                 response = self._send("token", "POST", endpoint, headers, form)
         parsed = self._json_ok("token", "POST", endpoint, response, "token endpoint")
         if "access_token" not in parsed:
-            raise ClientAttestationError("token endpoint returned no access_token", body=json.dumps(parsed))
+            # No body: a 2xx token response may hold the token under another name.
+            raise ClientAttestationError("token endpoint returned no access_token")
         self._annotate("jwt", parsed["access_token"])
         return parsed
 
@@ -509,18 +617,30 @@ def _normalize_base_url(attester_url: str) -> str:
     return host
 
 
-def _require_https(url: str, what: str, allow_insecure: bool) -> None:
-    """Credentials travel on every call, so endpoints must be https — except loopback (local fakes and
-    sidecars) or when the caller explicitly passed `allow_insecure=True`."""
-    parts = urllib.parse.urlsplit(url)
-    scheme = parts.scheme.lower()
-    if scheme == "https" or allow_insecure:
-        return
-    if scheme == "http" and (parts.hostname or "").lower() in _LOOPBACK_HOSTS:
-        return
-    raise ClientAttestationError(
-        f"{what} must use https: {url} (plain http is allowed only for loopback hosts, "
-        "or pass allow_insecure=True)")
+# Shared with the issuance client and the OpenBao signer.
+_require_https = _http.require_https
+
+
+_NUMERIC_STRING = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+def _token_lifetime(expires_in) -> "float | None":
+    """How long to cache a token, in seconds: `expires_in` as a JSON number, or a string of decimal
+    digits, capped at `_MAX_TOKEN_LIFETIME`. Anything else — missing, null, not a number, not finite, zero
+    or negative — is None, and the token is not cached, as with no `expires_in` at all."""
+    if isinstance(expires_in, bool):
+        return None
+    if isinstance(expires_in, str) and _NUMERIC_STRING.fullmatch(expires_in):
+        expires_in = float(expires_in)
+    if not isinstance(expires_in, (int, float)):
+        return None
+    try:
+        seconds = float(expires_in)
+    except OverflowError:  # an integer too large for a float: not finite, as the other ports read it
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, _MAX_TOKEN_LIFETIME)
 
 
 def _token_type(response: dict) -> str:
@@ -551,15 +671,136 @@ def _is_nonce_challenge(status: int, headers, body) -> bool:
     return False
 
 
+def _strip_credentials(request) -> None:
+    """Take the token and DPoP proof off a `requests` PreparedRequest that has already been sent, so a
+    redirect hop that `requests` copies from it carries neither."""
+    request.headers.pop("Authorization", None)
+    request.headers.pop(DPOP_HEADER, None)
+
+
 def _replayable(body) -> bool:
     return body is None or isinstance(body, (bytes, bytearray, str))
 
 
-def _httpx_body(response):
+def _requests_body(response):
+    """A `requests` response's body if it is at most `_MAX_NONCE_CHALLENGE_BODY` bytes, else None. Only
+    that much is read from the stream, and what was read is put back, so the caller still gets the whole
+    body."""
+    raw = getattr(response, "raw", None)
+    if getattr(response, "_content", False) is not False or raw is None:
+        return _capped(response.content)  # already in memory
+    head = b""
+    complete = False
+    error = None
     try:
-        return response.read()
-    except Exception:  # noqa: BLE001 - an async or already-closed stream: treat as no body
+        while len(head) <= _MAX_NONCE_CHALLENGE_BODY:
+            chunk = raw.read(_MAX_NONCE_CHALLENGE_BODY + 1 - len(head), decode_content=True)
+            if not chunk:
+                complete = True
+                break
+            head += chunk
+    except Exception as failure:  # noqa: BLE001 - a failed read: not a challenge
+        error = failure  # raised to the caller once it has read what came before it
+    if complete:
+        response._content, response._content_consumed = head, True  # what `requests` does on a full read
+        return head
+    response.raw = _ReplayedRaw(raw, head, error)
+    return None
+
+
+class _ReplayedRaw:
+    """A urllib3 response with its first bytes, already read (and decoded), put back in front. If reading
+    them failed, the failure is raised once those bytes have been handed back, as the read would have."""
+
+    def __init__(self, raw, head: bytes, error=None):
+        self._raw = raw
+        self._head = head
+        self._error = error
+
+    def _raise_pending(self):
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise error
+
+    def read(self, amt=None, *args, **kwargs):
+        if not self._head:
+            self._raise_pending()
+            return self._raw.read(amt, *args, **kwargs)
+        if amt is None:
+            self._raise_pending()  # a read of everything fails as a whole, as urllib3's own does
+            head, self._head = self._head, b""
+            return head + self._raw.read(None, *args, **kwargs)
+        head, self._head = self._head[:amt], self._head[amt:]
+        return head
+
+    def stream(self, amt=2 ** 16, decode_content=None):
+        if self._head:
+            head, self._head = self._head, b""
+            yield head
+        self._raise_pending()
+        yield from self._raw.stream(amt, decode_content=decode_content)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def _httpx_body(response):
+    """An `httpx` response's body if it is at most `_MAX_NONCE_CHALLENGE_BODY` bytes, else None. Only
+    that much is read from a sync stream, and what was read is put back, so the caller still gets the
+    whole body. An async stream is not read here (None)."""
+    import httpx
+
+    try:
+        return _capped(response.content)  # already in memory
+    except httpx.ResponseNotRead:
+        pass
+    stream = response.stream
+    if not isinstance(stream, httpx.SyncByteStream):
         return None
+    chunks = iter(stream)
+    head = b""
+    complete = False
+    error = None
+    try:
+        while len(head) <= _MAX_NONCE_CHALLENGE_BODY:
+            chunk = next(chunks, None)
+            if chunk is None:
+                complete = True
+                break
+            head += chunk
+    except Exception as failure:  # noqa: BLE001 - a failed read: not a challenge
+        error = failure  # raised to the caller after the bytes that came before it
+
+    class _Replayed(httpx.SyncByteStream):
+        def __iter__(self):
+            if head:
+                yield head
+            if error is not None:
+                raise error
+            yield from chunks
+
+        def close(self):
+            stream.close()
+
+    response.stream = _Replayed()
+    if not complete:
+        return None
+    # The stream is the body as sent: decode a gzip or deflate one, at most the cap; any other coding
+    # is not looked at.
+    coding = (response.headers.get("Content-Encoding") or "identity").strip().lower()
+    if coding == "identity":
+        return _capped(head)
+    if coding not in ("gzip", "x-gzip", "deflate"):
+        return None
+    try:
+        decoder = zlib.decompressobj(32 + zlib.MAX_WBITS)  # a gzip or zlib header
+        return _capped(decoder.decompress(head, _MAX_NONCE_CHALLENGE_BODY + 1))
+    except zlib.error:
+        return None
+
+
+def _capped(body):
+    return body if body is not None and len(body) <= _MAX_NONCE_CHALLENGE_BODY else None
 
 
 def _log_http_failed(step, method: str, url: str, error: TransportError) -> None:
@@ -569,13 +810,6 @@ def _log_http_failed(step, method: str, url: str, error: TransportError) -> None
 
 def _log_nonce_retry(url: str, status: int, at: str) -> None:
     _log.emit(_logger, logging.INFO, "dpop.nonce_retry", host=_log.host(url), status=status, at=at)
-
-
-def _int_or_none(value):
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _jwt_sub(compact_jwt: str) -> str:

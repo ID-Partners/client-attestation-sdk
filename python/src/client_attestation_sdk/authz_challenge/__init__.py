@@ -29,7 +29,7 @@ from .challenge import (
     Challenge, parse_challenge, parse_www_authenticate,
 )
 from .ciba import (
-    APPROVED, CIBA_GRANT, DENIED, EXPIRED, PENDING,
+    APPROVED, AUDIENCE_ENDPOINT, AUDIENCE_ISSUER, CIBA_GRANT, DENIED, EXPIRED, PENDING,
     CibaClient, CibaError, CibaRequest, ClientAuth, PrivateKeyJwtAuth,
     private_key_jwt_assertion,
 )
@@ -46,7 +46,7 @@ __all__ = [
     "AUTHN", "RESOURCE_AUTHORISATION", "CONSENT", "IDENTITY_PROOFING", "INTENT",
     # ciba
     "CibaClient", "CibaError", "CibaRequest", "ClientAuth", "PrivateKeyJwtAuth",
-    "private_key_jwt_assertion", "CIBA_GRANT",
+    "private_key_jwt_assertion", "CIBA_GRANT", "AUDIENCE_ISSUER", "AUDIENCE_ENDPOINT",
     "PENDING", "APPROVED", "DENIED", "EXPIRED",
     # resolver
     "ChallengeResolver", "CibaResolver", "WebConsentResolver", "ProofingResolver", "Hooks",
@@ -56,4 +56,4 @@ __all__ = [
     "CHANNEL_DEVICE", "CHANNEL_WEB", "CHANNEL_LOCAL",
     "ASSURANCE_DEVICE_APPROVED", "ASSURANCE_WEB_CONSENT",
 ]
-__version__ = "1.0.1"
+__version__ = "1.1.0"

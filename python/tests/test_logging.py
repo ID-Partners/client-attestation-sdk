@@ -5,6 +5,7 @@ message or attribute holds a JWT (`eyJ`), a challenge value, or private key mate
 import base64
 import json
 import logging
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,8 @@ import pytest
 
 from client_attestation_sdk import ClientAttestation, SigningKeyPair, StaticSvidSource, _http, _log
 from client_attestation_sdk.errors import TransportError
+
+AUD = "https://attester.example.com"  # the evidence_audience the fake attester's discovery document names
 
 ATTESTER_KEY = SigningKeyPair.generate("ES256")
 SVID = jwt.encode({"sub": "spiffe://example.org/workload", "aud": "https://attester.example.com"},
@@ -128,7 +131,8 @@ class _Adapter:
         import types
         raw = _http.request(request.method, request.url, headers=request.headers, body=request.body, timeout=2)
         response = types.SimpleNamespace(status_code=raw.status, headers=raw.headers, content=raw.body,
-                                         request=request, connection=self, history=[], close=lambda: None)
+                                         request=request, connection=self, history=[], close=lambda: None,
+                                         is_redirect=False)
         for hook in request.hooks["response"]:
             response = hook(response, **kwargs)
         return response
@@ -162,7 +166,7 @@ def test_silent_by_default():
 
 def test_full_flows_log_the_vocabulary_and_never_a_credential(server, capture):
     # Bearer (PoP JWT): initial, cache hit, forced refresh.
-    ca = ClientAttestation(server, evidence=StaticSvidSource(SVID), timeout=2)
+    ca = ClientAttestation(server, evidence=StaticSvidSource(SVID), evidence_audience=AUD, timeout=2)
     ca.token()
     ca.token()
     ca.token(force_refresh=True)
@@ -170,13 +174,13 @@ def test_full_flows_log_the_vocabulary_and_never_a_credential(server, capture):
 
     # DPoP combined: the AS demands its own nonce, then a resource does too.
     _Server.state["as_nonce"] = "as-n1"
-    dpop = ClientAttestation(server, evidence=StaticSvidSource(SVID), pop_method="dpop_combined", timeout=2)
+    dpop = ClientAttestation(server, evidence=StaticSvidSource(SVID), evidence_audience=AUD, pop_method="dpop_combined", timeout=2)
     auth = dpop.requests_auth()
     assert _Adapter().send(auth(_Request("POST", server + "/api?q=secret-query", b"x"))).status_code == 200
 
     # Challenge endpoint down with require_challenge=False, then a token endpoint that refuses.
     _Server.state.update(challenge_down=True, token_fails=True, as_nonce=None)
-    lax = ClientAttestation(server, evidence=StaticSvidSource(SVID), require_challenge=False, timeout=2)
+    lax = ClientAttestation(server, evidence=StaticSvidSource(SVID), evidence_audience=AUD, require_challenge=False, timeout=2)
     with pytest.raises(TransportError):
         lax.token()
 
@@ -203,7 +207,7 @@ def test_full_flows_log_the_vocabulary_and_never_a_credential(server, capture):
 
 
 def test_transport_failure_is_classified(capture):
-    ca = ClientAttestation("http://127.0.0.1:9", evidence=StaticSvidSource(SVID), timeout=1)
+    ca = ClientAttestation("http://127.0.0.1:9", evidence=StaticSvidSource(SVID), evidence_audience=AUD, timeout=1)
     with pytest.raises(TransportError):
         ca.token()
     failed = [r.attributes for r in capture.records if r.event == "http.failed"]
@@ -232,6 +236,65 @@ def test_emit_redacts_jwt_values_and_credential_keys(capture):
     assert "none" not in record.attributes
     assert record.getMessage().startswith('x.y leaked="<redacted:') and "flag=true" in record.getMessage()
     _assert_no_secrets(capture.dump(), "opaque")
+
+
+# Synthetic, built here so no scanner mistakes them for real ones.
+VAULT_TOKENS = tuple(prefix + "TESTONLY" * 3 + suffix for prefix in ("hvs.", "hvb.", "hvr.", "s.", "b.", "r.")
+                     for suffix in ("", "-_x9"))
+
+
+@pytest.mark.parametrize("key", ["auth_req_id", "code", "handle", "token", "secret", "password",
+                                 "assertion", "client_assertion", "vault_token", "x-vault-token",
+                                 "X-Vault-Token", "Authorization", "dpop", "private_key", "refresh_token",
+                                 "session_token", "api-token", "client_secret", "db_password"])
+def test_emit_redacts_any_value_under_a_credential_key(capture, key):
+    _log.emit(_log.get("test"), logging.INFO, "x.y", **{key: "opaque-value-123", "n": 7})
+    record = capture.records[-1]
+    assert record.attributes[key] == "<redacted:16 bytes>" and record.attributes["n"] == 7
+    _assert_no_secrets(capture.dump(), "opaque-value-123")
+
+
+@pytest.mark.parametrize("value", [*VAULT_TOKENS, *(f"X-Vault-Token: {t}" for t in VAULT_TOKENS),
+                                   "Bearer 2YotnFZFEjr1zCsicMWpAA", "DPoP 2YotnFZFEjr1zCsicMWpAA",
+                                   "bearer opaque", "Basic YWxhZGRpbjpvcGVuc2VzYW1l",
+                                   " Bearer 2YotnFZFEjr1zCsicMWpAA",
+                                   "Authorization: Bearer 2YotnFZFEjr1zCsicMWpAA"])
+def test_emit_redacts_values_that_carry_a_credential(capture, value):
+    _log.emit(_log.get("test"), logging.INFO, "x.y", detail=value)
+    assert capture.records[-1].attributes["detail"].startswith("<redacted:")
+    _assert_no_secrets(capture.dump(), value)
+
+
+def _redaction_cases():
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "validation", "redaction.json")
+    with open(path) as fh:
+        return [(c["key"], c["value"], c["redacted"]) for c in json.load(fh)["cases"]]
+
+
+@pytest.mark.parametrize("key,value,redacted", _redaction_cases())
+def test_emit_redaction_shared_cases(capture, key, value, redacted):
+    # validation/redaction.json: the Go, Java and TypeScript tests read the same cases.
+    _log.emit(_log.get("test"), logging.INFO, "x.y", **{key: value})
+    got = capture.records[-1].attributes[key]
+    if redacted:
+        assert isinstance(got, str) and got.startswith("<redacted:")
+    else:
+        assert got == value
+
+
+def test_emit_keeps_ordinary_attributes(capture):
+    """A backstop, not a filter: the vocabulary in docs/logging.md passes through untouched."""
+    attrs = {"host": "pf.example.com:9031", "path": "/as/token.oauth2", "method": "POST", "status": 400,
+             "step": "ciba_poll", "reason": "timeout", "token_type": "Bearer", "pop_method": "dpop_combined",
+             "client_id": "urn:agent:x", "alg": "ES256", "source": "StaticSvidSource", "at": "token_endpoint",
+             "keys": 3, "result": "invalid_audience", "mode": "introspection", "resolver": "ciba",
+             "kind": "resource_authorisation", "outcome": "pending", "channel": "device", "reused": False,
+             "fallback": "bubble_up", "ok": True, "interval": 5, "error": "authorization_pending",
+             "expires_in": 120, "detail": "s.example.com", "other": "hvs.short", "label": "bob.smith",
+             "host2": "vault.s.abcdefghijklmnopqrstuvwxyz.internal", "word": "DPoP", "scheme": "Bearer"}
+    _log.emit(_log.get("test"), logging.INFO, "token.obtained", **attrs)
+    assert capture.records[-1].attributes == attrs
+    assert "<redacted" not in capture.records[-1].getMessage()
 
 
 def test_validator_logs_verdicts_and_jwks_activity(capture):

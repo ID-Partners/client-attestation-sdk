@@ -3,6 +3,9 @@ package tokenvalidator
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -49,6 +52,8 @@ type IntrospectionConfig struct {
 //
 // Issuer and Audiences are required: New refuses a Config without them,
 // because a validator that skips either accepts tokens minted for someone else.
+// New also refuses a JWKSURI or introspection Endpoint that isn't https, unless
+// its host is loopback (localhost, 127.0.0.1, ::1) or AllowInsecure is set.
 type Config struct {
 	// Issuer is the expected "iss" claim. Required.
 	Issuer string
@@ -84,14 +89,73 @@ type Config struct {
 	DisableTokenTypeCheck bool
 	// Introspection, when set, enables ValidateActive via RFC 7662.
 	Introspection *IntrospectionConfig
+	// AllowInsecure permits a plain-http JWKSURI and introspection Endpoint on
+	// non-loopback hosts. Without it New refuses them: an attacker on the path
+	// could serve their own keys, or read the resource server's client secret.
+	AllowInsecure bool
 }
 
-// check refuses a contradictory config.
+// clone returns a deep copy of c (its slices and Introspection too), for New to keep: a caller reusing or
+// changing its Config afterwards must not change a live validator. Nil slices stay nil, since nil
+// AcceptedAlgorithms and AcceptedTokenTypes mean the defaults and an empty slice means none.
+func (c *Config) clone() *Config {
+	cp := *c
+	cp.Audiences = slices.Clone(c.Audiences)
+	cp.JWKS = slices.Clone(c.JWKS)
+	cp.RequiredScopes = slices.Clone(c.RequiredScopes)
+	cp.AcceptedAlgorithms = slices.Clone(c.AcceptedAlgorithms)
+	cp.AcceptedTokenTypes = slices.Clone(c.AcceptedTokenTypes)
+	if c.Introspection != nil {
+		introspection := *c.Introspection
+		cp.Introspection = &introspection
+	}
+	return &cp
+}
+
+// check refuses a contradictory or unsafe config.
 func (c *Config) check() error {
 	if c.ZeroLeeway && c.LeewaySeconds != 0 {
 		return errors.New("tokenvalidator: ZeroLeeway is set but LeewaySeconds is not 0")
 	}
+	if c.LeewaySeconds < 0 {
+		return errors.New("tokenvalidator: LeewaySeconds must not be negative")
+	}
+	if c.JWKSURI != "" {
+		if err := c.checkSecure(c.JWKSURI, "JWKSURI"); err != nil {
+			return err
+		}
+	}
+	if c.Introspection != nil && c.Introspection.Endpoint != "" {
+		if err := c.checkSecure(c.Introspection.Endpoint, "introspection Endpoint"); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// checkSecure refuses a non-https URL unless its host is loopback (localhost,
+// 127.0.0.1, ::1) or AllowInsecure is set: the same rule the client applies.
+func (c *Config) checkSecure(target, what string) error {
+	if c.AllowInsecure {
+		return nil
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return fmt.Errorf("tokenvalidator: %s is not a valid URL: %w", what, err)
+	}
+	if strings.EqualFold(u.Scheme, "https") || isLoopbackHost(u.Hostname()) {
+		return nil
+	}
+	return fmt.Errorf("tokenvalidator: refusing insecure %s %s: https is required for non-loopback hosts "+
+		"(set AllowInsecure to override)", what, target)
+}
+
+func isLoopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	}
+	return false
 }
 
 // acceptedAlgorithms returns the configured accepted algorithms, or the

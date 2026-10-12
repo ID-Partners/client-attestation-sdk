@@ -11,22 +11,24 @@ comes from, depends on the runtime:
 - AWS `sts:GetWebIdentityToken` (Lambda/ECS/EC2/Bedrock AgentCore).
 
 `auto_detect_evidence()` tries these in order and returns the first that applies, so a developer can
-write `ClientAttestation(attester_url)` and have it work without naming the source. Override by passing an
+write `ClientAttestation(attester_url, evidence_audience=...)` and have it work without naming the source. Override by passing an
 explicit `SvidSource` to `ClientAttestation`.
 """
 from __future__ import annotations
 
 import os
+import stat
 import urllib.parse
 
 from . import _http
-from .errors import TransportError
+from .errors import ClientAttestationError, TransportError
 from .svid_source import SpireWorkloadApiSvidSource, StaticSvidSource, SvidSource
 
 # Environment variables an operator can set to pin the evidence source explicitly.
 ENV_SVID = "CLIENT_ATTESTATION_SVID"            # the token itself (static)
 ENV_TOKEN_FILE = "CLIENT_ATTESTATION_TOKEN_FILE"  # path to a projected token file
 ENV_SPIFFE_SOCKET = "SPIFFE_ENDPOINT_SOCKET"    # SPIRE Workload API socket (standard SPIFFE var)
+ENV_AZURE_RESOURCE = "CLIENT_ATTESTATION_AZURE_RESOURCE"  # the only Entra resource Azure IMDS evidence may name
 
 # Default projected-token path used by the Kubernetes/GKE/AKS serviceAccountToken volume convention.
 DEFAULT_TOKEN_FILE = "/var/run/secrets/tokens/attester-token"
@@ -39,6 +41,8 @@ GCP_METADATA_IDENTITY = GCP_METADATA_ROOT + "instance/service-accounts/default/i
 AZURE_IMDS_IDENTITY = "http://169.254.169.254/metadata/identity/oauth2/token"
 AZURE_IMDS_INSTANCE = "http://169.254.169.254/metadata/instance"
 AZURE_IMDS_API_VERSION = "2018-02-01"
+# A token file larger than this is refused: a projected token is a few KiB.
+_MAX_TOKEN_FILE_BYTES = 64 * 1024
 
 
 class FileTokenSvidSource:
@@ -47,14 +51,21 @@ class FileTokenSvidSource:
     Kubernetes and GKE mount a short-lived, auto-rotated service-account token into the pod as a file
     (a projected `serviceAccountToken` volume). Reading it fresh each time picks up the rotation. The
     file's audience must already be the attester's evidence audience — set it when you declare the volume.
+    The path must be a regular file of at most 64 KiB; anything else raises :class:`EvidenceNotFound`.
     """
 
     def __init__(self, path: str):
         self.path = path
 
     def fetch(self, audience: str) -> str:  # noqa: ARG002 - audience is fixed when the volume is declared
-        with open(self.path, "r", encoding="utf-8") as handle:
-            return handle.read().strip()
+        # Checked before opening: opening a FIFO blocks, and a device such as /dev/zero never ends.
+        if not stat.S_ISREG(os.stat(self.path).st_mode):
+            raise EvidenceNotFound(f"token file {self.path} is not a regular file")
+        with open(self.path, "rb") as handle:
+            data = handle.read(_MAX_TOKEN_FILE_BYTES + 1)
+        if len(data) > _MAX_TOKEN_FILE_BYTES:
+            raise EvidenceNotFound(f"token file {self.path} is larger than {_MAX_TOKEN_FILE_BYTES} bytes")
+        return data.decode("utf-8").strip()
 
 
 class GoogleMetadataSvidSource:
@@ -62,7 +73,8 @@ class GoogleMetadataSvidSource:
 
     Works on any Google runtime that exposes the metadata server (GCE, GKE, Cloud Run, Vertex AI Agent
     Engine). The token's `aud` is the attester's evidence audience; `sub` is the service account. No
-    google-auth dependency — a plain metadata call.
+    google-auth dependency — a plain metadata call. The answer must be HTTP 200 carrying the
+    `Metadata-Flavor: Google` response header, as the real metadata server sends.
     """
 
     def __init__(self, timeout: float = 5.0):
@@ -70,8 +82,14 @@ class GoogleMetadataSvidSource:
 
     def fetch(self, audience: str) -> str:
         url = f"{GCP_METADATA_IDENTITY}?audience={urllib.parse.quote(audience, safe='')}&format=full"
-        response = _http.request("GET", url, headers={"Metadata-Flavor": "Google"}, timeout=self.timeout)
-        return _http.text_ok(response, "GCP metadata server").strip()
+        # direct: the identity request is plain HTTP, so a proxy from HTTP_PROXY would see the ID token.
+        response = _http.request("GET", url, headers={"Metadata-Flavor": "Google"}, timeout=self.timeout,
+                                 direct=True)
+        text = _http.text_ok(response, "GCP metadata server")
+        if response.status != 200 or not _from_google_metadata(response):
+            raise TransportError(f"GCP metadata server answered HTTP {response.status}; expected 200 with "
+                                 "Metadata-Flavor: Google", status=response.status)
+        return text.strip()
 
 
 class AzureImdsSvidSource:
@@ -80,6 +98,13 @@ class AzureImdsSvidSource:
     Works on any Azure compute that has a managed identity attached (Container Apps, VMs, Functions,
     AKS nodes without Workload Identity Federation). The token's `aud` is the attester's evidence
     audience (passed as IMDS's `resource` parameter); `oid` is the identity's stable object id.
+
+    `resource` is required, and is the only audience this source will request: the Entra resource the
+    attester's evidence audience must equal (for example `api://attester`). The audience comes from the
+    attester's discovery document, and IMDS issues a token for whatever resource it is asked for, so
+    without this an attester could obtain a working token for, say, Azure Resource Manager. A different
+    audience raises `ClientAttestationError` and IMDS is not called. Auto-detection reads it from
+    `CLIENT_ATTESTATION_AZURE_RESOURCE`.
 
     Unlike GCP's metadata server, IMDS returns a JSON envelope (`{"access_token": "...", ...}`), not a
     raw JWT body — the token is extracted from it. Pass `client_id` to select a specific user-assigned
@@ -92,16 +117,26 @@ class AzureImdsSvidSource:
     **Experimental** (see docs/api.md): Python only, and not yet run against a real attester.
     """
 
-    def __init__(self, timeout: float = 5.0, client_id: str = None):
+    def __init__(self, timeout: float = 5.0, client_id: str = None, *, resource: str = None):
         self.timeout = timeout
         self.client_id = client_id
+        self.resource = resource
 
     def fetch(self, audience: str) -> str:
+        if not self.resource:
+            raise ClientAttestationError(
+                "AzureImdsSvidSource needs the Entra resource the attester's evidence audience must equal: "
+                f"pass resource=... or set {ENV_AZURE_RESOURCE}")
+        if audience != self.resource:
+            raise ClientAttestationError(
+                f"the attester asked for Azure IMDS evidence for {audience!r}, but this source is limited "
+                f"to {self.resource!r}")
         params = {"api-version": AZURE_IMDS_API_VERSION, "resource": audience}
         if self.client_id:
             params["client_id"] = self.client_id
         url = f"{AZURE_IMDS_IDENTITY}?{urllib.parse.urlencode(params)}"
-        response = _http.request("GET", url, headers={"Metadata": "true"}, timeout=self.timeout)
+        response = _http.request("GET", url, headers={"Metadata": "true"}, timeout=self.timeout,
+                                 direct=True)  # never via a proxy, which would see the token
         envelope = _http.json_ok(response, "Azure IMDS")
         return _http.require(envelope, "access_token", "Azure IMDS response")
 
@@ -141,22 +176,33 @@ def _aws_credentials_available() -> bool:
     return False
 
 
+def _from_google_metadata(response: _http.HttpResponse) -> bool:
+    """Whether a response carries the header the GCP metadata server always sets."""
+    return response.headers.get("Metadata-Flavor") == "Google"
+
+
 def _gcp_metadata_available(timeout: float = 0.3) -> bool:
+    """Whether the GCP metadata server answers: HTTP 200 with `Metadata-Flavor: Google`.
+    metadata.google.internal is a DNS name, so whatever a search domain, LLMNR or a hostile resolver
+    points it at could answer; the header is what google-auth checks too."""
     try:
         response = _http.request("GET", GCP_METADATA_ROOT,
-                                 headers={"Metadata-Flavor": "Google"}, timeout=timeout)
+                                 headers={"Metadata-Flavor": "Google"}, timeout=timeout, direct=True)
     except TransportError:
         return False
-    return response.ok
+    return response.status == 200 and _from_google_metadata(response)
 
 
 def _azure_imds_available(timeout: float = 0.3) -> bool:
+    """Whether Azure IMDS answers: HTTP 200 with the documented instance-metadata JSON (a `compute`
+    object)."""
     try:
         response = _http.request("GET", f"{AZURE_IMDS_INSTANCE}?api-version=2021-02-01",
-                                 headers={"Metadata": "true"}, timeout=timeout)
+                                 headers={"Metadata": "true"}, timeout=timeout, direct=True)
+        document = _http.json_ok(response, "Azure IMDS") if response.status == 200 else None
     except TransportError:
         return False
-    return response.ok
+    return isinstance(document, dict) and isinstance(document.get("compute"), dict)
 
 
 def auto_detect_evidence() -> SvidSource:
@@ -195,7 +241,8 @@ def auto_detect_evidence() -> SvidSource:
         return GoogleMetadataSvidSource()
 
     if _azure_imds_available():
-        return AzureImdsSvidSource(client_id=os.environ.get("AZURE_CLIENT_ID"))
+        return AzureImdsSvidSource(client_id=os.environ.get("AZURE_CLIENT_ID"),
+                                   resource=os.environ.get(ENV_AZURE_RESOURCE))
 
     # AWS is last: it needs an outbound STS call, so only reach for it when AWS credentials are visible in
     # the environment (Lambda/ECS/EC2/AgentCore). On EKS, prefer a projected token file (handled above).

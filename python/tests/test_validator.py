@@ -22,14 +22,22 @@ def _validator(vectors, **overrides):
 
 
 def _case_validator(vectors, case):
-    """The validator a vector case asks for: the shared config plus the case's overrides and clock."""
+    """The validator a vector case asks for: the shared config plus the case's overrides, key set and clock."""
     options = {"accepted_algorithms": vectors["accepted_algorithms"], **(case.get("config") or {})}
+    fetch_error = case.get("jwks_fetch_error")
+    if fetch_error is not None:
+        options["jwks_uri"] = "https://keys.internal.example:8443/jwks"
     cfg = ValidatorConfig(
-        issuer=vectors["issuer"], audiences=[vectors["audience"]], jwks=vectors["jwks"],
+        issuer=vectors["issuer"], audiences=[vectors["audience"]],
+        jwks=None if fetch_error is not None else case.get("jwks", vectors["jwks"]),
         required_scopes=vectors["required_scopes"], **options,
     )
+
+    def get(url):
+        raise TransportError(fetch_error, status=503)
+
     clock = (lambda: float(case["now"])) if "now" in case else None
-    return AccessTokenValidator(cfg, clock=clock)
+    return AccessTokenValidator(cfg, http_get=get, clock=clock)
 
 
 def test_vectors_match_expected():
@@ -38,6 +46,8 @@ def test_vectors_match_expected():
         result = _case_validator(vectors, case).validate(case["token"])
         got = "valid" if result.valid else result.error
         assert got == case["expect"], f"{case['name']}: expected {case['expect']}, got {got}"
+        if "expect_description" in case:
+            assert result.error_description == case["expect_description"], case["name"]
 
 
 def test_introspection_vectors_match_expected():

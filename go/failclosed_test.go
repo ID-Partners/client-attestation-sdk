@@ -41,13 +41,13 @@ func standardDoc(base string) map[string]any {
 		"attestation_endpoint": base + "/mint",
 		"challenge_endpoint":   base + "/challenge",
 		"token_endpoint":       base + "/token",
-		"evidence_audience":    "aud",
+		"evidence_audience":    shortAudience,
 	}
 }
 
 func tokenFrom(t *testing.T, srv *httptest.Server, opts ...Option) error {
 	t.Helper()
-	ca, err := NewClientAttestation(srv.URL, append([]Option{WithEvidence(StaticSvidSource{SVID: "s"})}, opts...)...)
+	ca, err := NewClientAttestation(srv.URL, append([]Option{WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "s"})}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}

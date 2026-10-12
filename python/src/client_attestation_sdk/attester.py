@@ -20,16 +20,16 @@ told otherwise, which is exactly the behaviour of earlier releases. See docs/att
         def discover(self, transport, attester_url): ...
         def mint(self, transport, metadata, request): ...
 
-    ca = ClientAttestation("https://attester.example", profile=MyAttester())
+    ca = ClientAttestation("https://attester.example", profile=MyAttester(), evidence_audience="my-aud")
 """
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
+from .builders import ATTESTATION_TYP, DPOP_TYP, POP_TYP
 from .errors import TransportError
 from .keys import SigningKeyPair, _sign_compact
 
@@ -41,6 +41,14 @@ __all__ = [
     "MintResult",
     "PingFederateProfile",
 ]
+
+
+def _reserved_typ(typ) -> bool:
+    """Whether ``typ`` names one of the SDK's own credential types, compared as RFC 7515 section 4.1.9 says a
+    verifier may: case-insensitively, with or without the ``application/`` prefix."""
+    t = str(typ).strip().lower()
+    t = t[len("application/"):] if t.startswith("application/") else t
+    return t in (ATTESTATION_TYP, POP_TYP, DPOP_TYP)
 
 
 @dataclass(frozen=True)
@@ -94,15 +102,22 @@ class MintRequest:
     """
 
     instance_key: SigningKeyPair
-    evidence: str
-    challenge: Optional[str] = None
+    evidence: str = field(repr=False)
+    challenge: Optional[str] = field(default=None, repr=False)
     client_id: Optional[str] = None
     authorization_details: Optional[list] = None
     operator: Optional[dict] = None
     asserted_context: Optional[dict] = None
 
     def sign(self, claims: dict, typ: str) -> str:
-        """Sign ``claims`` as a compact JWS with the instance key, under header ``typ`` (no ``jwk``)."""
+        """Sign ``claims`` as a compact JWS with the instance key, under header ``typ`` (no ``jwk``).
+
+        ``typ`` may not be one the SDK's own credentials use (``ATTESTATION_TYP``, ``POP_TYP``,
+        ``DPOP_TYP``): a profile could otherwise have the instance key sign a Client Attestation PoP or
+        DPoP proof with claims of its choosing. Raises ``ValueError`` if it is."""
+        if _reserved_typ(typ):
+            raise ValueError(f"typ {typ!r} is reserved for the SDK's own credentials; "
+                             "a profile cannot sign it with the instance key")
         return _sign_compact(claims, self.instance_key, typ, embed_jwk=False)
 
     def instance_proof(self, typ: str, audience: str) -> str:
@@ -120,7 +135,7 @@ class MintResult:
     **Experimental** (see docs/api.md): part of the attester-profile interface, new in 0.4.0.
     """
 
-    attestation: str
+    attestation: str = field(repr=False)
     expires_in: Any = None
 
 
@@ -210,5 +225,6 @@ class PingFederateProfile(AttesterProfile):
         response = transport.request_json("mint", "POST", metadata.attestation_endpoint, body)
         attestation = response.get("attestation")
         if not attestation or not isinstance(attestation, str):
-            raise TransportError("attester response contained no attestation", body=json.dumps(response))
+            # No body: a 2xx mint response may hold the attestation under another name.
+            raise TransportError("attester response contained no attestation")
         return MintResult(attestation, response.get("expires_in"))

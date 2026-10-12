@@ -2,6 +2,7 @@ package global.idpartners.clientattestation;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -18,6 +19,8 @@ import org.junit.jupiter.api.Test;
  * mis-shaped responses all surface as {@link ClientAttestation.ClientAttestationException}.
  */
 class ClientAttestationTransportTest {
+    /** The evidence_audience the fake attester's discovery document names. */
+    private static final String AUD = "https://attester.example.com";
 
     private StubHttpServer server;
 
@@ -40,8 +43,8 @@ class ClientAttestationTransportTest {
         this.server.respond(host + "/.well-known/client-attester", 200, "{"
                 + "\"attestation_endpoint\":\"" + this.server.url("/federation/attestation") + "\","
                 + "\"token_endpoint\":\"" + this.server.url(tokenPath) + "\","
-                + "\"evidence_audience\":\"https://attester.example.com\"}");
-        return ClientAttestation.builder(this.server.url(host)).evidence(new SvidSource.Static("svid"))
+                + "\"evidence_audience\":\"" + AUD + "\"}");
+        return ClientAttestation.builder(this.server.url(host)).evidence(new SvidSource.Static("svid")).evidenceAudience(AUD)
                 .timeout(timeout).build();
     }
 
@@ -88,7 +91,7 @@ class ClientAttestationTransportTest {
         ClientAttestation.ClientAttestationException garbage = assertThrows(
                 ClientAttestation.ClientAttestationException.class, () -> client("/garbage").token());
         assertEquals(200, garbage.status());
-        assertEquals("<html/>", garbage.body());
+        assertNull(garbage.body());   // a 2xx body is never kept: it may hold the token
         ClientAttestation.ClientAttestationException numeric = assertThrows(
                 ClientAttestation.ClientAttestationException.class, () -> client("/numeric").token());
         assertTrue(numeric.getMessage().contains("no access_token"));
@@ -97,7 +100,7 @@ class ClientAttestationTransportTest {
     @Test
     void discoveryFailuresAreClientAttestationExceptions() {
         ClientAttestation missing = ClientAttestation.builder(this.server.url("/nothing-here"))
-                .evidence(new SvidSource.Static("svid")).build();
+                .evidence(new SvidSource.Static("svid")).evidenceAudience(AUD).build();
         ClientAttestation.ClientAttestationException e =
                 assertThrows(ClientAttestation.ClientAttestationException.class, missing::discovery);
         assertEquals(404, e.status());
@@ -110,11 +113,11 @@ class ClientAttestationTransportTest {
     @Test
     void discoveryWithoutAnAttestationEndpointFailsCleanly() {
         this.server.respond("/noendpoint/.well-known/client-attester", 200,
-                "{\"evidence_audience\":\"https://attester.example.com\"}");
+                "{\"evidence_audience\":\"" + AUD + "\"}");
         ClientAttestation.ClientAttestationException e = assertThrows(
                 ClientAttestation.ClientAttestationException.class,
                 () -> ClientAttestation.builder(this.server.url("/noendpoint"))
-                        .evidence(new SvidSource.Static("svid")).build().token());
+                        .evidence(new SvidSource.Static("svid")).evidenceAudience(AUD).build().token());
         assertTrue(e.getMessage().contains("attestation_endpoint"), e.getMessage());
     }
 
@@ -125,6 +128,6 @@ class ClientAttestationTransportTest {
         // accepted as text or rejected as a ClientAttestationException — never a raw RuntimeException.
         assertThrows(ClientAttestation.ClientAttestationException.class,
                 () -> ClientAttestation.builder(this.server.url("/numaud"))
-                        .evidence(new SvidSource.Static("svid")).build().token());
+                        .evidence(new SvidSource.Static("svid")).evidenceAudience(AUD).build().token());
     }
 }

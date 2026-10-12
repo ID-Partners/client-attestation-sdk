@@ -26,5 +26,5 @@ Anything that lets a credential be accepted when it should be refused, leaks a k
 or lets one workload act as another. That includes the validators accepting a malformed or expired token,
 and the one-call client sending a credential somewhere it shouldn't.
 
-The keys in `vectors/inputs.json` and `validation/tokens.json` are public test vectors. They aren't a
-vulnerability.
+The keys in `vectors/inputs.json` and `validation/tokens.json` are public test vectors, including the
+private JWKs some `validation/tokens.json` cases put in a JWKS on purpose. They aren't a vulnerability.

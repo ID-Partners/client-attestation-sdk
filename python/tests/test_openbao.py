@@ -4,6 +4,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import jwt
+import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
@@ -11,9 +12,11 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from client_attestation_sdk import (
     ClientAttestationBuilder,
     ClientAttestationCredential,
+    ClientAttestationError,
     OpenBaoTransitSigner,
     SigningKeyPair,
 )
+from client_attestation_sdk import _http
 
 KEY_NAME = "attestation-es256"
 TOKEN = "unit-test-token"
@@ -146,3 +149,55 @@ def test_vault_down_fails_closed():
     except Exception:
         raised = True
     assert raised, "an unreachable vault must fail closed"
+
+
+class _Recorder:
+    """Stands in for the SDK's one HTTP function: records every URL and answers with transit key metadata, so
+    a test can show where the vault token would have gone, with no network."""
+
+    def __init__(self):
+        self.urls = []
+        pem = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        self._body = json.dumps({"data": {
+            "type": "ecdsa-p256", "latest_version": 1, "keys": {"1": {"public_key": pem}}}}).encode()
+
+    def __call__(self, method, url, **kwargs):
+        self.urls.append(url)
+        return _http.HttpResponse(200, {"Content-Type": "application/json"}, self._body)
+
+
+@pytest.fixture()
+def recorder(monkeypatch):
+    rec = _Recorder()
+    monkeypatch.setattr(_http, "request", rec)
+    return rec
+
+
+def test_plain_http_to_a_non_loopback_vault_is_refused(recorder):
+    # Refused before any request: the vault token must not travel in cleartext, and a key read from whoever
+    # answers would become the attester's published JWK.
+    with pytest.raises(ClientAttestationError, match="must use https"):
+        OpenBaoTransitSigner("http://openbao.example:8200", TOKEN, KEY_NAME)
+    assert recorder.urls == []
+
+
+def test_allow_insecure_lifts_the_https_rule(recorder):
+    signer = OpenBaoTransitSigner("http://openbao.example:8200", TOKEN, KEY_NAME, allow_insecure=True)
+    assert signer.algorithm == "ES256"
+    assert recorder.urls == ["http://openbao.example:8200/v1/transit/keys/" + KEY_NAME]
+
+
+def test_https_and_loopback_vaults_are_allowed(recorder):
+    assert OpenBaoTransitSigner("https://openbao.example:8200/", TOKEN, KEY_NAME).algorithm == "ES256"
+    assert OpenBaoTransitSigner("http://localhost:8200", TOKEN, KEY_NAME).algorithm == "ES256"
+    assert recorder.urls == ["https://openbao.example:8200/v1/transit/keys/" + KEY_NAME,
+                             "http://localhost:8200/v1/transit/keys/" + KEY_NAME]
+
+
+@pytest.mark.parametrize("name", ["../../sys/raw/x", "k/../../../sys/seal", "k?x=1", "k#frag", "a/b", "%2e%2e",
+                                  ".", "..", "", "k y", "k\n"])
+def test_key_names_that_escape_the_path_are_refused_before_any_request(recorder, name):
+    with pytest.raises(ValueError, match="invalid transit key name"):
+        OpenBaoTransitSigner("https://openbao.example", TOKEN, name)
+    assert recorder.urls == []

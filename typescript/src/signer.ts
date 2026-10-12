@@ -8,7 +8,8 @@ import { base64url, calculateJwkThumbprint, exportJWK, importSPKI, type JWK } fr
 
 import { TransportError } from "./errors.js";
 import { base64Encode } from "./runtime.js";
-import { parseJsonObject, request as httpRequest, snippet, type HttpResponse } from "./http.js";
+import { checkSecure, parseJsonObject, request as httpRequest, snippet, type HttpResponse } from "./http.js";
+import { SUPPORTED_ALGORITHMS } from "./signing-key-pair.js";
 
 /** Per-call timeout for the vault. */
 const OPENBAO_TIMEOUT_MS = 5_000;
@@ -24,30 +25,55 @@ export interface JwsSigner {
   sign(signingInput: Uint8Array): Promise<Uint8Array>;
 }
 
+/** The length of a raw `r||s` JWS signature for each ECDSA algorithm. */
+const EC_SIGNATURE_BYTES: Record<string, number> = { ES256: 64, ES384: 96, ES512: 132 };
+
 /** Assemble a compact JWS whose signature is produced by an external signer (header carries `kid`; external
+ * signers hold issuing keys, referenced by id, never an embedded jwk). The signer's algorithm must be one the
+ * SDK signs with (never `none`), and its signature must not be empty and, for ES*, must be the fixed-width
+ * `r||s` (not DER, not truncated).
  *
- * @internal
- * signers hold issuing keys, referenced by id, never an embedded jwk). */
+ * @internal */
 export async function signExternal(
   claims: Record<string, unknown>,
   signer: JwsSigner,
   typ: string,
 ): Promise<string> {
+  const alg = signer.algorithm;
+  if (!SUPPORTED_ALGORITHMS.includes(alg)) {
+    throw new Error(
+      `external signer algorithm ${JSON.stringify(alg)} is not allowed: use ES256/384/512, RS256/384/512 or PS256/384/512`,
+    );
+  }
   const enc = new TextEncoder();
-  const header = { alg: signer.algorithm, typ, kid: signer.keyId };
+  const header = { alg, typ, kid: signer.keyId };
   const signingInput = `${b64url(enc.encode(JSON.stringify(header)))}.${b64url(enc.encode(JSON.stringify(claims)))}`;
   const signature = await signer.sign(enc.encode(signingInput));
+  if (!signature || signature.length === 0) {
+    throw new Error("external signer returned an empty signature");
+  }
+  const want = EC_SIGNATURE_BYTES[alg];
+  if (want !== undefined && signature.length !== want) {
+    throw new Error(`external signer returned a ${signature.length}-byte ${alg} signature; want the ${want}-byte raw r||s`);
+  }
   return `${signingInput}.${b64url(signature)}`;
 }
 
 const KEY_TYPE_ALG: Record<string, string> = { "ecdsa-p256": "ES256", "ecdsa-p384": "ES384", "ecdsa-p521": "ES512" };
 const ALG_HASH: Record<string, string> = { ES256: "sha2-256", ES384: "sha2-384", ES512: "sha2-512" };
+/** The key name goes into the request path, so "/", "?", "#", "%" and dot segments are refused. */
+const KEY_NAME = /^[A-Za-z0-9_.-]+$/;
 
 /**
  * A {@link JwsSigner} backed by an OpenBao / HashiCorp Vault transit engine: the attestation is signed
  * inside the vault (`POST /v1/transit/sign/<key>` with `marshaling_algorithm=jws`, which returns the
  * fixed-width `r||s`) and the private key never leaves it. `create` reads the key metadata to pin the
  * latest version, derive the public JWK and compute its RFC 7638 `kid`. Fail-closed (vault errors throw).
+ *
+ * `baoAddr` must be https unless its host is loopback (`localhost`, `127.0.0.1`, `::1`) or
+ * `allowInsecure: true` is passed: the vault token rides on every call, and the public key read from the
+ * vault becomes the attester's published JWK. `keyName` may contain only letters, digits, `_`, `.` and `-`
+ * (and is not `.` or `..`).
  *
  * @experimental See docs/api.md: a client for a third-party API that authenticates with a static token only; its constructor will change when other auth methods are added.
  */
@@ -75,8 +101,17 @@ export class OpenBaoTransitSigner implements JwsSigner {
     this.keyId = keyId;
   }
 
-  static async create(baoAddr: string, token: string, keyName: string): Promise<OpenBaoTransitSigner> {
+  static async create(
+    baoAddr: string,
+    token: string,
+    keyName: string,
+    opts?: { allowInsecure?: boolean },
+  ): Promise<OpenBaoTransitSigner> {
     const base = baoAddr.replace(/\/+$/, "");
+    checkSecure(base, "baoAddr", opts?.allowInsecure ?? false);
+    if (!KEY_NAME.test(keyName) || keyName === "." || keyName === "..") {
+      throw new Error(`invalid transit key name '${keyName}': use only letters, digits, '_', '.' and '-'`);
+    }
     const data = await request("GET", base, token, `/v1/transit/keys/${keyName}`);
     const keyType = String(data.type);
     const algorithm = KEY_TYPE_ALG[keyType];

@@ -18,6 +18,8 @@ import org.junit.jupiter.api.Test;
  * loopback or {@code allowInsecure(true)}.
  */
 class ClientAttestationFailClosedTest {
+    /** The evidence_audience the fake attester's discovery document names. */
+    private static final String AUD = "https://attester.example.com";
 
     private StubHttpServer server;
 
@@ -37,7 +39,7 @@ class ClientAttestationFailClosedTest {
 
     /** A host whose discovery advertises the given endpoints (null = omitted). */
     private String host(String name, String attestation, String challenge, String token) {
-        StringBuilder doc = new StringBuilder("{\"evidence_audience\":\"https://attester.example.com\"");
+        StringBuilder doc = new StringBuilder("{\"evidence_audience\":\"" + AUD + "\"");
         if (attestation != null) {
             doc.append(",\"attestation_endpoint\":\"").append(attestation).append('"');
         }
@@ -52,7 +54,7 @@ class ClientAttestationFailClosedTest {
     }
 
     private ClientAttestation.Builder builder(String host) {
-        return ClientAttestation.builder(host).evidence(new SvidSource.Static("svid"));
+        return ClientAttestation.builder(host).evidence(new SvidSource.Static("svid")).evidenceAudience(AUD);
     }
 
     // ── item 11a: challenge ─────────────────────────────────────────────────────────────────────────

@@ -113,6 +113,8 @@ def test_discover_fetches_metadata_document():
     }
     server = JsonServer(json.dumps(metadata))
     try:
+        metadata["issuer"] = server.url
+        server._body = json.dumps(metadata)
         assert discover(server.url + "/.well-known/oauth-authorization-server") == metadata
     finally:
         server.close()
@@ -184,6 +186,46 @@ def test_concurrent_misses_share_one_fetch():
     assert len(results) == 10 and all(r is not None for r in results)
 
 
+def test_a_caller_holding_a_stale_key_never_waits_for_a_fetch():
+    document = json.dumps({"keys": [_jwk("ES256", "k")]})
+    started = threading.Event()
+    release = threading.Event()
+
+    def get(url):
+        return document
+
+    def slow_get(url):
+        started.set()
+        release.wait(10)
+        return document
+
+    clock = FakeClock()
+    provider = JwksProvider(jwks_uri="https://as/jwks", http_get=get, clock=clock, max_age_seconds=60)
+    assert provider.resolve("k") is not None
+    provider._http_get = slow_get
+    clock.now += 120   # the set is stale: the next caller refreshes it, and the fetch hangs
+    fetcher = threading.Thread(target=provider.resolve, args=("k",))
+    fetcher.start()
+    assert started.wait(5)
+
+    results = {}
+    holder = threading.Thread(target=lambda: results.update(stale=provider.resolve("k")))
+    holder.start()
+    holder.join(2)
+    stuck = holder.is_alive()
+    # a caller without the key waits for the fetch in flight, which may bring it
+    misser = threading.Thread(target=lambda: results.update(missing=provider.resolve("other")))
+    misser.start()
+    misser.join(0.2)
+    waited = misser.is_alive()
+    release.set()
+    for t in (fetcher, holder, misser):
+        t.join(5)
+    assert not stuck, "a caller with a usable stale key waited for another caller's fetch"
+    assert results["stale"] is not None
+    assert waited and results["missing"] is None
+
+
 def test_keys_are_refreshed_once_they_are_old():
     rotation = {"kid": "old"}
     get, calls = _counting_get(lambda: {"keys": [_jwk("ES256", rotation["kid"])]})
@@ -229,7 +271,8 @@ def test_fetch_failure_is_key_not_found_not_an_exception():
                        algorithm="ES256", headers={"kid": key.key_id, "typ": "at+jwt"})
     result = validator.validate(token)
     assert result.error == errors.KEY_NOT_FOUND
-    assert "connection refused" in result.error_description
+    # the description reaches WWW-Authenticate: the fetch failure's detail stays in the log
+    assert result.error_description == "signing keys unavailable"
 
 
 def test_oversized_jwks_is_refused():

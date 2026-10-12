@@ -6,9 +6,10 @@ import jwt
 import pytest
 
 from client_attestation_sdk import SigningKeyPair
-
+from client_attestation_sdk.errors import TransportError
 from client_attestation_sdk.token_validator import (
     AccessTokenValidator,
+    IntrospectionConfig,
     ProtectedResource,
     ValidatorConfig,
     bearer_token,
@@ -42,6 +43,27 @@ def test_bearer_extraction():
     assert bearer_token("") is None
     assert bearer_token(None) is None
     assert bearer_token("Bearer ") is None
+
+
+def _bearer_cases():
+    with open(os.path.join(VALIDATION, "bearer.json")) as fh:
+        return [(c["header"], c["token"]) for c in json.load(fh)["cases"]]
+
+
+@pytest.mark.parametrize("header,token", _bearer_cases())
+def test_bearer_extraction_shared_cases(header, token):
+    # validation/bearer.json: the Go, Java and TypeScript tests read the same cases.
+    assert bearer_token(header) == token
+
+
+def test_bearer_extraction_is_linear():
+    spaces = "Bearer a" + " " * 64000 + "b"
+    newline = "Bearer" + " " * 64000 + "!\n!"
+    started = time.perf_counter()
+    assert bearer_token(spaces) == "a" + " " * 64000 + "b"
+    assert bearer_token(newline) is None
+    assert bearer_token("Bearer" + " \n" * 32000) == " "
+    assert time.perf_counter() - started < 0.2
 
 
 def test_metadata_rfc9728():
@@ -134,3 +156,32 @@ def test_bearer_guard_refuses_confirmation_without_proof(cnf):
     claims["cnf"] = None
     bearer = jwt.encode(claims, key.private_key, algorithm="ES256", headers={"typ": "at+jwt", "kid": key.key_id})
     assert resource.authenticate("Bearer " + bearer).authorized
+
+
+def _introspecting_resource(response):
+    """A guard for https://api.test whose validator accepts another resource too and introspects to `response`."""
+    def post(url, body, headers):
+        if response is None:
+            raise TransportError("introspection endpoint returned HTTP 503", status=503)
+        return response
+
+    config = ValidatorConfig(issuer="https://issuer.test", audiences=["https://api.test", "https://other.test"],
+                             jwks={"keys": []},
+                             introspection=IntrospectionConfig("https://issuer.test/introspect", "rs", "secret"))
+    return ProtectedResource("https://api.test", ["https://issuer.test"],
+                             AccessTokenValidator(config, http_post=post))
+
+
+def test_authenticate_active_binds_this_resource_and_refuses_confirmation():
+    active = {"active": True, "sub": "agent-1", "aud": "https://api.test"}
+    assert _introspecting_resource(active).authenticate_active("Bearer opaque").authorized
+    for response, error in [({**active, "aud": "https://other.test"}, errors.INVALID_AUDIENCE),
+                            ({k: v for k, v in active.items() if k != "aud"}, errors.INVALID_AUDIENCE),
+                            ({**active, "cnf": {"jkt": "bound-key"}}, errors.INVALID_TOKEN),
+                            ({"active": False}, errors.INACTIVE)]:
+        decision = _introspecting_resource(response).authenticate_active("Bearer opaque")
+        assert not decision.authorized and decision.status == 401 and decision.result.error == error
+    missing = _introspecting_resource(active).authenticate_active(None)
+    assert not missing.authorized and missing.status == 401
+    with pytest.raises(TransportError):
+        _introspecting_resource(None).authenticate_active("Bearer opaque")

@@ -9,9 +9,17 @@
  * - redirects are never followed — a 3xx is a {@link TransportError}, and the target is never contacted;
  * - the response body is capped (default 1 MiB), by `content-length` and again while streaming;
  * - {@link request} returns non-2xx responses as data; {@link jsonOk} turns them, and malformed JSON,
- *   into a {@link TransportError}.
+ *   into a {@link TransportError};
+ * - a URL with userinfo (`user:password@`) is refused, and errors name a URL without its userinfo, query or
+ *   fragment.
+ *
+ * Proxies: `fetch` uses no proxy from the environment by default (Node, Deno, Bun without configuration,
+ * edge runtimes). Node started with `NODE_USE_ENV_PROXY=1` or `--use-env-proxy` sends every request,
+ * plain http included, to `HTTP_PROXY` / `HTTPS_PROXY`; the SDK can't pick a dispatcher per request
+ * without depending on undici, so the other ports' rule (a proxy only for https to a remote host) is
+ * then the operator's to keep, with `NO_PROXY`.
  */
-import { TransportError } from "./errors.js";
+import { ClientAttestationError, TransportError } from "./errors.js";
 import { utf8Decode, utf8Encode } from "./runtime.js";
 
 /** @internal */
@@ -19,11 +27,34 @@ export const DEFAULT_MAX_BYTES = 1024 * 1024;
 /** @internal */
 export const DEFAULT_TIMEOUT_MS = 20_000;
 /**
- * At most this many characters of a response body are carried in an error.
+ * At most this many characters of a non-2xx response body are carried in an error. A 2xx body never is:
+ * that is where access tokens, attestations and SVIDs travel.
  *
  * @internal
  */
 export const ERROR_BODY_CHARS = 512;
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/**
+ * Refuse a non-https URL unless it is loopback or the caller passed `allowInsecure`. Shared by every SDK
+ * client that sends credentials.
+ *
+ * @internal
+ */
+export function checkSecure(url: string, what: string, allowInsecure: boolean): void {
+  if (allowInsecure) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new ClientAttestationError(`${what} is not a valid URL: ${url}`);
+  }
+  if (parsed.protocol === "https:" || LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) return;
+  throw new ClientAttestationError(
+    `${what} must use https: ${url} (loopback hosts are exempt; pass allowInsecure: true to override)`,
+  );
+}
 
 /** @internal */
 export interface HttpRequestOptions {
@@ -55,6 +86,31 @@ export function snippet(body: string): string {
   return body.length > ERROR_BODY_CHARS ? body.slice(0, ERROR_BODY_CHARS) : body;
 }
 
+/**
+ * `url` without its userinfo, query or fragment, for error messages: a query can carry a secret, and
+ * userinfo is one.
+ *
+ * @internal
+ */
+export function displayUrl(url: string): string {
+  const beforeQuery = url.split(/[?#]/, 1)[0] ?? "";
+  return beforeQuery.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/\\]*@/, "$1");
+}
+
+/**
+ * Whether `url` carries userinfo, read as `fetch` would read it; an unparseable URL is checked by hand.
+ *
+ * @internal
+ */
+export function hasUserinfo(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.username !== "" || parsed.password !== "";
+  } catch {
+    return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#\\]*@/.test(url);
+  }
+}
+
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -75,7 +131,11 @@ export async function request(url: string, opts: HttpRequestOptions = {}): Promi
   const method = opts.method ?? "GET";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-  const where = `${method} ${url}`;
+  const where = `${method} ${displayUrl(url)}`;
+  if (hasUserinfo(url)) {
+    // fetch refuses these too, but its error would come after `where` held the userinfo
+    throw new TransportError(`${where}: URLs with userinfo (user:password@) are not supported`, "network");
+  }
   const timedOut = (cause: unknown) =>
     new TransportError(`${where} timed out after ${timeoutMs} ms`, "timeout", { cause });
 
@@ -175,7 +235,7 @@ async function readCapped(res: Response, maxBytes: number, tooLarge: () => Trans
 export function jsonOk<T = Record<string, unknown>>(res: HttpResponse, opts: { allowEmpty?: boolean } = {}): T {
   if (!res.ok) {
     const body = snippet(res.body);
-    throw new TransportError(`${res.method} ${res.url} returned HTTP ${res.status}: ${body}`, "status", {
+    throw new TransportError(`${res.method} ${displayUrl(res.url)} returned HTTP ${res.status}: ${body}`, "status", {
       status: res.status,
       body,
     });
@@ -184,7 +244,9 @@ export function jsonOk<T = Record<string, unknown>>(res: HttpResponse, opts: { a
 }
 
 /**
- * Parse `res.body` as a JSON object regardless of status; a {@link TransportError} if it is not one.
+ * Parse `res.body` as a JSON object regardless of status; a {@link TransportError} if it is not one. The
+ * error carries no body, no cause and not the parser's message, which quotes part of the text: the body
+ * parsed here is a 2xx one, which carries tokens, attestations and SVIDs.
  *
  * @internal
  */
@@ -196,17 +258,12 @@ export function parseJsonObject<T = Record<string, unknown>>(
   let parsed: unknown;
   try {
     parsed = JSON.parse(res.body);
-  } catch (err) {
-    throw new TransportError(`${res.method} ${res.url} returned malformed JSON: ${describe(err)}`, "json", {
-      status: res.status,
-      body: snippet(res.body),
-      cause: err,
-    });
+  } catch {
+    throw new TransportError(`${res.method} ${displayUrl(res.url)} returned malformed JSON`, "json", { status: res.status });
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new TransportError(`${res.method} ${res.url} did not return a JSON object`, "json", {
+    throw new TransportError(`${res.method} ${displayUrl(res.url)} did not return a JSON object`, "json", {
       status: res.status,
-      body: snippet(res.body),
     });
   }
   return parsed as T;

@@ -18,8 +18,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * {@link SigningKeyPair} unit coverage: every supported algorithm, unsupported-algorithm rejection, and the
- * {@code fromJwk} wrap path (round-trip and missing-private-part rejection). Also covers {@link Jws}'s
- * signing-failure path via an algorithm/key mismatch.
+ * {@code fromJwk} wrap path (round-trip, missing-private-part and algorithm/key mismatch rejection).
  */
 class SigningKeyPairTest {
 
@@ -78,13 +77,12 @@ class SigningKeyPairTest {
     }
 
     @Test
-    void algorithmKeyMismatchSurfacesAsSigningFailure() throws Exception {
-        // An EC key wrapped with an RSA alg passes fromJwk but must fail closed inside Jws when signing.
+    void algorithmKeyMismatchIsRefusedAtImport() throws Exception {
+        // An EC key wrapped with an RSA alg used to pass fromJwk and fail only when signing.
         EllipticCurveJsonWebKey jose4jKey = EcJwkGenerator.generateJwk(EllipticCurves.P256);
-        SigningKeyPair mismatched = SigningKeyPair.fromJwk(jose4jKey, "RS256");
-        IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> new PopBuilder(mismatched).audience("https://as.example.com").build());
-        assertTrue(e.getMessage().contains("JWS signing failed"));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> SigningKeyPair.fromJwk(jose4jKey, "RS256"));
+        assertTrue(e.getMessage().contains("needs an RSA key"));
     }
 
     @Test

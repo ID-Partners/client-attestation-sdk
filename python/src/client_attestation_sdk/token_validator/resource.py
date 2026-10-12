@@ -21,6 +21,8 @@ from .result import ValidationResult
 
 BEARER = "bearer"
 _WELL_KNOWN = "/.well-known/oauth-protected-resource"
+# RE2's \s: space, tab, LF, FF and CR. Not str.isspace(), which also takes VT, NBSP, U+2028 and more.
+_SPACE = " \t\n\f\r"
 
 
 def bearer_token(authorization_header):
@@ -28,10 +30,20 @@ def bearer_token(authorization_header):
     is absent, blank, or not a Bearer credential."""
     if not authorization_header:
         return None
-    parts = authorization_header.split(None, 1)
-    if len(parts) == 2 and parts[0].lower() == BEARER and parts[1].strip():
-        return parts[1].strip()
-    return None
+    # Linear string operations, no regex. The result is what Go's RE2 (?i)^\s*Bearer\s+(.+?)\s*$ returns,
+    # so every port extracts the same token (validation/bearer.json).
+    h = authorization_header.lstrip(_SPACE)
+    scheme = h[:len(BEARER)]
+    if (len(h) <= len(BEARER) or not scheme.isascii() or scheme.lower() != BEARER
+            or h[len(BEARER)] not in _SPACE):
+        return None
+    rest = h[len(BEARER) + 1:]
+    token = rest.strip(_SPACE)
+    if not token:
+        # Only whitespace after the scheme: RE2 takes the last non-LF whitespace character after the first.
+        tail = rest.rstrip("\n")
+        return tail[-1] if tail else None
+    return None if "\n" in token else token
 
 
 class AuthDecision:
@@ -111,11 +123,23 @@ class ProtectedResource:
         """Guard a request: extract the bearer token, validate it (audience must be this resource, plus any
         ``required_scopes``), and return an :class:`AuthDecision`. Missing/invalid/expired/wrong-audience →
         401; insufficient scope → 403."""
+        return self._guard(authorization_header, lambda token: self.validator.validate(token, required_scopes))
+
+    def authenticate_active(self, authorization_header, required_scopes=None):
+        """:meth:`authenticate` for tokens checked by RFC 7662 introspection
+        (:meth:`AccessTokenValidator.validate_active`), such as opaque tokens, with the same rules: the
+        response's ``aud`` must name this resource, so a response without one is refused (401), and a
+        sender-constrained token (``cnf``) is refused (401). A failed introspection call is not a verdict:
+        it raises, as ``validate_active`` does, and the caller answers it (503, say)."""
+        return self._guard(authorization_header,
+                           lambda token: self.validator.validate_active(token, required_scopes))
+
+    def _guard(self, authorization_header, validate):
         token = bearer_token(authorization_header)
         if token is None:
             return AuthDecision(False, status=401, www_authenticate=self.challenge(),
                                 error_description="authentication required")
-        result = self.validator.validate(token, required_scopes)
+        result = validate(token)
         if result.valid and self.resource not in result.audience:
             result = ValidationResult._failure(errors.INVALID_AUDIENCE, "token audience is not this resource")
         if result.valid and result.claims.get("cnf") is not None:

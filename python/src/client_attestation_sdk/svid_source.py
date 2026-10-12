@@ -7,10 +7,15 @@ cover dev, tests, and the in-process :class:`~client_attestation_sdk.spiffe.Spif
 """
 from __future__ import annotations
 
+import os
+import re
+import selectors
 import subprocess
+import threading
 from typing import Protocol, runtime_checkable
 
 from . import _http
+from .token_validator import _strict
 
 
 @runtime_checkable
@@ -62,16 +67,168 @@ class SpireWorkloadApiSvidSource:
         self._bin = spire_agent
 
     def fetch(self, audience: str) -> str:
-        out = subprocess.run(
-            [self._bin, "api", "fetch", "jwt", "-audience", audience, "-socketPath", self._socket],
-            capture_output=True, text=True, timeout=30)
-        for line in out.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("token("):          # "token(spiffe://…): eyJ…"
-                return line.split("):", 1)[1].strip()
-            if line.count(".") == 2:               # a bare compact JWT line
+        """Return the first JWT-SVID the agent prints on stdout. Raises
+        :class:`~client_attestation_sdk.evidence.EvidenceNotFound` if there is none. At most 1 MiB of stdout
+        is read: an agent that prints more is killed and ``RuntimeError`` is raised. The agent's stderr is
+        discarded, never read as output or held in memory. An agent that has not exited within 30 seconds
+        is killed and :class:`subprocess.TimeoutExpired` is raised.
+
+        The agent's exit decides the outcome, as in the other ports: once it has exited, stdout is read for
+        at most 250 ms more (a helper the agent started can inherit the pipe and hold it open), then the
+        pipe is closed. On exit status 0, what was read is parsed; on any other status ``RuntimeError`` is
+        raised. A helper holding stdout never turns a success into a failure, and never keeps ``fetch``
+        waiting longer than that."""
+        args = [self._bin, "api", "fetch", "jwt", "-audience", audience, "-socketPath", self._socket]
+        raw, returncode = _run_capped(args, _SPIRE_AGENT_TIMEOUT, _SPIRE_AGENT_MAX_OUTPUT)
+        if raw is None:
+            raise RuntimeError(f"spire-agent fetch failed: output is larger than {_SPIRE_AGENT_MAX_OUTPUT} bytes")
+        if returncode != 0:
+            raise RuntimeError(f"spire-agent fetch failed: exit status {returncode}")
+        stdout = raw.decode("utf-8", "replace")
+        svid = _parse_spire_jwt_output(stdout)
+        if svid:
+            return svid
+        from .evidence import EvidenceNotFound  # evidence imports this module
+        # The output may hold a token or bundle that failed to parse, so the error gives only its size. Lines
+        # are counted by LF alone, as in the other ports (splitlines would also split on CR, VT, FF and more).
+        lines = stdout.count("\n") + (1 if stdout and not stdout.endswith("\n") else 0)
+        raise EvidenceNotFound(
+            f"could not parse a JWT-SVID from spire-agent output ({len(stdout.encode())} bytes, "
+            f"{lines} lines; not shown)")
+
+
+_SPIRE_AGENT_TIMEOUT = 30
+_SPIRE_AGENT_MAX_OUTPUT = 1 << 20   # the most stdout read from spire-agent, as in the other ports
+# How long stdout is still read after spire-agent has exited, as in the other ports. A helper the agent
+# started can inherit the pipe and hold it open; after this the pipe is closed.
+_SPIRE_AGENT_STDOUT_GRACE = 0.25
+_POLL_INTERVAL = 0.05   # how often the reader checks whether it should stop
+
+
+def _run_capped(args: list, timeout: float, max_bytes: int) -> "tuple[bytes | None, int]":
+    """Run ``args`` with stdin and stderr on the null device and return (stdout, exit status). stdout is read
+    on a separate thread so a chatty agent can't block the wait; past ``max_bytes`` the process is killed and
+    stdout is ``None``. A process still running after ``timeout`` seconds is killed and
+    :class:`subprocess.TimeoutExpired` raised, without any of its output.
+
+    The process's exit decides: once it has exited, stdout is read for at most ``_SPIRE_AGENT_STDOUT_GRACE``
+    seconds more, then the reader stops and closes the pipe, and what was read so far is returned. A helper
+    that inherited the pipe can keep it open, but never keeps this call waiting longer than that."""
+    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    lock = threading.Lock()   # guards kept, over and stop between the reader and this thread
+    kept = bytearray()
+    state = {"over": False, "stop": False}
+
+    def keep(chunk: bytes) -> bool:
+        """Add a chunk; False once the reader should stop."""
+        with lock:
+            if state["stop"]:
+                return False
+            if len(kept) + len(chunk) > max_bytes:
+                state["over"] = True
+                kept.clear()
+                proc.kill()
+                return False
+            kept.extend(chunk)
+            return True
+
+    def drain():  # owns the pipe: only this thread reads or closes it
+        selector = None
+        try:
+            fd = proc.stdout.fileno()
+            if os.name == "posix":   # Windows can't select on a pipe: there, plain blocking reads
+                selector = selectors.DefaultSelector()
+                selector.register(fd, selectors.EVENT_READ)
+            while True:
+                if selector is not None and not selector.select(_POLL_INTERVAL):
+                    with lock:
+                        if state["stop"]:
+                            return
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk or not keep(chunk):
+                    return
+        except (OSError, ValueError):
+            return
+        finally:
+            if selector is not None:
+                selector.close()
+            proc.stdout.close()
+
+    reader = threading.Thread(target=drain, name="spire-agent-output", daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _stop(proc, lock, state)
+        raise subprocess.TimeoutExpired(args, timeout) from None
+    except BaseException:   # e.g. KeyboardInterrupt: don't leave the agent running
+        _stop(proc, lock, state)
+        raise
+    # The agent has exited. What it wrote is in the pipe; give the reader the grace period to finish, then
+    # take what it has and stop it, whether or not a helper still holds the pipe open.
+    reader.join(_SPIRE_AGENT_STDOUT_GRACE)
+    with lock:
+        state["stop"] = True
+        return (None if state["over"] else bytes(kept)), proc.returncode
+
+
+def _stop(proc: subprocess.Popen, lock: threading.Lock, state: dict) -> None:
+    """Kill the agent, reap it, and tell the reader to close the pipe."""
+    with lock:
+        state["stop"] = True
+    proc.kill()
+    proc.wait()
+
+
+_SECTION = re.compile(r"(token|hint|bundle)\(.*?\):(.*)", re.DOTALL)
+_B64URL = re.compile(r"[A-Za-z0-9_-]+")
+_SPACE = " \t\r"   # the only characters ignored around a line or value, in every port: not a BOM or NBSP
+
+
+def _parse_spire_jwt_output(out: str) -> str | None:
+    """The first JWT-SVID in the output of ``spire-agent api fetch jwt``, or ``None``.
+
+    SPIRE prints each SVID as ``token(<spiffe id>):`` with the JWT on the next, tab-indented line, then
+    ``hint(<spiffe id>):`` and ``bundle(<trust domain>):`` sections laid out the same way. The single-line
+    form ``token(<spiffe id>): <jwt>`` and a bare JWT line are accepted too. Only a syntactically valid
+    compact JWS is returned; the values of hint and bundle sections are skipped. A label with no value takes
+    the next line as its value only if that line is not itself a label. Only ASCII space, tab and CR around a
+    line or value are ignored.
+    """
+    lines = out.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip(_SPACE)
+        section = _SECTION.fullmatch(line)
+        if section is None:
+            if _is_compact_jws(line):        # a bare compact JWT line
                 return line
-        raise RuntimeError(f"could not parse SVID from spire-agent output:\n{out.stdout}\n{out.stderr}")
+        else:
+            value = section.group(2).strip(_SPACE)
+            if not value and i + 1 < len(lines):  # the value is on the next line, unless that is another label
+                following = lines[i + 1].strip(_SPACE)
+                if _SECTION.fullmatch(following) is None:
+                    i += 1
+                    value = following
+            if section.group(1) == "token" and _is_compact_jws(value):
+                return value
+        i += 1
+    return None
+
+
+def _is_compact_jws(s: str) -> bool:
+    """Three non-empty base64url segments whose first is the canonical encoding of a strict JSON object (the
+    token validator's reader) with a non-empty string ``alg``. It verifies nothing; it tells a JWT from a
+    version string or log line."""
+    parts = s.split(".")
+    if len(parts) != 3 or not all(_B64URL.fullmatch(p) for p in parts):
+        return False
+    try:
+        header = _strict.parse_object(_strict.b64url_decode(parts[0]), "header")
+    except _strict.Malformed:
+        return False
+    return isinstance(header.get("alg"), str) and bool(header["alg"])
 
 
 class SpiffeAgentSvidSource:

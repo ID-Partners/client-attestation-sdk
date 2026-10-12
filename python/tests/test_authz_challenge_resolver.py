@@ -1,6 +1,7 @@
 """CibaResolver / WebConsentResolver: the ceremony state machine with all deployment edges faked."""
 import json
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -93,6 +94,42 @@ def test_transaction_hash_refuses_non_portable_values():
         transaction_hash({"when": object()})
 
 
+@pytest.mark.parametrize("fields", [
+    {1: "x"}, {"n": {1: "x"}}, {"n": [{"a": 1}, {True: "x"}]}, {None: "x"}, {"n": {1.5: "x"}},
+    {"n": ("a", "b")}, {"n": [1, ("a",)]}, {"n": {"m": (1,)}},
+], ids=["int_key", "nested_int_key", "bool_key_in_list", "none_key", "float_key", "tuple", "nested_tuple",
+        "tuple_in_object"])
+def test_transaction_hash_refuses_values_json_would_conflate(fields):
+    """{1: x} and {"1": x}, {True: x} and {"true": x}, a tuple and a list: JSON prints each pair the same,
+    so two different Python values would share one hash. Only one spelling is accepted."""
+    with pytest.raises(ValueError):
+        transaction_hash(fields)
+
+
+def test_transaction_hash_still_takes_shared_and_deep_values():
+    shared = {"a": "1"}
+    assert transaction_hash({"x": shared, "y": [shared, shared]}) == transaction_hash(
+        {"x": {"a": "1"}, "y": [{"a": "1"}, {"a": "1"}]})
+    cyclic: list = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError):             # json.dumps refuses the cycle; the key check terminates
+        transaction_hash({"c": cyclic})
+
+
+def test_transaction_hash_is_over_exact_code_points():
+    import unicodedata
+    nfc, nfd = unicodedata.normalize("NFC", "Jos\u00e9"), unicodedata.normalize("NFD", "Jos\u00e9")
+    assert nfc != nfd and transaction_hash({"payee": nfc}) != transaction_hash({"payee": nfd})
+
+
+def test_resolve_refuses_an_instruction_with_a_non_string_key():
+    fake, clock = FakeAS(), Clock()
+    r = _resolver(fake, clock)
+    with pytest.raises(ValueError):
+        r.resolve(CHALLENGE, subject="alice", initiator="agent", instruction={"amount": "1", 7: "x"})
+    assert fake.calls == []
+
+
 def test_happy_path_push_then_approve():
     fake, clock = FakeAS(), Clock()
     events = []
@@ -145,7 +182,7 @@ def test_settle_window_holds_approved_until_device_verdict_or_timeout():
     hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=3, persist=persist, rehydrate=rehydrate)
     r = _resolver(fake, clock, hooks)
     res = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
-    fake.token_answers = [(200, "{}")]
+    fake.token_answers = [(200, json.dumps({"access_token": "x"}))]
     p = r.poll(res.code)
     assert p.status == PENDING and p.detail.get("settling")          # AS said yes; we hold
     # the phone's stronger verdict lands in the durable store during the window
@@ -160,7 +197,7 @@ def test_settle_window_falls_back_to_device_approved():
     hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=3)
     r = _resolver(fake, clock, hooks)
     res = r.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
-    fake.token_answers = [(200, "{}")]
+    fake.token_answers = [(200, json.dumps({"access_token": "x"}))]
     assert r.poll(res.code).status == PENDING
     clock.t += 3.5
     p = r.poll(res.code)
@@ -199,7 +236,7 @@ def test_dedupe_across_replicas_via_persisted_lookup():
     fake, clock = FakeAS(), Clock()
     other = Ceremony(code="PAY-elsewhere", kind=RESOURCE_AUTHORISATION, channel=CHANNEL_DEVICE,
                      subject="alice", txn_hash=transaction_hash({"subject": "alice", **INSTR}),
-                     instruction=INSTR, initiator="replica-2", created_at=clock.t)
+                     instruction=INSTR, initiator="a", created_at=clock.t, resolver="ciba")
     other.extra["expires_in"] = 120
     hooks = Hooks(channel_for=lambda s: CHANNEL_DEVICE, settle_seconds=0,
                   find_live_persisted=lambda s, h: other.to_dict())
@@ -261,7 +298,7 @@ def test_attempt_cap_after_a_denial_but_not_after_an_approval():
     fake2, clock2 = FakeAS(), Clock()
     r2 = _resolver(fake2, clock2, max_attempts=1)
     a2 = r2.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
-    fake2.token_answers = [(200, "{}")]
+    fake2.token_answers = [(200, json.dumps({"access_token": "x"}))]
     assert r2.poll(a2.code).status == APPROVED
     b2 = r2.resolve(CHALLENGE, subject="alice", instruction=INSTR, initiator="a")
     assert isinstance(b2, Pending) and b2.code != a2.code and len(fake2.pushes) == 2
@@ -282,7 +319,7 @@ def test_poll_unknown_code_is_none_and_rehydrate_path():
     # rehydrate hook supplies a ceremony this process never saw
     cer = Ceremony(code="PAY-r", kind=RESOURCE_AUTHORISATION, channel=CHANNEL_DEVICE, subject="alice",
                    txn_hash="h", instruction=INSTR, initiator="x", created_at=clock.t, status=APPROVED,
-                   assurance="device-signed")
+                   assurance="device-signed", resolver="ciba")
     r2 = _resolver(fake, clock, Hooks(rehydrate=lambda code: cer.to_dict() if code == "PAY-r" else None))
     p = r2.poll("PAY-r")
     assert p.status == APPROVED and p.assurance == "device-signed"

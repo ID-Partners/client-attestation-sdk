@@ -36,6 +36,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false   # no job in this workflow uses git credentials
       - id: diff
         env:
           EVENT: ${{ github.event_name }}
@@ -76,6 +77,8 @@ jobs:
         working-directory: go
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go }}
@@ -104,6 +107,8 @@ jobs:
         working-directory: python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
@@ -124,6 +129,8 @@ jobs:
         working-directory: python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
@@ -141,6 +148,12 @@ jobs:
           PY
       - run: python -m pip install -c minimums.txt -e '.[test]'
       - run: python -m pytest
+      # release.yml builds the sdist and wheel with exactly this hash-pinned tooling, so a bump to
+      # .github/build-requirements.txt is proven here rather than at release time
+      - name: Build with the release's pinned tooling
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r ../.github/build-requirements.txt
+          python -m build --no-isolation --outdir "$RUNNER_TEMP/dist"
 
   typescript:
     name: node ${{ matrix.node }}
@@ -156,6 +169,8 @@ jobs:
         working-directory: typescript
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
@@ -182,6 +197,8 @@ jobs:
         working-directory: java
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
@@ -198,6 +215,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -229,5 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Every job that ran passed (a skipped job had nothing to check)
+        env:
+          NEEDS: ${{ toJSON(needs) }}   # via env, never spliced into the script
         run: |
-          echo '${{ toJSON(needs) }}' | python3 -c "import json,sys; n=json.load(sys.stdin); bad=[k for k,v in n.items() if v['result'] not in ('success','skipped')]; print('failed:', bad) if bad else print('all passed'); sys.exit(1 if bad else 0)"
+          printf '%s' "$NEEDS" | python3 -c "import json,sys; n=json.load(sys.stdin); bad=[k for k,v in n.items() if v['result'] not in ('success','skipped')]; print('failed:', bad) if bad else print('all passed'); sys.exit(1 if bad else 0)"

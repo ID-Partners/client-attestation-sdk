@@ -1,0 +1,133 @@
+{
+  "_comment": "Validator configurations on top of the shared config in tokens.json (a jwks_uri replaces the static jwks). `accepted`: building the validator succeeds; `refused`: it fails with the port's config error. Semantics: SEMANTICS.md, Configuration.",
+  "cases": [
+    {
+      "name": "jwks_uri_https",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "https://issuer.example.com/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_https_upper_case_scheme",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "HTTPS://issuer.example.com/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http",
+      "expect": "refused",
+      "config": {
+        "jwks_uri": "http://issuer.example.com/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_allow_insecure",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "http://issuer.example.com/jwks",
+        "allow_insecure": true
+      }
+    },
+    {
+      "name": "jwks_uri_http_localhost",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "http://localhost:8080/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_localhost_upper_case",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "http://LOCALHOST/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_127_0_0_1",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "http://127.0.0.1:9000/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_ipv6_loopback",
+      "expect": "accepted",
+      "config": {
+        "jwks_uri": "http://[::1]:8080/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_127_0_0_2",
+      "expect": "refused",
+      "config": {
+        "jwks_uri": "http://127.0.0.2/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_localhost_subdomain",
+      "expect": "refused",
+      "config": {
+        "jwks_uri": "http://localhost.attacker.example/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_http_localhost_userinfo",
+      "expect": "refused",
+      "config": {
+        "jwks_uri": "http://localhost@attacker.example/jwks"
+      }
+    },
+    {
+      "name": "jwks_uri_no_scheme",
+      "expect": "refused",
+      "config": {
+        "jwks_uri": "issuer.example.com/jwks"
+      }
+    },
+    {
+      "name": "introspection_https",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect"
+      }
+    },
+    {
+      "name": "introspection_http",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "http://issuer.example.com/introspect"
+      }
+    },
+    {
+      "name": "introspection_http_allow_insecure",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "http://issuer.example.com/introspect",
+        "allow_insecure": true
+      }
+    },
+    {
+      "name": "introspection_http_loopback",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "http://127.0.0.1:9000/introspect"
+      }
+    },
+    {
+      "name": "leeway_zero",
+      "expect": "accepted",
+      "config": {
+        "leeway_seconds": 0
+      }
+    },
+    {
+      "name": "leeway_negative",
+      "expect": "refused",
+      "config": {
+        "leeway_seconds": -1
+      }
+    }
+  ]
+}

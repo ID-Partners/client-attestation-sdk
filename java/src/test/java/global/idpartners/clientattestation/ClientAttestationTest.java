@@ -22,6 +22,8 @@ import org.junit.jupiter.api.Test;
  * (mirrors {@code python/tests/test_token_source.py}), plus base-URL normalization. No live PingFederate.
  */
 class ClientAttestationTest {
+    /** The evidence_audience the fake attester's discovery document names. */
+    private static final String AUD = "https://attester.example.com";
 
     private HttpServer server;
     private String baseUrl;
@@ -41,7 +43,7 @@ class ClientAttestationTest {
                     + "\"attestation_endpoint\":\"" + base + "/federation/attestation\","
                     + "\"challenge_endpoint\":\"" + base + "/federation/attestation-challenge\","
                     + "\"token_endpoint\":\"" + base + "/as/token.oauth2\","
-                    + "\"evidence_audience\":\"https://attester.example.com\","
+                    + "\"evidence_audience\":\"" + AUD + "\","
                     + "\"pop_audience\":\"https://pf.issuer.example\"}");
         });
 
@@ -81,7 +83,7 @@ class ClientAttestationTest {
 
     @Test
     void fullFlowReturnsAndCachesAToken() throws Exception {
-        ClientAttestation ca = ClientAttestation.builder(this.baseUrl)
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD)
                 .evidence(new SvidSource.Static("fake-svid")).build();
 
         String token = ca.token();
@@ -109,7 +111,7 @@ class ClientAttestationTest {
 
     @Test
     void dpopCombinedModeSendsDpopHeaderWithNonceInsteadOfPop() throws Exception {
-        ClientAttestation ca = ClientAttestation.builder(this.baseUrl)
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD)
                 .evidence(new SvidSource.Static("fake-svid"))
                 .popMethod("dpop_combined")
                 .build();
@@ -138,7 +140,7 @@ class ClientAttestationTest {
         operator.put("sub", "ops@example.com");
         operator.put("iss", "https://idp.example/é");
         operator.put("aud", java.util.List.of(Map.of("z", 1, "a", true)));
-        ClientAttestation ca = ClientAttestation.builder(this.baseUrl)
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD)
                 .evidence(new SvidSource.Static("fake-svid")).operator(operator).build();
         assertEquals("AT-xyz", ca.token());
 
@@ -156,7 +158,7 @@ class ClientAttestationTest {
 
     @Test
     void noOperatorMeansNothingSent() throws Exception {
-        ClientAttestation ca = ClientAttestation.builder(this.baseUrl)
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD)
                 .evidence(new SvidSource.Static("fake-svid")).operator(Map.of()).build();
         ca.token();
         assertFalse(this.lastMintBody.contains("operator"));
@@ -165,7 +167,7 @@ class ClientAttestationTest {
 
     @Test
     void challengeAtTokenFalseKeepsTheChallengeOutOfThePop() throws Exception {
-        ClientAttestation ca = ClientAttestation.builder(this.baseUrl)
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD)
                 .evidence(new SvidSource.Static("fake-svid")).challengeAtToken(false).build();
         assertEquals("AT-xyz", ca.token());
         assertFalse(JwtTestSupport.claims(this.lastPopHeader).containsKey("challenge"));
@@ -175,7 +177,7 @@ class ClientAttestationTest {
 
     @Test
     void challengeAtTokenFalseKeepsTheChallengeOutOfTheDpopNonce() throws Exception {
-        ClientAttestation ca = ClientAttestation.builder(this.baseUrl)
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD)
                 .evidence(new SvidSource.Static("fake-svid")).popMethod("dpop_combined").challengeAtToken(false)
                 .build();
         assertEquals("AT-xyz", ca.token());
@@ -185,7 +187,7 @@ class ClientAttestationTest {
 
     @Test
     void challengeAtTokenDefaultsToTrue() throws Exception {
-        ClientAttestation.builder(this.baseUrl).evidence(new SvidSource.Static("fake-svid")).build().token();
+        ClientAttestation.builder(this.baseUrl).evidenceAudience(AUD).evidence(new SvidSource.Static("fake-svid")).build().token();
         assertEquals("chal-123", JwtTestSupport.claims(this.lastPopHeader).get("challenge"));
         assertEquals("chal-123", mintProofChallenge());
     }
@@ -211,6 +213,60 @@ class ClientAttestationTest {
         assertEquals("https://pf.example.com", ClientAttestation.normalizeBaseUrl("https://pf.example.com/"));
         assertEquals("http://pf.pf:9080", ClientAttestation.normalizeBaseUrl("http://pf.pf:9080"));
         assertThrows(IllegalArgumentException.class, () -> ClientAttestation.normalizeBaseUrl("   "));
+    }
+
+    /** An evidence source that records the audiences it was asked for. */
+    private static final class RecordingSource implements SvidSource {
+        final java.util.List<String> audiences = new java.util.ArrayList<>();
+
+        @Override
+        public String fetch(String audience) {
+            this.audiences.add(audience);
+            return "svid";
+        }
+    }
+
+    @Test
+    void evidenceAudienceIsRequiredBeforeAnyRequest() {
+        // Without a pin the discovery document would choose the audience the workload's identity token is for.
+        RecordingSource source = new RecordingSource();
+        ClientAttestation ca = ClientAttestation.builder("https://attester.invalid") // not resolvable: any request would fail
+                .evidence(source).build();
+        ClientAttestation.ClientAttestationException e =
+                assertThrows(ClientAttestation.ClientAttestationException.class, ca::token);
+        assertTrue(e.getMessage().startsWith("evidenceAudience is required"), e.getMessage());
+        assertEquals(java.util.List.of(), source.audiences);
+    }
+
+    @Test
+    void aDiscoveredAudienceOtherThanThePinFetchesNoEvidence() {
+        RecordingSource source = new RecordingSource();
+        ClientAttestation ca = ClientAttestation.builder(this.baseUrl).evidence(source)
+                .evidenceAudience("https://other-service.example").build();
+        ClientAttestation.ClientAttestationException e =
+                assertThrows(ClientAttestation.ClientAttestationException.class, ca::token);
+        assertEquals("the attester asks for evidence for \"https://attester.example.com\", but evidenceAudience is "
+                + "\"https://other-service.example\"", e.getMessage());
+        assertEquals(java.util.List.of(), source.audiences);
+        assertNull(this.lastMintBody);
+    }
+
+    @Test
+    void staticMetadataNeedsNoPinButMustMatchOne() throws Exception {
+        AttesterMetadata meta = AttesterMetadata.of("aud-1", this.baseUrl + "/federation/attestation",
+                this.baseUrl + "/as/token.oauth2");
+        RecordingSource source = new RecordingSource();
+        ClientAttestation.ClientAttestationException e = assertThrows(ClientAttestation.ClientAttestationException.class,
+                () -> ClientAttestation.builder().metadata(meta).evidence(source).evidenceAudience("aud-2").build()
+                        .token());
+        assertTrue(e.getMessage().endsWith("but evidenceAudience is \"aud-2\""), e.getMessage());
+        assertEquals(java.util.List.of(), source.audiences);
+        // No pin needed: the flow runs to a token.
+        assertEquals("AT-xyz", ClientAttestation.builder().metadata(meta).evidence(source).build().token());
+        assertEquals(java.util.List.of("aud-1"), source.audiences);
+        // A matching pin is accepted.
+        assertEquals("AT-xyz", ClientAttestation.builder().metadata(meta).evidence(source).evidenceAudience("aud-1")
+                .build().token());
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────────────────────────────

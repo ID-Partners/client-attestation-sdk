@@ -19,6 +19,8 @@ import {
   autoDetectEvidence,
 } from "../src/index.js";
 
+const AUD = "https://attester.example"; // the evidence_audience the fake attester's discovery document names
+
 const servers: Server[] = [];
 const savedEnv = { ...process.env };
 
@@ -53,7 +55,7 @@ async function attester(opts: { challenge?: Challenge | null; discovery?: Record
       const doc: Record<string, string> = {
         attestation_endpoint: base + "/attest",
         token_endpoint: base + "/token",
-        evidence_audience: "https://attester.example",
+        evidence_audience: AUD,
       };
       if (opts.challenge !== null) doc.challenge_endpoint = base + "/challenge";
       return json(res, 200, { ...doc, ...opts.discovery });
@@ -92,26 +94,26 @@ describe("challenge fails closed", () => {
   for (const [what, challenge] of broken) {
     it(`fails the flow on ${what}`, async () => {
       const as = await attester({ challenge });
-      const err = await failure(new ClientAttestation(as.url, { evidence }).token());
+      const err = await failure(new ClientAttestation(as.url, { evidence, evidenceAudience: AUD }).token());
       expect(err.message).toContain("/challenge");
       expect(as.tokenPops).toEqual([]);
     });
 
     it(`proceeds without a challenge on ${what} when requireChallenge is false`, async () => {
       const as = await attester({ challenge });
-      expect(await new ClientAttestation(as.url, { evidence, requireChallenge: false }).token()).toBe("AT");
+      expect(await new ClientAttestation(as.url, { evidence, evidenceAudience: AUD, requireChallenge: false }).token()).toBe("AT");
       expect(decodeJwt(as.tokenPops[0]).challenge).toBeUndefined();
     });
   }
 
   it("keeps the status of a failed challenge call", async () => {
     const as = await attester({ challenge: (res) => json(res, 503, {}) });
-    expect((await failure(new ClientAttestation(as.url, { evidence }).token())).status).toBe(503);
+    expect((await failure(new ClientAttestation(as.url, { evidence, evidenceAudience: AUD }).token())).status).toBe(503);
   });
 
   it("needs no challenge when none is advertised", async () => {
     const as = await attester({ challenge: null });
-    expect(await new ClientAttestation(as.url, { evidence }).token()).toBe("AT");
+    expect(await new ClientAttestation(as.url, { evidence, evidenceAudience: AUD }).token()).toBe("AT");
     expect(decodeJwt(as.tokenPops[0]).challenge).toBeUndefined();
   });
 });
@@ -158,7 +160,7 @@ describe("transport security", () => {
   for (const endpoint of ["token_endpoint", "attestation_endpoint", "challenge_endpoint"]) {
     it(`refuses a non-https ${endpoint} from discovery`, async () => {
       const as = await attester({ discovery: { [endpoint]: "http://evil.example/x" } });
-      const err = await failure(new ClientAttestation(as.url, { evidence }).token());
+      const err = await failure(new ClientAttestation(as.url, { evidence, evidenceAudience: AUD }).token());
       expect(err.message).toContain(endpoint);
       expect(err.message).toContain("http://evil.example/x");
     });
@@ -166,12 +168,12 @@ describe("transport security", () => {
 
   it("refuses an unparseable endpoint", async () => {
     const as = await attester({ discovery: { token_endpoint: "::not a url" } });
-    expect((await failure(new ClientAttestation(as.url, { evidence }).token())).message).toContain("not a valid URL");
+    expect((await failure(new ClientAttestation(as.url, { evidence, evidenceAudience: AUD }).token())).message).toContain("not a valid URL");
   });
 
   it("lets allowInsecure reach a plain-http endpoint", async () => {
     const as = await attester({ discovery: { token_endpoint: "http://pf.invalid/token" } });
-    const err = await failure(new ClientAttestation(as.url, { evidence, allowInsecure: true, timeoutMs: 2000 }).token());
+    const err = await failure(new ClientAttestation(as.url, { evidence, evidenceAudience: AUD, allowInsecure: true, timeoutMs: 2000 }).token());
     expect(err.message).not.toContain("must use https");
   });
 });

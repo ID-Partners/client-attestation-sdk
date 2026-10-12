@@ -4,10 +4,17 @@
   none), plus the expected verdict. A case may carry `config` (overrides of the shared validator config:
   `accepted_algorithms`, `accepted_token_types` (null turns the typ check off), `leeway_seconds`) and `now`
   (the validator's clock, in epoch seconds). Without them the emitter uses the shared config and the real
-  clock.
+  clock. A case may also carry `jwks` (a key set that replaces the shared one, for the key-selection cases)
+  or `jwks_fetch_error` (no static key set: the validator is given a `jwks_uri` whose fetch fails with that
+  message), and `expect_description` (the result's error description must be exactly this).
 - validation/introspection.json: canned RFC 7662 introspection responses and the expected verdict of
-  `validate_active` / `validateActive` / `ValidateActive` for each. `"raises"` means the call must fail with
-  the port's error (an exception, or Go's returned error) rather than return a verdict.
+  `validate_active` / `validateActive` / `ValidateActive` for each (`expect`), and of the
+  `ProtectedResource.authenticate_active` guard (`expect_guard`) for the `guard` resource, whose validator
+  accepts every audience in `guard.audiences`. `"raises"` means the call must fail with the port's error (an
+  exception, or Go's returned error) rather than return a verdict.
+- validation/config.json: validator configurations (a `jwks_uri`, an introspection `endpoint`,
+  `allow_insecure`, `leeway_seconds`, each on top of the shared config) and whether building a validator from
+  each must be `"accepted"` or `"refused"` with the port's config error.
 
 validation/SEMANTICS.md says what every verdict means. Run: `python3 validation/generate.py`."""
 import base64
@@ -15,7 +22,7 @@ import json
 import os
 
 from cryptography.hazmat.primitives import hashes, hmac, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +68,22 @@ public_pem = issuer_key.public_key().public_bytes(serialization.Encoding.PEM,
 def es256(signing_input, key):
     r, s = decode_dss_signature(key.sign(signing_input, ec.ECDSA(hashes.SHA256())))
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+HASHES = {"256": hashes.SHA256, "384": hashes.SHA384, "512": hashes.SHA512}
+
+
+def jws_sign(signing_input, key, alg):
+    """Sign as `alg` says with whatever key is given, even one the algorithm shouldn't accept (an ES384
+    signature made with a P-256 key: the hash is SHA-384, the signature is sized by the key's curve)."""
+    digest = HASHES[alg[2:]]()
+    if alg.startswith("ES"):
+        size = (key.curve.key_size + 7) // 8
+        r, s = decode_dss_signature(key.sign(signing_input, ec.ECDSA(digest)))
+        return r.to_bytes(size, "big") + s.to_bytes(size, "big")
+    if alg.startswith("PS"):
+        return key.sign(signing_input, padding.PSS(padding.MGF1(digest), padding.PSS.DIGEST_LENGTH), digest)
+    return key.sign(signing_input, padding.PKCS1v15(), digest)
 
 
 def hs256(signing_input, secret):
@@ -276,12 +299,161 @@ cases = [
     case("sub_null", sign({**base, "sub": None}), "valid"),
 ]
 
+
+# --- key selection (step 3) and key use (step 4), each against its own key set ---
+ALL_ALGORITHMS = ["ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512"]
+p384_key = ec.generate_private_key(ec.SECP384R1())
+rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+rsa_weak_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+leaked_key = ec.generate_private_key(ec.SECP256R1())   # published with its private part
+ed25519_key = ed25519.Ed25519PrivateKey.generate()      # a key type a port may not read
+
+
+def int_b64u(n):
+    return b64u(n.to_bytes((n.bit_length() + 7) // 8, "big"))
+
+
+def jwk_of(key, kid=None, alg=None, private=False, **extra):
+    """A JWK for key; kid, alg and use are left out unless given, extra members are added as they are."""
+    if isinstance(key, rsa.RSAPrivateKey):
+        numbers = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "n": int_b64u(numbers.n), "e": int_b64u(numbers.e)}
+        if private:
+            jwk["d"] = int_b64u(key.private_numbers().d)
+    else:
+        size = (key.curve.key_size + 7) // 8
+        numbers = key.public_key().public_numbers()
+        jwk = {"kty": "EC", "crv": {256: "P-256", 384: "P-384", 521: "P-521"}[key.curve.key_size],
+               "x": b64u(numbers.x.to_bytes(size, "big")), "y": b64u(numbers.y.to_bytes(size, "big"))}
+        if private:
+            jwk["d"] = b64u(key.private_numbers().private_value.to_bytes(size, "big"))
+    if kid is not None:
+        jwk["kid"] = kid
+    if alg is not None:
+        jwk["alg"] = alg
+    jwk.update(extra)
+    return jwk
+
+
+def keyset(*jwks):
+    return {"keys": list(jwks)}
+
+
+ABSENT = object()
+
+
+def signed(key=issuer_key, alg="ES256", kid=KID, claims=None):
+    """The base claims signed with key as alg, with kid in the header (ABSENT leaves it out)."""
+    h = {"alg": alg}
+    if kid is not ABSENT:
+        h["kid"] = kid
+    h["typ"] = "at+jwt"
+    return compact(jcs(h), jcs(claims or base), lambda m: jws_sign(m, key, alg))
+
+
+every_alg = {"accepted_algorithms": ALL_ALGORITHMS}
+cases += [
+    # kid absent matches only a set holding exactly one key; kid-less JWKs are distinct keys, not one
+    case("kid_absent_two_kidless_keys", signed(kid=ABSENT), "key_not_found",
+         jwks=keyset(jwk_of(wrong_key), jwk_of(issuer_key))),
+    case("kid_absent_one_kidless_key", signed(kid=ABSENT), "valid", jwks=keyset(jwk_of(issuer_key))),
+    # an empty kid names no key, not even a JWK whose kid is the empty string
+    case("kid_empty_jwk_kid_empty", signed(kid=""), "key_not_found", jwks=keyset(jwk_of(issuer_key, kid=""))),
+    case("kid_absent_sole_jwk_kid_empty", signed(kid=ABSENT), "valid", jwks=keyset(jwk_of(issuer_key, kid=""))),
+    # duplicate kids: the first JWK with that kid that may be used for the alg, in document order
+    case("kid_duplicate_first_wins", signed(), "valid",
+         jwks=keyset(jwk_of(issuer_key, KID), jwk_of(wrong_key, KID))),
+    case("kid_duplicate_later_ignored", signed(), "invalid_signature",
+         jwks=keyset(jwk_of(wrong_key, KID), jwk_of(issuer_key, KID))),
+    case("kid_duplicate_other_alg_skipped", signed(), "valid",
+         jwks=keyset(jwk_of(wrong_key, KID, alg="ES384"), jwk_of(issuer_key, KID, alg="ES256"))),
+
+    # an EC key only verifies the algorithm of its curve: P-256 ES256, P-384 ES384, P-521 ES512
+    case("ec_p256_key_es384_token", signed(alg="ES384"), "invalid_signature",
+         config=every_alg, jwks=keyset(jwk_of(issuer_key, KID))),
+    case("ec_p256_key_declared_es384", signed(alg="ES384"), "invalid_signature",
+         config=every_alg, jwks=keyset(jwk_of(issuer_key, KID, alg="ES384"))),
+    case("ec_p384_key_es256_token", signed(p384_key, "ES256"), "invalid_signature",
+         config=every_alg, jwks=keyset(jwk_of(p384_key, KID))),
+    case("ec_p384_key_es384_token", signed(p384_key, "ES384"), "valid",
+         config=every_alg, jwks=keyset(jwk_of(p384_key, KID))),
+    case("ec_key_rs256_token", signed(rsa_key, "RS256"), "invalid_signature",
+         config=every_alg, jwks=keyset(jwk_of(issuer_key, KID))),
+
+    # an RSA JWK without alg verifies any RS* or PS* algorithm that is accepted; one with alg only that one
+    case("rsa_algless_rs256", signed(rsa_key, "RS256"), "valid", config=every_alg, jwks=keyset(jwk_of(rsa_key, KID))),
+    case("rsa_algless_rs512", signed(rsa_key, "RS512"), "valid", config=every_alg, jwks=keyset(jwk_of(rsa_key, KID))),
+    case("rsa_algless_ps256", signed(rsa_key, "PS256"), "valid", config=every_alg, jwks=keyset(jwk_of(rsa_key, KID))),
+    case("rsa_algless_ps384", signed(rsa_key, "PS384"), "valid", config=every_alg, jwks=keyset(jwk_of(rsa_key, KID))),
+    case("rsa_declared_rs256_ps256_token", signed(rsa_key, "PS256"), "key_not_found",
+         config=every_alg, jwks=keyset(jwk_of(rsa_key, KID, alg="RS256"))),
+    case("rsa_key_es256_token", signed(), "invalid_signature", config=every_alg, jwks=keyset(jwk_of(rsa_key, KID))),
+    # an RSA key under 2048 bits verifies nothing
+    case("rsa_1024_rs256", signed(rsa_weak_key, "RS256"), "invalid_signature",
+         config=every_alg, jwks=keyset(jwk_of(rsa_weak_key, KID))),
+    case("rsa_1024_declared_ps256", signed(rsa_weak_key, "PS256"), "invalid_signature",
+         config=every_alg, jwks=keyset(jwk_of(rsa_weak_key, KID, alg="PS256"))),
+
+    # a JWK not meant for verifying signatures is skipped, as if it weren't in the set
+    case("jwk_use_enc_skipped", signed(), "key_not_found", jwks=keyset(jwk_of(issuer_key, KID, use="enc"))),
+    case("jwk_use_enc_not_counted", signed(kid=ABSENT), "valid",
+         jwks=keyset(jwk_of(issuer_key, use="sig"), jwk_of(wrong_key, use="enc"))),
+    case("jwk_key_ops_without_verify", signed(), "key_not_found",
+         jwks=keyset(jwk_of(issuer_key, KID, key_ops=["encrypt"]))),
+    case("jwk_key_ops_verify", signed(), "valid", jwks=keyset(jwk_of(issuer_key, KID, key_ops=["verify"]))),
+    # key_ops holding "verify" among other operations (a JWK exported from a key pair) still verifies
+    case("jwk_key_ops_sign_verify", signed(), "valid",
+         jwks=keyset(jwk_of(issuer_key, KID, key_ops=["sign", "verify"]))),
+    case("jwk_key_ops_verify_encrypt", signed(), "valid",
+         jwks=keyset(jwk_of(issuer_key, KID, key_ops=["verify", "encrypt"]))),
+    case("rsa_key_ops_sign_verify_ps256", signed(rsa_key, "PS256"), "valid",
+         config=every_alg, jwks=keyset(jwk_of(rsa_key, KID, key_ops=["sign", "verify"]))),
+    case("jwk_private_ec_skipped", signed(leaked_key), "key_not_found",
+         jwks=keyset(jwk_of(leaked_key, KID, private=True))),
+    case("jwk_private_not_counted", signed(kid=ABSENT), "valid",
+         jwks=keyset(jwk_of(leaked_key, private=True), jwk_of(issuer_key))),
+    case("jwk_private_rsa_skipped", signed(rsa_key, "RS256"), "key_not_found",
+         config=every_alg, jwks=keyset(jwk_of(rsa_key, KID, private=True))),
+
+    # a JWK the port can't read is left out, and the rest of the set still counts
+    case("jwk_unknown_kty_skipped", signed(), "valid",
+         jwks=keyset({"kty": "foo", "kid": KID}, jwk_of(issuer_key, KID))),
+    # (its own kid: a port that reads Ed25519 has a key it simply doesn't use for an ES256 token)
+    case("jwk_ed25519_skipped", signed(), "valid",
+         jwks=keyset({"kty": "OKP", "crv": "Ed25519", "kid": "ed25519",
+                      "x": b64u(ed25519_key.public_key().public_bytes(serialization.Encoding.Raw,
+                                                                      serialization.PublicFormat.Raw))},
+                     jwk_of(issuer_key, KID))),
+    case("jwk_ec_without_y_skipped", signed(), "valid",
+         jwks=keyset({k: v for k, v in jwk_of(wrong_key, KID).items() if k != "y"}, jwk_of(issuer_key, KID))),
+    case("jwk_rsa_without_e_skipped", signed(), "valid",
+         jwks=keyset({"kty": "RSA", "kid": KID, "n": int_b64u(rsa_key.public_key().public_numbers().n)},
+                     jwk_of(issuer_key, KID))),
+    case("jwk_non_object_skipped", signed(), "valid",
+         jwks=keyset("not a jwk", 42, None, ["kty"], jwk_of(issuer_key, KID))),
+    case("jwk_unreadable_not_counted", signed(kid=ABSENT), "valid",
+         jwks=keyset({"kty": "foo"}, "not a jwk", None, jwk_of(issuer_key))),
+
+    # a failed jwks_uri fetch never reaches the caller: the description is fixed, the detail goes to the log
+    case("jwks_fetch_failed", sign(base), "key_not_found",
+         jwks_fetch_error="GET https://keys.internal.example:8443/jwks failed: 503 <html>backend \ufffd</html>",
+         expect_description="signing keys unavailable"),
+
+    # a \u escape takes exactly four ASCII hex digits: not Arabic-Indic digits, not fullwidth letters
+    case("header_escape_arabic_indic_digits",
+         compact(b'{"alg":"ES256","kid":"' + KID.encode() + b'","typ":"at+jwt","x":"\\u' +
+                 "\u0660\u0660".encode("utf-8") + b'41"}', jcs(base)), "invalid_token"),
+    case("payload_escape_fullwidth_hex", raw(with_raw_member('"n":"\\u00\uff21\uff21"')), "invalid_token"),
+]
+
 names = [c["name"] for c in cases]
 assert len(names) == len(set(names)), "duplicate case names"
 
 out = {
     "_comment": "TEST ONLY. The issuer key behind these tokens was thrown away after signing; the tokens and "
-                "JWKS are published test vectors. Never trust them anywhere real. Semantics: SEMANTICS.md.",
+                "JWKS are published test vectors. Some cases' JWKS deliberately include private JWKs (with \"d\"), "
+                "throwaway keys that check a private key in a JWKS is skipped. Never trust any of them anywhere "
+                "real. Semantics: SEMANTICS.md.",
     "issuer": ISSUER,
     "audience": AUDIENCE,
     "required_scopes": REQUIRED_SCOPES,
@@ -294,18 +466,21 @@ with open(os.path.join(HERE, "tokens.json"), "w") as fh:
     fh.write("\n")
 
 
-def icase(name, expect, response=None, **extra):
-    c = {"name": name, "expect": expect}
+def icase(name, expect, response=None, guard=None, **extra):
+    """`guard` is the authenticate_active verdict, when it differs from the validate_active one."""
+    c = {"name": name, "expect": expect, "expect_guard": guard or expect}
     if response is not None:
         c["response"] = response
     c.update(extra)
     return c
 
 
+OTHER_RESOURCE = "https://other.example.com"
 active = {"active": True, "sub": "agent-1", "scope": "read write", "aud": AUDIENCE, "client_id": "rp"}
 introspection_cases = [
     icase("active", "valid", active),
-    icase("active_no_aud", "valid", without(active, "aud")),
+    # the AS needn't return aud, but then nothing says the token is for this resource: the guard refuses it
+    icase("active_no_aud", "valid", without(active, "aud"), guard="invalid_audience"),
     icase("active_aud_array", "valid", {**active, "aud": ["https://other.example.com", AUDIENCE]}),
     icase("inactive", "inactive", {"active": False}),
     # RFC 7662 section 2.2: active is a boolean; only JSON true counts
@@ -319,7 +494,14 @@ introspection_cases = [
     icase("scp_array", "valid", {**without(active, "scope"), "scp": ["read"]}),
     icase("scp_string", "valid", {**without(active, "scope"), "scp": "read write"}),
     icase("scp_non_string_entry", "invalid_token", {**without(active, "scope"), "scp": ["read", 7]}),
-    icase("wrong_audience", "invalid_audience", {**active, "aud": "https://other.example.com"}),
+    # the guard's validator accepts the other resource too, so only the guard's binding catches this
+    icase("wrong_audience", "invalid_audience", {**active, "aud": OTHER_RESOURCE}),
+    # a sender-constrained token needs its proof checked, which a Bearer guard can't do
+    icase("cnf_jkt", "valid", {**active, "cnf": {"jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"}},
+          guard="invalid_token"),
+    icase("cnf_x5t", "valid", {**active, "cnf": {"x5t#S256": "bwcK0esc3ACC3DB2Y5_lESsXE8o9ltc05O89jdN-dg2"}},
+          guard="invalid_token"),
+    icase("cnf_null", "valid", {**active, "cnf": None}),
     icase("aud_non_string_entry", "invalid_token", {**active, "aud": [AUDIENCE, 7]}),
     icase("sub_number", "invalid_token", {**active, "sub": 7}),
     # transport and configuration failures are errors, never a verdict
@@ -330,10 +512,51 @@ with open(os.path.join(HERE, "introspection.json"), "w") as fh:
     json.dump({
         "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, "
                     "with required_scopes and audience from tokens.json. `raises`: the call must fail with the "
-                    "port's error. Semantics: SEMANTICS.md.",
+                    "port's error. expect_guard: the verdict of ProtectedResource.authenticate_active for the "
+                    "guard resource, whose validator accepts guard.audiences. Semantics: SEMANTICS.md.",
+        "guard": {"resource": AUDIENCE, "audiences": [AUDIENCE, OTHER_RESOURCE]},
         "cases": introspection_cases,
     }, fh, indent=2, ensure_ascii=True)
     fh.write("\n")
 
-print(f"wrote validation/tokens.json ({len(cases)} cases) and validation/introspection.json "
-      f"({len(introspection_cases)} cases)")
+
+
+def ccase(name, expect, **config):
+    return {"name": name, "expect": expect, "config": config}
+
+
+config_cases = [
+    # https everywhere except the client's loopback hosts, unless allow_insecure (SEMANTICS.md, Configuration)
+    ccase("jwks_uri_https", "accepted", jwks_uri=ISSUER + "/jwks"),
+    ccase("jwks_uri_https_upper_case_scheme", "accepted", jwks_uri="HTTPS://issuer.example.com/jwks"),
+    ccase("jwks_uri_http", "refused", jwks_uri="http://issuer.example.com/jwks"),
+    ccase("jwks_uri_http_allow_insecure", "accepted", jwks_uri="http://issuer.example.com/jwks",
+          allow_insecure=True),
+    ccase("jwks_uri_http_localhost", "accepted", jwks_uri="http://localhost:8080/jwks"),
+    ccase("jwks_uri_http_localhost_upper_case", "accepted", jwks_uri="http://LOCALHOST/jwks"),
+    ccase("jwks_uri_http_127_0_0_1", "accepted", jwks_uri="http://127.0.0.1:9000/jwks"),
+    ccase("jwks_uri_http_ipv6_loopback", "accepted", jwks_uri="http://[::1]:8080/jwks"),
+    # only the three names are exempt, not the rest of 127/8 or a name that starts with localhost
+    ccase("jwks_uri_http_127_0_0_2", "refused", jwks_uri="http://127.0.0.2/jwks"),
+    ccase("jwks_uri_http_localhost_subdomain", "refused", jwks_uri="http://localhost.attacker.example/jwks"),
+    ccase("jwks_uri_http_localhost_userinfo", "refused", jwks_uri="http://localhost@attacker.example/jwks"),
+    ccase("jwks_uri_no_scheme", "refused", jwks_uri="issuer.example.com/jwks"),
+    ccase("introspection_https", "accepted", introspection_endpoint=ISSUER + "/introspect"),
+    ccase("introspection_http", "refused", introspection_endpoint="http://issuer.example.com/introspect"),
+    ccase("introspection_http_allow_insecure", "accepted",
+          introspection_endpoint="http://issuer.example.com/introspect", allow_insecure=True),
+    ccase("introspection_http_loopback", "accepted", introspection_endpoint="http://127.0.0.1:9000/introspect"),
+    ccase("leeway_zero", "accepted", leeway_seconds=0),
+    ccase("leeway_negative", "refused", leeway_seconds=-1),
+]
+with open(os.path.join(HERE, "config.json"), "w") as fh:
+    json.dump({
+        "_comment": "Validator configurations on top of the shared config in tokens.json (a jwks_uri replaces the "
+                    "static jwks). `accepted`: building the validator succeeds; `refused`: it fails with the "
+                    "port's config error. Semantics: SEMANTICS.md, Configuration.",
+        "cases": config_cases,
+    }, fh, indent=2, ensure_ascii=True)
+    fh.write("\n")
+
+print(f"wrote validation/tokens.json ({len(cases)} cases), validation/introspection.json "
+      f"({len(introspection_cases)} cases) and validation/config.json ({len(config_cases)} cases)")

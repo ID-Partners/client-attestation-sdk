@@ -8,6 +8,11 @@ package clientattestation
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -49,16 +54,19 @@ func Generate(algorithm string) (*SigningKeyPair, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to generate a %s key: %w", algorithm, err)
 	}
-	key, err := jwk.FromRaw(raw)
-	if err != nil {
-		return nil, fmt.Errorf("unable to import generated %s key: %w", algorithm, err)
-	}
-	return newSigningKeyPair(key, algorithm)
+	return newSigningKeyPair(raw, algorithm)
 }
 
 // FromJWK wraps an existing JWK (which must contain the private component "d")
 // for the given algorithm. The jwkJSON argument may be raw JSON bytes, a string,
 // or a map[string]any.
+//
+// The key must suit the algorithm: an EC key on the algorithm's curve for
+// ES256/384/512 (P-256/384/521), an RSA key of at least 2048 bits for
+// RS256/384/512 and PS256/384/512. Its public members must belong to its private
+// key. Only the key material is kept: the published JWK is re-encoded
+// canonically (fixed-width EC coordinates, minimal RSA integers) and its kid is
+// always the RFC 7638 thumbprint, whatever "kid" or other members the input had.
 func FromJWK(jwkJSON any, algorithm string) (*SigningKeyPair, error) {
 	var data []byte
 	switch v := jwkJSON.(type) {
@@ -86,7 +94,69 @@ func FromJWK(jwkJSON any, algorithm string) (*SigningKeyPair, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse JWK: %w", err)
 	}
-	return newSigningKeyPair(key, algorithm)
+	var raw any
+	if err := key.Raw(&raw); err != nil {
+		return nil, fmt.Errorf("unable to read the JWK's key material: %w", err)
+	}
+	return newSigningKeyPair(raw, algorithm)
+}
+
+// ecAlgorithmCurve is the curve each ECDSA JWS algorithm signs on.
+var ecAlgorithmCurve = map[string]elliptic.Curve{
+	"ES256": elliptic.P256(), "ES384": elliptic.P384(), "ES512": elliptic.P521(),
+}
+
+// rsaAlgorithms are the RSA JWS algorithms the SDK signs with.
+var rsaAlgorithms = map[string]bool{
+	"RS256": true, "RS384": true, "RS512": true, "PS256": true, "PS384": true, "PS512": true,
+}
+
+// minRSABits is the smallest RSA modulus the SDK signs with.
+const minRSABits = 2048
+
+// isSigningAlgorithm reports whether alg is one the SDK signs with: ES256/384/512, RS256/384/512 or
+// PS256/384/512.
+func isSigningAlgorithm(alg string) bool {
+	_, ec := ecAlgorithmCurve[alg]
+	return ec || rsaAlgorithms[alg]
+}
+
+// checkKeyForAlgorithm refuses a key the algorithm can't sign with (wrong type, wrong curve, RSA under
+// 2048 bits) and a key whose public half doesn't belong to its private half: signing with one key while
+// advertising another (as kid, cnf.jwk or the DPoP jwk) gives credentials no verifier will accept.
+func checkKeyForAlgorithm(raw any, algorithm string) error {
+	if !isSigningAlgorithm(algorithm) {
+		return fmt.Errorf("unsupported signing algorithm: %s", algorithm)
+	}
+	digest := sha256.Sum256([]byte("client-attestation-sdk key pair check"))
+	switch k := raw.(type) {
+	case *ecdsa.PrivateKey:
+		curve, ok := ecAlgorithmCurve[algorithm]
+		if !ok {
+			return fmt.Errorf("%s needs an RSA key, not an EC key", algorithm)
+		}
+		if k.Curve == nil || k.Curve.Params().Name != curve.Params().Name {
+			return fmt.Errorf("%s needs an EC key on %s", algorithm, curve.Params().Name)
+		}
+		sig, err := ecdsa.SignASN1(rand.Reader, k, digest[:])
+		if err != nil || !ecdsa.VerifyASN1(&k.PublicKey, digest[:], sig) {
+			return fmt.Errorf("the JWK's public key (x, y) does not match its private key (d)")
+		}
+	case *rsa.PrivateKey:
+		if !rsaAlgorithms[algorithm] {
+			return fmt.Errorf("%s needs an EC key, not an RSA key", algorithm)
+		}
+		if k.N == nil || k.N.BitLen() < minRSABits {
+			return fmt.Errorf("RSA keys must be at least %d bits", minRSABits)
+		}
+		sig, err := rsa.SignPKCS1v15(rand.Reader, k, crypto.SHA256, digest[:])
+		if err != nil || rsa.VerifyPKCS1v15(&k.PublicKey, crypto.SHA256, digest[:], sig) != nil {
+			return fmt.Errorf("the JWK's public key (n, e) does not match its private key")
+		}
+	default:
+		return fmt.Errorf("%s needs an EC or RSA private key", algorithm)
+	}
+	return nil
 }
 
 // jwkHasPrivate reports whether the JWK JSON carries a private component ("d").
@@ -99,7 +169,17 @@ func jwkHasPrivate(data []byte) bool {
 	return ok
 }
 
-func newSigningKeyPair(private jwk.Key, algorithm string) (*SigningKeyPair, error) {
+// newSigningKeyPair wraps a raw private key (*ecdsa.PrivateKey or *rsa.PrivateKey). The JWK is rebuilt
+// from the raw key, so it carries no caller-supplied members: jws.Sign copies a key's own "kid" into the
+// header, which must always be the thumbprint.
+func newSigningKeyPair(raw any, algorithm string) (*SigningKeyPair, error) {
+	if err := checkKeyForAlgorithm(raw, algorithm); err != nil {
+		return nil, err
+	}
+	private, err := jwk.FromRaw(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unable to import %s key: %w", algorithm, err)
+	}
 	pub, err := private.PublicKey()
 	if err != nil {
 		return nil, fmt.Errorf("unable to derive public key: %w", err)

@@ -106,7 +106,7 @@ func loggingAttester(t *testing.T, tokenType, demandNonce string) *httptest.Serv
 			"attestation_endpoint": srv.URL + "/federation/attestation",
 			"challenge_endpoint":   srv.URL + "/federation/attestation-challenge",
 			"token_endpoint":       srv.URL + "/as/token.oauth2?SECRET=1",
-			"evidence_audience":    "https://attester.example.com",
+			"evidence_audience":    fakeAudience,
 		})
 	})
 	mux.HandleFunc("/federation/attestation-challenge", func(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +142,7 @@ func TestLoggingFullFlowNeverLogsSecrets(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := loggingAttester(t, tc.tokenType, tc.nonce)
 			logger, buf := debugLogger()
-			ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: logSecretSvid}),
+			ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: logSecretSvid}),
 				WithPopMethod(tc.popMethod), WithLogger(logger))
 			if err != nil {
 				t.Fatal(err)
@@ -202,7 +202,7 @@ func TestLoggingResourceNonceRetry(t *testing.T) {
 	as := newDpopAS(t, "DPoP")
 	rs := newDpopResource(t, as)
 	logger, buf := debugLogger()
-	ca, err := NewClientAttestation(as.srv.URL, WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
+	ca, err := NewClientAttestation(as.srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: "fake-svid"}),
 		WithPopMethod(PopMethodDpopCombined), WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		}))
 		defer srv.Close()
 		logger, buf := debugLogger()
-		ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
+		ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
 		if _, err := ca.Token(ctx); err == nil {
 			t.Fatal("expected an error")
 		}
@@ -245,7 +245,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		}))
 		defer srv.Close()
 		logger, buf := debugLogger()
-		ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
+		ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
 		_, _ = ca.Token(ctx)
 		if e := findEvent(events(t, buf), "http.failed"); e == nil || e["reason"] != "malformed" {
 			t.Errorf("http.failed = %v", e)
@@ -258,7 +258,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		}))
 		defer srv.Close()
 		logger, buf := debugLogger()
-		ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
+		ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
 		_, _ = ca.Token(ctx)
 		if e := findEvent(events(t, buf), "http.failed"); e == nil || e["reason"] != "redirect" || e["status"] != float64(302) {
 			t.Errorf("http.failed = %v", e)
@@ -271,7 +271,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		defer srv.Close()
 		defer close(release)
 		logger, buf := debugLogger()
-		ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger),
+		ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger),
 			WithTimeout(50*time.Millisecond))
 		_, _ = ca.Token(ctx)
 		if e := findEvent(events(t, buf), "http.failed"); e == nil || e["reason"] != "timeout" {
@@ -285,7 +285,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		mux.HandleFunc("/.well-known/client-attester", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 200, map[string]any{
 				"attestation_endpoint": srv.URL + "/mint", "challenge_endpoint": srv.URL + "/challenge",
-				"token_endpoint": srv.URL + "/token", "evidence_audience": "aud",
+				"token_endpoint": srv.URL + "/token", "evidence_audience": shortAudience,
 			})
 		})
 		mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 500, nil) })
@@ -299,7 +299,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		srv = httptest.NewServer(mux)
 		defer srv.Close()
 		logger, buf := debugLogger()
-		ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger),
+		ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger),
 			WithRequireChallenge(false))
 		_, _ = ca.Token(ctx)
 		evs := requireEvents(t, buf, "challenge.skipped")
@@ -320,7 +320,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		mux.HandleFunc("/.well-known/client-attester", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 200, map[string]any{
 				"attestation_endpoint": srv.URL + "/mint", "token_endpoint": "http://127.0.0.1:1/token",
-				"evidence_audience": "aud",
+				"evidence_audience": shortAudience,
 			})
 		})
 		mux.HandleFunc("/mint", func(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +330,7 @@ func TestLoggingHTTPFailures(t *testing.T) {
 		srv = httptest.NewServer(mux)
 		defer srv.Close()
 		logger, buf := debugLogger()
-		ca, _ := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
+		ca, _ := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience), WithEvidence(StaticSvidSource{SVID: "x"}), WithLogger(logger))
 		_, _ = ca.Token(ctx)
 		e := findEvent(events(t, buf), "http.failed")
 		if e == nil || e["step"] != "token" || e["reason"] != "network" || e["host"] != "127.0.0.1:1" {
@@ -363,7 +363,7 @@ func TestLoggingIsSilentByDefault(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	srv := loggingAttester(t, "Bearer", "")
-	ca, err := NewClientAttestation(srv.URL, WithEvidence(StaticSvidSource{SVID: logSecretSvid}), WithLogger(nil))
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(StaticSvidSource{SVID: logSecretSvid}), WithLogger(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

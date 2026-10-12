@@ -2,6 +2,7 @@ package tokenvalidator
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,10 +30,17 @@ type vectorCase struct {
 	// accepted_token_types turns the typ check off).
 	Config map[string]json.RawMessage `json:"config"`
 	Now    *int64                     `json:"now"`
+	// JWKS replaces the shared key set; JWKSFetchError instead gives the validator a jwks_uri whose fetch
+	// fails with that message. ExpectDescription, when set, is the exact error description expected.
+	JWKS              json.RawMessage `json:"jwks"`
+	JWKSFetchError    *string         `json:"jwks_fetch_error"`
+	ExpectDescription *string         `json:"expect_description"`
 }
 
-// shared reports whether a case runs under the shared config and the real clock.
-func (c vectorCase) shared() bool { return c.Config == nil && c.Now == nil }
+// shared reports whether a case runs under the shared config, key set and the real clock.
+func (c vectorCase) shared() bool {
+	return c.Config == nil && c.Now == nil && c.JWKS == nil && c.JWKSFetchError == nil
+}
 
 // validatorFor is the validator a case asks for: the shared config plus its overrides and clock.
 func validatorFor(t *testing.T, v vectorFile, c vectorCase) *AccessTokenValidator {
@@ -67,6 +75,14 @@ func validatorFor(t *testing.T, v vectorFile, c vectorCase) *AccessTokenValidato
 	if c.Now != nil {
 		at := time.Unix(*c.Now, 0)
 		opts = append(opts, WithClock(func() time.Time { return at }))
+	}
+	if c.JWKS != nil {
+		cfg.JWKS = c.JWKS
+	}
+	if c.JWKSFetchError != nil {
+		message := *c.JWKSFetchError
+		cfg.JWKS, cfg.JWKSURI = nil, "https://keys.internal.example:8443/jwks"
+		opts = append(opts, WithHTTPGet(func(string) ([]byte, error) { return nil, errors.New(message) }))
 	}
 	val, err := New(cfg, opts...)
 	if err != nil {
@@ -119,6 +135,9 @@ func TestVectorsMatchExpected(t *testing.T) {
 		}
 		if got != c.Expect {
 			t.Errorf("%s: expected %s, got %s", c.Name, c.Expect, got)
+		}
+		if c.ExpectDescription != nil && r.ErrorDescription != *c.ExpectDescription {
+			t.Errorf("%s: description %q, want %q", c.Name, r.ErrorDescription, *c.ExpectDescription)
 		}
 	}
 }

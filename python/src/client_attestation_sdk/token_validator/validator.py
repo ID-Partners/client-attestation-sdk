@@ -13,7 +13,7 @@ from client_attestation_sdk.errors import TransportError
 
 from . import _strict, errors
 from .config import _is_forbidden_algorithm, _normalise_type
-from .jwks import JwksProvider
+from .jwks import JwksProvider, key_fits
 from .result import ValidationResult
 
 
@@ -47,10 +47,13 @@ class AccessTokenValidator:
 
     def __init__(self, config, http_post=None, http_get=None, *, clock=None):
         """``clock`` returns the current time in epoch seconds (default :func:`time.time`); inject one to
-        validate as of a fixed instant."""
-        self.config = config
+        validate as of a fixed instant.
+
+        The validator keeps its own copy of ``config``: changing that object (or its lists, or its
+        introspection settings) afterwards doesn't change what the validator accepts."""
+        self.config = config._checked_copy()
         self._clock = clock or time.time
-        self._jwks = JwksProvider(jwks=config.jwks, jwks_uri=config.jwks_uri, http_get=http_get)
+        self._jwks = JwksProvider(jwks=self.config.jwks, jwks_uri=self.config.jwks_uri, http_get=http_get)
         self._http_post = http_post or _default_post
 
     def validate(self, token, required_scopes=None):
@@ -72,10 +75,14 @@ class AccessTokenValidator:
         kid = header.get("kid")
         key = self._jwks.resolve(kid, alg) if kid is None or isinstance(kid, str) else None
         if key is None:
-            return ValidationResult._failure(errors.KEY_NOT_FOUND, self._jwks.last_error or "no signing key for this kid")
+            # a fetch failure's detail (internal host, dial error, IdP body) went to the log as jwks.fetch_failed;
+            # the description lands in WWW-Authenticate, in front of anyone
+            return ValidationResult._failure(
+                errors.KEY_NOT_FOUND,
+                "signing keys unavailable" if self._jwks.last_error else "no signing key for this kid")
 
         try:
-            verified = jwt.get_algorithm_by_name(alg).verify(signing_input, key, signature)
+            verified = key_fits(alg, key) and jwt.get_algorithm_by_name(alg).verify(signing_input, key, signature)
         except Exception:
             verified = False
         if not verified:

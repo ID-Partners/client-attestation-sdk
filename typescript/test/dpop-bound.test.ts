@@ -10,7 +10,15 @@ import { type AddressInfo } from "node:net";
 import { calculateJwkThumbprint, compactVerify, decodeJwt, decodeProtectedHeader, importJWK, type JWK } from "jose";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ClientAttestation, DpopProofBuilder, SigningKeyPair, StaticSvidSource } from "../src/index.js";
+import {
+  ClientAttestation,
+  ClientAttestationError,
+  DpopProofBuilder,
+  SigningKeyPair,
+  StaticSvidSource,
+} from "../src/index.js";
+
+const AUD = "https://attester.example"; // the evidence_audience the fake attester's discovery document names
 
 const servers: Server[] = [];
 
@@ -31,6 +39,18 @@ describe("credential redirects", () => {
       await response.body?.cancel();
     }
     expect(targetHits).toBe(0);
+  });
+
+  it("refuses a plain-http resource unless it is loopback or allowInsecure is set", async () => {
+    const as = await authorizationServer();
+    const ca = client(as.url);
+    await expect(ca.requestHeaders("GET", "http://api.example.com/things")).rejects.toThrow(
+      "resource URL must use https",
+    );
+    await expect(ca.fetch("http://api.example.com/things")).rejects.toThrow("resource URL must use https");
+    expect((await ca.requestHeaders("GET", `${as.url}/things`)).Authorization).toMatch(/^DPoP /);
+    const insecure = client(as.url, { allowInsecure: true });
+    expect((await insecure.requestHeaders("GET", "http://api.example.com/things")).Authorization).toMatch(/^DPoP /);
   });
 });
 
@@ -81,7 +101,7 @@ async function authorizationServer(opts: AsOptions = {}) {
         attestation_endpoint: base + "/attest",
         challenge_endpoint: base + "/challenge",
         token_endpoint: base + "/token",
-        evidence_audience: "https://attester.example",
+        evidence_audience: AUD,
       });
     }
     if (req.url === "/challenge") return json(res, 200, { attestation_challenge: "attester-chal" });
@@ -145,7 +165,7 @@ async function resourceServer(boundKeys: Map<string, string>, opts: ResourceOpti
 
 function client(asUrl: string, extra: Record<string, unknown> = {}): ClientAttestation {
   return new ClientAttestation(asUrl, {
-    evidence: new StaticSvidSource("svid"),
+    evidence: new StaticSvidSource("svid"), evidenceAudience: AUD,
     popMethod: "dpop_combined",
     ...extra,
   });
@@ -274,8 +294,8 @@ describe("dpop_combined: DPoP-bound tokens at a resource", () => {
     expect(decodeJwt((await ca.requestHeaders("GET", `${rs}/next`)).DPoP).nonce).toBe("fresh");
     expect((await ca.fetch(`${rs}/bad`)).status).toBe(400);
     expect(hits).toBe(2);
-    // an unparseable url still gets a proof (nonces are keyed by the raw string)
-    expect((await ca.requestHeaders("GET", "relative/path")).Authorization).toBe("DPoP AT-1");
+    // a url with no scheme or host gets no credential
+    await expect(ca.requestHeaders("GET", "relative/path")).rejects.toThrow("resource URL is not a valid URL");
   });
 
   it("requestHeaders gives the DPoP scheme, a proof with htm/htu/ath and the remembered nonce", async () => {
@@ -337,7 +357,7 @@ describe("dpop_combined: DPoP-bound tokens at a resource", () => {
         return json(res, 200, {
           attestation_endpoint: `http://${req.headers.host}/attest`,
           token_endpoint: tokenUrl + "/token",
-          evidence_audience: "aud",
+          evidence_audience: AUD,
         });
       }
       json(res, 200, { attestation: `h.${Buffer.from('{"sub":"d"}').toString("base64url")}.s` });
@@ -359,7 +379,7 @@ describe("dpop_combined: DPoP-bound tokens at a resource", () => {
         return json(res, 200, {
           attestation_endpoint: base + "/attest",
           token_endpoint: rotating + "/token",
-          evidence_audience: "aud",
+          evidence_audience: AUD,
         });
       }
       const sub = Buffer.from(JSON.stringify({ sub: "demo", k: body.length })).toString("base64url");
@@ -385,12 +405,12 @@ describe("Bearer tokens are unchanged", () => {
     const url = await listen((req, res) => {
       const base = `http://${req.headers.host}`;
       if (req.url === "/.well-known/client-attester") {
-        return json(res, 200, { attestation_endpoint: base + "/attest", token_endpoint: base + "/token", evidence_audience: "a" });
+        return json(res, 200, { attestation_endpoint: base + "/attest", token_endpoint: base + "/token", evidence_audience: AUD });
       }
       if (req.url === "/attest") return json(res, 200, { attestation: `h.${Buffer.from('{"sub":"d"}').toString("base64url")}.s` });
       json(res, 200, { access_token: "AT-plain" });
     });
-    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid") });
+    const ca = new ClientAttestation(url, { evidence: new StaticSvidSource("svid"), evidenceAudience: AUD });
     expect(await ca.requestHeaders("GET", "https://api.example/x")).toEqual({ Authorization: "Bearer AT-plain" });
   });
 });
@@ -409,12 +429,182 @@ describe("DpopProofBuilder normalisation", () => {
     expect(claims.ath).toBe(createHash("sha256").update("tok").digest("base64url"));
   });
 
-  it("keeps a non-default port, adds no path to a bare origin, and leaves unparseable input alone", async () => {
+  it("keeps a non-default port, adds no path to a bare origin, and refuses a URL with no htu", async () => {
     const key = await SigningKeyPair.generate("ES256");
     const htu = async (uri: string) => decodeJwt(await new DpopProofBuilder(key).uri(uri).accessToken(null).build()).htu;
     expect(await htu("https://as.example:8443/token?x")).toBe("https://as.example:8443/token");
     expect(await htu("https://as.example?x")).toBe("https://as.example");
-    expect(await htu("not a url#frag")).toBe("not a url");
+    await expect(htu("not-a-url#frag")).rejects.toThrow("uri (htu) must be an absolute http or https URL with a host");
     expect(decodeJwt(await new DpopProofBuilder(key).uri("https://a/").build()).ath).toBeUndefined();
+  });
+});
+
+describe("the DPoP nonce memory", () => {
+  /** Stubs fetch for every URL outside the AS: `handler` answers those. */
+  function stubResources(asUrl: string, handler: (url: string, init?: RequestInit) => Promise<Response> | Response) {
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).startsWith(asUrl) ? realFetch(input, init) : handler(String(input), init));
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const nonceOf = async (ca: ClientAttestation, url: string) =>
+    decodeJwt((await ca.requestHeaders("GET", url)).DPoP).nonce;
+
+  it("ignores a DPoP-Nonce over 1024 characters, and does not answer a challenge carrying one", async () => {
+    const as = await authorizationServer();
+    const ca = client(as.url);
+    const long = "n".repeat(1025);
+    let hits = 0;
+    stubResources(as.url, (url) => {
+      hits += 1;
+      if (url.endsWith("/fits")) return new Response("ok", { headers: { "DPoP-Nonce": "n".repeat(1024) } });
+      return new Response(null, {
+        status: 401,
+        headers: { "WWW-Authenticate": 'DPoP error="use_dpop_nonce"', "DPoP-Nonce": long },
+      });
+    });
+    expect((await ca.fetch("https://rs.example/data")).status).toBe(401);
+    expect(hits).toBe(1);
+    expect(await nonceOf(ca, "https://rs.example/next")).toBeUndefined();
+    await ca.fetch("https://rs.example/fits");
+    expect(await nonceOf(ca, "https://rs.example/next")).toBe("n".repeat(1024));
+  });
+
+  it("remembers at most 256 origins, forgetting the one stored longest ago", async () => {
+    const as = await authorizationServer();
+    const ca = client(as.url);
+    stubResources(as.url, (url) => new Response("ok", { headers: { "DPoP-Nonce": "n-" + new URL(url).hostname } }));
+    const count = 256 + 44;
+    for (let i = 0; i < count; i++) {
+      await ca.fetch(`https://h${i}.example/p${i}`);
+      await ca.fetch("https://h1.example/"); // kept fresh, so never the oldest
+    }
+    expect(await nonceOf(ca, "https://h0.example/")).toBeUndefined();
+    expect(await nonceOf(ca, "https://h1.example/")).toBe("n-h1.example");
+    expect(await nonceOf(ca, `https://h${count - 1}.example/`)).toBe(`n-h${count - 1}.example`);
+  });
+
+  it("answers a challenge with its own nonce, even if another response stored one meanwhile", async () => {
+    const as = await authorizationServer();
+    const ca = client(as.url);
+    const proofs: Record<string, unknown>[] = [];
+    stubResources(as.url, (url, init) => {
+      if (url.endsWith("/other")) return new Response("ok", { headers: { "DPoP-Nonce": "other-nonce" } });
+      proofs.push(decodeJwt(new Headers(init?.headers).get("DPoP") as string));
+      if (proofs.length > 1) return new Response("ok");
+      // While the client reads this challenge's body, a concurrent response stores another nonce.
+      const body = new ReadableStream({
+        async pull(controller) {
+          await ca.fetch("https://rs.example/other");
+          controller.enqueue(new TextEncoder().encode('{"error":"use_dpop_nonce"}'));
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 400, headers: { "DPoP-Nonce": "challenge-nonce" } });
+    });
+    expect((await ca.fetch("https://rs.example/data")).status).toBe(200);
+    expect(proofs.map((p) => p.nonce)).toEqual([undefined, "challenge-nonce"]);
+  });
+});
+
+describe("URLs that parsers disagree on", () => {
+  const ambiguous = [
+    "https://evil.example\\@as.example/t",
+    "https://as.example/a\\b",
+    " https://as.example/t",
+    "https://as.example/t ",
+    "https://as.example\t/t",
+    "https://as.example/t\n",
+    "https://as.example/\x00t",
+    "https://as.example/\x7ft",
+  ];
+
+  it.each(ambiguous)("requestHeaders and DpopProofBuilder refuse %j", async (url) => {
+    const as = await authorizationServer();
+    const ca = client(as.url);
+    await expect(ca.requestHeaders("GET", url)).rejects.toThrow(ClientAttestationError);
+    const key = await SigningKeyPair.generate("ES256");
+    await expect(new DpopProofBuilder(key).uri(url).build()).rejects.toThrow(
+      /backslash, whitespace or control character/,
+    );
+  });
+
+  const noHtu = ["https://b\u00fccher.example/t"];
+
+  it.each(noHtu.flatMap((url) => ["DPoP", "Bearer"].map((tokenType) => [url, tokenType])))(
+    "a dpop_combined client refuses %j (%s token), which has no htu, before fetching the token",
+    async (url, tokenType) => {
+      const as = await authorizationServer({ tokenType });
+      const ca = client(as.url);
+      const err = await ca.requestHeaders("GET", url).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ClientAttestationError);
+      expect((err as Error).message).toMatch(/^uri \(htu\) /);
+      expect(as.tokenProofs).toHaveLength(0); // a cold cache: no mint and no token request
+    },
+  );
+
+  /** An attester + AS for the attestation_pop_jwt method, issuing tokens of `tokenType`. */
+  async function popJwtServer(tokenType: string) {
+    return listen((req, res) => {
+      const base = `http://${req.headers.host}`;
+      if (req.url === "/.well-known/client-attester") {
+        return json(res, 200, { attestation_endpoint: base + "/attest", token_endpoint: base + "/token", evidence_audience: "a" });
+      }
+      if (req.url === "/attest") return json(res, 200, { attestation: `h.${Buffer.from('{"sub":"d"}').toString("base64url")}.s` });
+      json(res, 200, { access_token: "AT-plain", token_type: tokenType });
+    });
+  }
+
+  it.each(noHtu)("a client not configured for DPoP sends a Bearer token to %j, as before", async (url) => {
+    const ca = new ClientAttestation(await popJwtServer("Bearer"), { evidence: new StaticSvidSource("svid"), evidenceAudience: "a" });
+    expect(await ca.requestHeaders("GET", url)).toEqual({ Authorization: "Bearer AT-plain" });
+  });
+
+  it.each(noHtu)("a DPoP token the AS chose still refuses %j", async (url) => {
+    const ca = new ClientAttestation(await popJwtServer("DPoP"), { evidence: new StaticSvidSource("svid"), evidenceAudience: "a" });
+    const err = await ca.requestHeaders("GET", url).catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/^uri \(htu\) /);
+  });
+
+  // fetch (WHATWG) sends "[", "]", "|" and a lone "%" as written (and escapes "^"), so the proof's htu must
+  // name the target exactly as sent: a conforming resource (RFC 9449 section 4.3) compares after RFC 3986 section 6.2.2
+  // normalisation, which decodes only unreserved characters, so "%5B" is not "[".
+  it("fetch signs the request target it sends, with [ ] | and a lone % as written", async () => {
+    const as = await authorizationServer();
+    const seen: { target: string; htu: unknown }[] = [];
+    const rs = await listen(async (req, res) => {
+      const { claims } = await verifyProof(req.headers["dpop"] as string);
+      seen.push({ target: `http://${req.headers.host}${(req.url as string).split("?")[0]}`, htu: claims.htu });
+      json(res, 200, { ok: true });
+    });
+    const ca = client(as.url);
+    for (const path of ["/items[0]", "/a[b]/c|d^e", "/100%", "/caf\u00e9[x]"]) {
+      expect((await ca.fetch(`${rs}${path}?q=1`)).status).toBe(200);
+    }
+    // The proof names exactly the target the server received. How fetch writes "^" differs between Node
+    // versions (raw on 20 and 22, %5E later), so only what every version sends as written is pinned.
+    expect(seen).toHaveLength(4);
+    for (const { target, htu } of seen) expect(htu).toBe(target);
+    expect(seen[0].target).toBe(`${rs}/items[0]`);
+    expect(seen[1].target).toMatch(/\/a\[b\]\/c\|d(\^|%5E)e$/);
+    expect(seen[2].target).toBe(`${rs}/100%`);
+    expect(seen[3].target).toBe(`${rs}/caf%C3%A9[x]`);
+  });
+
+  it("leaves what follows the path alone, and fetch signs the URL it sends", async () => {
+    const key = await SigningKeyPair.generate("ES256");
+    const proof = await new DpopProofBuilder(key).uri("https://as.example/t?q=a\\b c#a b").build();
+    expect(decodeJwt(proof).htu).toBe("https://as.example/t");
+
+    // fetch parses the URL as WHATWG does (a backslash is a slash), and the proof names that URL.
+    const as = await authorizationServer();
+    const rs = await resourceServer(as.boundKeys);
+    const ca = client(as.url);
+    expect((await ca.fetch(`${rs.url}/a\\b`)).status).toBe(200);
+    expect(rs.seen.at(-1)?.proof.htu).toBe(`${rs.url}/a/b`);
   });
 });

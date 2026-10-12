@@ -70,12 +70,16 @@ final class Fixtures {
                 .acceptedAlgorithms((List<String>) v.get("accepted_algorithms"));
     }
 
-    /** Whether a case runs under the shared config and the real clock. */
+    /** Whether a case runs under the shared config, key set and the real clock. */
     static boolean shared(Map<String, Object> c) {
-        return c.get("config") == null && c.get("now") == null;
+        return c.get("config") == null && c.get("now") == null && c.get("jwks") == null
+                && c.get("jwks_fetch_error") == null;
     }
 
-    /** The validator a case asks for: the shared config plus its overrides (present wins) and clock. */
+    /**
+     * The validator a case asks for: the shared config plus its overrides (present wins), key set and clock. A
+     * case with a fetch error gets a jwks_uri whose fetch fails with that message.
+     */
     @SuppressWarnings("unchecked")
     static AccessTokenValidator validatorFor(Map<String, Object> v, Map<String, Object> c) {
         ValidatorConfig.Builder b = vectorConfig(v);
@@ -91,7 +95,16 @@ final class Fixtures {
                 b.leewaySeconds(((Number) o.get("leeway_seconds")).intValue());
             }
         }
-        AccessTokenValidator.Builder builder = AccessTokenValidator.builder(b.build());
+        if (c.get("jwks") != null) {
+            b.jwks((Map<String, Object>) c.get("jwks"));
+        }
+        String fetchError = (String) c.get("jwks_fetch_error");
+        if (fetchError != null) {
+            b.jwks((Map<String, Object>) null).jwksUri("https://keys.internal.example:8443/jwks");
+        }
+        AccessTokenValidator.Builder builder = AccessTokenValidator.builder(b.build()).httpGet(url -> {
+            throw new IllegalStateException(fetchError);
+        });
         if (c.get("now") != null) {
             long millis = ((Number) c.get("now")).longValue() * 1000L;
             builder.clock(() -> millis);
@@ -104,6 +117,17 @@ final class Fixtures {
         try {
             return (List<Map<String, Object>>) JsonUtil.parseJson(
                     Files.readString(Path.of("..", "validation", "introspection.json"))).get("cases");
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** validation/bearer.json: each case is an Authorization header and the token every port extracts. */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> bearerCases() {
+        try {
+            return (List<Map<String, Object>>) JsonUtil.parseJson(
+                    Files.readString(Path.of("..", "validation", "bearer.json"))).get("cases");
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }

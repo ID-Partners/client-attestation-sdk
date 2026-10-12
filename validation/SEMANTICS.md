@@ -3,9 +3,10 @@
 This is the contract every port's resource-server validator implements (Python
 `client_attestation_sdk.token_validator`, TypeScript `src/validator`, Go `tokenvalidator`, Java
 `global.idpartners.clientattestation.tokenvalidator`). For the same token, config and clock, all four return
-the same verdict. [`tokens.json`](tokens.json) and [`introspection.json`](introspection.json) pin it: each
-case names the rule it tests, and [`../verify-validation.sh`](../verify-validation.sh) fails if any port
-disagrees with any expected verdict. CI runs it on every pull request.
+the same verdict. [`tokens.json`](tokens.json), [`introspection.json`](introspection.json) and
+[`config.json`](config.json) pin it: each case names the rule it tests, and
+[`../verify-validation.sh`](../verify-validation.sh) fails if any port disagrees with any expected verdict. CI
+runs it on every pull request.
 
 Where a rule could go either way, it fails closed: a token the validator can't read unambiguously is refused.
 
@@ -44,6 +45,24 @@ claim as `invalid_token` and HTTP 401 because this API receives no sender proof.
 behaviour. All four resource suites sign and exercise these cases. Low-level `validate` remains JWT
 validation only; a caller using a sender-constrained token must verify its sender proof separately.
 
+### Bearer extraction
+
+`bearerToken` (Python `bearer_token`, Go `BearerToken`), and so `ProtectedResource.authenticate`, takes the
+token from an `Authorization` header value. Every port returns what Go's RE2 pattern
+`(?i)^\s*Bearer\s+(.+?)\s*$` returns, or no token (Go `""`, the others null / `None`):
+
+- Only space, tab, LF, FF and CR count as whitespace. A vertical tab, NBSP, U+0085, U+2028 or any other
+  non-ASCII space does not separate the scheme from the token, so `Bearer<NBSP>x` has no token.
+- The scheme `Bearer` matches case-insensitively in ASCII only.
+- Whitespace before the scheme and after the token is dropped. The token may contain any character but LF,
+  including inner spaces and CR, so `Bearer a\nb` has no token.
+- When only whitespace follows the scheme, the token is the last non-LF character after the first
+  whitespace character: `Bearer  ` (two spaces) gives `" "`, while `Bearer ` and `Bearer \n` give none.
+
+Every port parses the header in linear time; none runs a backtracking regular expression on it.
+[`bearer.json`](bearer.json) pins this: each case is a header and the token every port must return, and all
+four resource test suites read it.
+
 ## Local validation, in order
 
 `validate` runs these steps in this order and returns the first failure. The order is part of the contract:
@@ -72,19 +91,37 @@ happens to hold a symmetric or mislabelled key.
 
 ### 3. Key → `key_not_found`
 
+The key set is the JWKs that may verify a signature, in document order. A JWK is left out, as if it weren't
+published, when its `use` is present and not `"sig"`, when its `key_ops` is present and is not an array
+holding `"verify"`, when it carries a private key member (`d`, `p`, `q`, `dp`, `dq`, `qi` or `k`), or when the
+port can't read it (an entry that isn't a JSON object, a key type or curve the port doesn't support, a
+malformed key). A JWK left out costs only itself, never the rest of the set. Every JWK left is its own key:
+JWKs without a `kid` are never merged into one.
+
 - `kid` absent (or JSON `null`): the token matches a key only when the key set holds exactly one key.
-- `kid` a string: the key with that `kid`. An empty string matches no key.
+- `kid` a string: the first key in the set with that `kid` that may be used for the header `alg` (one with
+  that `kid` that declares another `alg` is passed over). An empty string matches no key, not even a JWK
+  whose `kid` is the empty string.
 - `kid` any other type: no key.
 - A JWK that declares `alg` is only used for that `alg`.
 
 With a `jwks_uri`, an unknown `kid` triggers at most one refetch per 30 seconds (and a set older than an
-hour is refetched); a failed fetch keeps the keys already held. The failure reason is the description.
+hour is refetched); a failed fetch keeps the keys already held. When no key matches and the last fetch
+failed, the description is exactly `signing keys unavailable`. Why the fetch failed (the JWKS host, a
+network error, the issuer's response) goes to the log as `jwks.fetch_failed`, never into the description,
+which a resource puts in its `WWW-Authenticate` header for anyone to read.
 
 ### 4. Signature → `invalid_signature`
 
 The signature over `header.payload` (the ASCII of the first two segments) must verify with the resolved key
 under exactly the header `alg`. A signature of the wrong length, or a key the algorithm can't use, is
-`invalid_signature`.
+`invalid_signature`. What an algorithm can use, whether or not the JWK declares `alg`:
+
+- `ES256`, `ES384` and `ES512` need an EC key on P-256, P-384 and P-521 respectively. A P-256 key never
+  verifies an `ES384` signature, even one made with that key.
+- `RS*` and `PS*` need an RSA key with a modulus of at least 2048 bits (RFC 7518 section 3.3). An RSA JWK
+  without `alg` verifies any of them that is accepted.
+- A key of another type (an EC key for `RS256`, an RSA key for `ES256`) verifies nothing.
 
 ### 5. Payload → `invalid_token`
 
@@ -151,7 +188,9 @@ only if it is:
 
 - valid UTF-8 (RFC 8259 section 8.1), with no byte-order mark;
 - one JSON value per RFC 8259 with nothing but whitespace after it: no `NaN` or `Infinity`, no trailing
-  commas, no leading zeros, no raw control characters in strings, no single quotes or bare names;
+  commas, no leading zeros, no raw control characters in strings, no single quotes or bare names, and a
+  `\u` escape takes exactly four ASCII hex digits (`0-9 a-f A-F`; not Arabic-Indic digits or fullwidth
+  letters);
 - an object at the top level;
 - no deeper than **64** levels of nesting (the outermost object is level 1);
 - free of duplicate member names in **every** object at any depth. Names are compared after escapes are
@@ -164,8 +203,8 @@ now detect them themselves.
 
 Numbers are read as IEEE 754 doubles wherever that matters: a number too large for a double becomes
 ±infinity rather than an error, so it is only malformed where a NumericDate is expected. (Python keeps an
-integer of up to 4000 digits exact and Java keeps a large integer as a `BigInteger`; the verdict is the same,
-only the type in the claims map differs.)
+integer of up to 4000 digits exact and Java one of up to 19 digits, as a `Long` or `BigInteger`; a longer one
+is a double there too. The verdict is the same, only the type in the claims map differs.)
 
 ## Configuration
 
@@ -184,6 +223,59 @@ Python, TypeScript and Java tell "omitted" from "empty" by the argument being ab
 
 Every port can be given a clock (Python `clock=`, epoch seconds; TypeScript `clock`, epoch milliseconds; Go
 `WithClock`; Java `Builder.clock`, epoch milliseconds), which is how the shared vectors pin leeway.
+That clock is only for `exp`, `nbf` and `iat`. The JWKS cache ages, and spaces its refetches, on the
+runtime's monotonic clock (Python `time.monotonic`, TypeScript `performance.now`, Go the monotonic reading
+of `time.Now`, Java `System.nanoTime`), so validating as of a fixed instant, or a step in the wall clock,
+neither stops nor forces a refetch.
+
+A configuration that can't be honoured is refused when the validator is built, with the port's config
+error (Python `ValueError`, TypeScript `Error`, Go an `error` from `New`, Java `IllegalArgumentException`),
+never discovered later as a token that slipped through:
+
+- **Leeway** is a non-negative integer number of seconds. A negative leeway is refused in every port.
+  Python also refuses anything but an `int` (a `bool`, a float, `NaN`), and TypeScript anything but a
+  non-negative safe integer (`NaN`, a fraction, a string): `NaN` makes every time comparison false, which
+  would switch off the `exp`, `nbf` and `iat` checks, and `"60"` would concatenate.
+- **List options** (accepted algorithms, accepted token types, required scopes, and audiences when given as
+  a list) are lists of strings. Python and TypeScript refuse a bare string or a non-string entry: a bare
+  string would be read as its characters, so `"at+jwt"` would accept a `typ` of `t`. (A single audience may
+  still be passed as a string.) Go and Java's types already rule this out.
+- **Endpoints.** The JWKS URI and the introspection endpoint must use `https`. Over plain http anyone on
+  the path could serve their own keys and forge any token, or read the client secret the resource server
+  sends to the introspection endpoint. The only exemptions are the ones the client makes for its own
+  endpoints: a loopback host (`localhost`, `127.0.0.1` or `::1`, case-insensitively; not the rest of
+  127/8 and not a name that merely starts with `localhost`), and an explicit opt-out named like the client's:
+  Python `allow_insecure=True`, TypeScript `allowInsecure: true`, Go `Config.AllowInsecure`, Java
+  `Builder.allowInsecure(true)`. Python, like its client, exempts only `http://` on a loopback host; the
+  other ports, like theirs, exempt a loopback host whatever the scheme.
+
+[`config.json`](config.json) pins these: each case is a configuration on top of the shared one and whether
+building a validator from it is `accepted` or `refused`.
+
+### AS-metadata discovery
+
+Python `discover` and Java `Discovery.discover` (the ports that have it) fetch an RFC 8414 / OpenID Connect
+metadata document, and return it only if it is safe to configure a validator from:
+
+1. The metadata URL must use https, with the same exemptions as above (`allow_insecure` /
+   `allowInsecure`). This is checked before any request.
+2. The expected issuer is the one the caller passes (`issuer=` / the `issuer` argument), or else the one the
+   URL was built from: `/.well-known/oauth-authorization-server` or `/.well-known/openid-configuration`
+   inserted after the host (RFC 8414 section 3.1: `https://as.example/.well-known/oauth-authorization-server/t1`
+   is issuer `https://as.example/t1`), or appended to the issuer's path (OpenID Connect Discovery section 4:
+   `https://as.example/t1/.well-known/openid-configuration` is `https://as.example/t1`). Insertion is tried
+   first. A URL that is neither, or has a query or fragment, names no issuer, and the call is refused before
+   any request unless the caller passes one.
+3. The body is read as [strict JSON](#strict-json) and must be an object.
+4. Its `issuer` must be a string equal to the expected issuer (RFC 8414 section 3.3). A passed issuer is
+   compared exactly. A derived one may also come back with a terminating `/`, which RFC 8414 and OpenID
+   Connect Discovery drop when building the URL.
+5. `jwks_uri` and `introspection_endpoint`, when present and not `null`, must be strings that use https,
+   with the same exemptions.
+
+An insecure metadata URL, or one that names no issuer, is a config error (Python `ValueError`, Java
+`IllegalArgumentException`). A failed fetch or a document that fails steps 3 to 5 is a failed call
+(`TransportError` / `TransportException`): the document says nothing the validator can use.
 
 ## Introspection
 
@@ -221,6 +313,26 @@ When the call succeeds, the response is checked in this order:
 Introspection does not check `exp`, `nbf`, `iat`, `iss` or the token type: that is the authorisation server's
 job, and `active: true` is its answer.
 
+### The introspection guard
+
+`ProtectedResource.authenticate_active` / `authenticateActive` / `AuthenticateActive` guards a request with
+`validate_active` and then applies the same two rules as the JWT guard, `authenticate`:
+
+1. **This resource.** The response's audience must name the resource the guard was built for. A validator may
+   accept several audiences (one per resource it serves), so an audience the validator accepts can still name
+   a different resource: `invalid_audience`. A response with no audience is refused too (`invalid_audience`),
+   because nothing then says the token was issued for this resource.
+2. **No sender constraint.** A response with a `cnf` member that isn't `null` is `invalid_token`. A
+   DPoP-bound or mTLS-bound token is only usable with its proof, which a Bearer guard never sees.
+
+Both rules run after `validate_active`'s own checks, so a response that fails one of those first gets that
+verdict instead. For example, a response for another resource that also lacks a required scope is
+`insufficient_scope` (403), not `invalid_audience` (401). Either way the guard refuses it.
+
+A failed introspection call fails the guard the same way it fails `validate_active`. `expect_guard` in
+`introspection.json` pins the guard's verdict for every case, for a guard whose validator accepts both
+`guard.audiences`.
+
 ## Known limits
 
 - **Unpaired surrogate escapes in member names.** Go's JSON decoder turns an unpaired `\ud800`-style escape
@@ -236,3 +348,6 @@ job, and `active: true` is its answer.
 Extend [`generate.py`](generate.py) (never hand-edit the JSON), run `python3 validation/generate.py`, then
 `./verify-validation.sh`. The generator signs with a throwaway key on every run, so every token changes;
 that is expected. A new rule belongs in this document too.
+
+[`bearer.json`](bearer.json) has no signed tokens, so it is edited by hand. Escape control and non-ASCII
+characters (`\u000b`, `\u00a0`), and use null for "no token". The four ports' resource tests read it directly.

@@ -186,7 +186,7 @@ func TestChallengeAtTokenFalseDropsTokenEndpointCopy(t *testing.T) {
 
 func TestChallengeAtTokenFalseUsesRememberedDpopNonce(t *testing.T) {
 	srv, captured := wireAttester(t)
-	ca, err := NewClientAttestation(srv.URL,
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(shortAudience),
 		WithEvidence(StaticSvidSource{SVID: "s"}),
 		WithChallengeAtToken(false),
 		WithPopMethod(PopMethodDpopCombined))

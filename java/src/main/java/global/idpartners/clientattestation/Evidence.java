@@ -10,13 +10,15 @@
  *   - the GCP metadata server (GCE, GKE, Cloud Run, Vertex AI Agent Engine).
  *
  * {@link #autoDetect()} tries these in order and returns the first that applies, so a caller can write
- * {@code new ClientAttestation(attesterUrl)} and have it work without naming the source. Override by passing an
+ * {@code ClientAttestation.builder(attesterUrl).evidenceAudience(audience).build()} and have it work without
+ * naming the source. Override by passing an
  * explicit {@link SvidSource} to {@link ClientAttestation}.
  */
 package global.idpartners.clientattestation;
 
 import global.idpartners.clientattestation.internal.HttpTransport;
 import java.net.URI;
+import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -107,15 +109,37 @@ public final class Evidence {
                         + "explicitly.");
     }
 
+    /**
+     * Whether the GCP metadata server answers at {@code url}: HTTP 200 with {@code Metadata-Flavor: Google}.
+     * {@code metadata.google.internal} is a DNS name, so whatever a search domain, LLMNR or a hostile resolver
+     * points it at could answer; the header is what google-auth checks too.
+     */
     static boolean gcpMetadataAvailable(String url, Duration timeout) {
         try {
-            HttpTransport.Response r = HttpTransport.send(HttpTransport.client(timeout),
+            HttpTransport.Response r = HttpTransport.send(metadataClient(timeout),
                     HttpRequest.newBuilder(URI.create(url)).header("Metadata-Flavor", "Google").GET(), timeout);
-            return r.status() >= 200 && r.status() < 500;
+            return r.status() == 200 && fromGoogleMetadata(r);
         } catch (RuntimeException e) {
             // TransportException (unreachable, timeout, redirect, oversize) or a malformed URL: not on GCP.
             return false;
         }
+    }
+
+    /** Whether a response carries the header the GCP metadata server always sets. */
+    static boolean fromGoogleMetadata(HttpTransport.Response response) {
+        return response.headers().firstValue("Metadata-Flavor").filter("Google"::equals).isPresent();
+    }
+
+    /**
+     * A client for GCP metadata requests: no redirects, and never a proxy, since the identity request is plain
+     * HTTP and a proxy would see the ID token.
+     */
+    static HttpClient metadataClient(Duration connectTimeout) {
+        return HttpClient.newBuilder()
+                .connectTimeout(connectTimeout)
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .proxy(HttpClient.Builder.NO_PROXY)
+                .build();
     }
 
     /** No platform identity could be detected and none was supplied. */
