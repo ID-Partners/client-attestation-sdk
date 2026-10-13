@@ -103,6 +103,51 @@ class IntrospectionTest {
         assertThrows(NullPointerException.class, () -> new IntrospectionConfig(null, "a", "b"));
     }
 
+    // F5: anything but the two methods used to be taken as client_secret_post, moving the secret into the form
+    @Test
+    void introspectionConfigAcceptsOnlyTheTwoAuthMethods() {
+        for (String method : List.of(IntrospectionConfig.CLIENT_SECRET_BASIC, IntrospectionConfig.CLIENT_SECRET_POST)) {
+            IntrospectionConfig c = new IntrospectionConfig(ENDPOINT, "rs", "s3cret", method);
+            assertEquals(method, c.authMethod());
+            AccessTokenValidator.builder(config().introspection(c).build()).build();
+        }
+        // unset (null or "", e.g. System.getenv with no variable) is the default, client_secret_basic
+        for (String method : new String[] {null, ""}) {
+            assertEquals(IntrospectionConfig.CLIENT_SECRET_BASIC,
+                    new IntrospectionConfig(ENDPOINT, "rs", "s3cret", method).authMethod());
+        }
+        for (String method : new String[] {"client_secret_basci", "private_key_jwt", "client_secret_jwt",
+            "CLIENT_SECRET_BASIC", " client_secret_basic", "none", " "}) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> new IntrospectionConfig(ENDPOINT, "rs", "s3cret", method), method);
+            assertTrue(e.getMessage().contains("authMethod"), e.getMessage());
+            assertFalse(e.getMessage().contains("s3cret"), e.getMessage());
+        }
+    }
+
+    // F6: the same fixture and header are in every port's tests and in validation/introspection.json
+    @Test
+    void clientSecretBasicFormEncodesTheCredentials() {
+        String header = "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMl"
+                + "QTklRjAlOUYlOTglODA=";
+        for (String method : new String[] {null, "", IntrospectionConfig.CLIENT_SECRET_BASIC}) {
+            AtomicReference<String> sent = new AtomicReference<>();
+            AtomicReference<Map<String, String>> headers = new AtomicReference<>();
+            AccessTokenValidator v = AccessTokenValidator.builder(config().introspection(new IntrospectionConfig(
+                    ENDPOINT, "rs:1 a+b%c", "s3cr*t~-._!'()/?#&=\u00e9\uD83D\uDE00", method)).build())
+                    .httpPost((u, body, h) -> {
+                        sent.set(body);
+                        headers.set(h);
+                        return Map.of("active", true);
+                    }).build();
+            v.introspect("opaque");
+            assertEquals(header, headers.get().get("Authorization"));
+            assertFalse(form(sent.get()).containsKey("client_id"));
+            assertFalse(form(sent.get()).containsKey("client_secret"));
+        }
+        assertEquals("Basic cnM6c2VjcmV0", AccessTokenValidator.basicAuthorization("rs", "secret"));
+    }
+
     @Test
     void explicitTokenTypeHint() {
         AtomicReference<String> sent = new AtomicReference<>();
@@ -217,5 +262,26 @@ class IntrospectionTest {
         AccessTokenValidator bad = new AccessTokenValidator(config()
                 .introspection(new IntrospectionConfig("://bad", "rs", "s")).allowInsecure(true).build());
         assertThrows(IllegalArgumentException.class, () -> bad.introspect("t"));
+    }
+
+    // The client id and secret must be non-empty, and the error names the field, never the value
+    @Test
+    void credentialsMustBeNonEmpty() {
+        for (String[] c : new String[][] {{null, "s3cret", "clientId"}, {"", "s3cret", "clientId"},
+            {"rs", null, "clientSecret"}, {"rs", "", "clientSecret"}}) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> new IntrospectionConfig(ENDPOINT, c[0], c[1]), c[2]);
+            assertTrue(e.getMessage().contains(c[2]), e.getMessage());
+            assertFalse(e.getMessage().contains("s3cret"), e.getMessage());
+        }
+    }
+
+    // A bad authMethod is described, never echoed: a secret put in the wrong argument would be in the message
+    @Test
+    void authMethodRefusalDoesNotEchoTheValue() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> new IntrospectionConfig(ENDPOINT, "rs", "s3cret", "hunter2-secret"));
+        assertFalse(e.getMessage().contains("hunter2"), e.getMessage());
+        assertTrue(e.getMessage().contains("14 characters"), e.getMessage());
     }
 }

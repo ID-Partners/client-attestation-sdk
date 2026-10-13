@@ -131,7 +131,10 @@ func WithAlgorithm(algorithm string) Option {
 
 // WithPopMethod sets the proof-of-possession method sent alongside the attestation:
 // PopMethodAttestationPopJWT (default) sends a dedicated OAuth-Client-Attestation-PoP JWT under the
-// PoP header; PopMethodDpopCombined sends a DPoP proof under the DPoP header instead.
+// PoP header; PopMethodDpopCombined sends a DPoP proof under the DPoP header instead. Leaving it out gives
+// the default. "" is ignored, like WithAlgorithm(""), so an earlier WithPopMethod still applies. Any other
+// value, a case variant or one with spaces included, is an error from NewClientAttestation
+// (vectors/pop-method.json).
 func WithPopMethod(method string) Option {
 	return func(c *ClientAttestation) {
 		if method != "" {
@@ -219,6 +222,9 @@ func NewClientAttestation(attesterURL string, opts ...Option) (*ClientAttestatio
 	if c.skew < 0 {
 		return nil, fmt.Errorf("expiry skew must not be negative, got %v", c.skew)
 	}
+	if err := checkPopMethod(c.popMethod); err != nil {
+		return nil, err
+	}
 	if c.timeout <= 0 {
 		c.timeout = 20 * time.Second // zero or negative means the default, never "no timeout"
 	}
@@ -240,6 +246,16 @@ func NewClientAttestation(attesterURL string, opts ...Option) (*ClientAttestatio
 	c.httpClient = safeClient(c.httpClient, c.timeout)
 	c.logger = sdklog.OrDiscard(c.logger)
 	return c, nil
+}
+
+// checkPopMethod refuses a PoP method other than the two the draft names (case-sensitive). Without it a
+// misspelt value would quietly send a PoP JWT. WithPopMethod has already turned "" into the default.
+func checkPopMethod(method string) error {
+	switch method {
+	case PopMethodAttestationPopJWT, PopMethodDpopCombined:
+		return nil
+	}
+	return fmt.Errorf("pop method must be %q or %q, got %q", PopMethodAttestationPopJWT, PopMethodDpopCombined, method)
 }
 
 // TokenOption tunes a single TokenWithOptions call.
@@ -522,6 +538,11 @@ func (t clientTransport) RequestJSON(ctx context.Context, step, method, target s
 // runFlow runs the full attestation exchange and returns the token endpoint response together with the
 // instance key the attestation (and so the token) is bound to. Caller holds c.lock.
 func (c *ClientAttestation) runFlow(ctx context.Context) (*tokenResponse, *SigningKeyPair, error) {
+	// NewClientAttestation refused anything else. A value that still isn't one of the two fails here,
+	// before any request, rather than falling back to a PoP JWT.
+	if checkPopMethod(c.popMethod) != nil {
+		return nil, nil, &ClientAttestationError{Message: fmt.Sprintf("unsupported pop method %q", c.popMethod)}
+	}
 	if c.evidenceAudience == "" && !c.staticMetadata {
 		return nil, nil, &ClientAttestationError{Message: errPinRequired}
 	}

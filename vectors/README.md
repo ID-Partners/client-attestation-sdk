@@ -6,11 +6,25 @@
 - `htu.json`: request URLs and the DPoP `htu` and nonce origin every port must produce for them, or the
   error message every port must refuse them with. Each port's test suite runs every case through its
   `DpopProofBuilder` and its DPoP nonce key.
-- `spire-cli.json`: fake `spire-agent` shell scripts that start a helper holding stdout open, and the token
-  or exact error every port's SPIRE CLI source must give for each, within a time limit. The rule: the
-  agent's exit decides, so once it has exited stdout is read for at most 250 ms more and then closed; on
-  exit status 0 what was read is parsed (the first token wins), and any other status or a kill fails the
-  fetch.
+- `pop-method.json`: values for the one-call client's PoP method setting and what every port must do with
+  each: use `attestation_pop_jwt`, use `dpop_combined`, or refuse it when the client is built, before any
+  request. The rule: unset (`null`, or `""`) is `attestation_pop_jwt`; otherwise the value must be exactly
+  one of the two names, case-sensitive, so a case variant, surrounding whitespace or a non-string is
+  refused. Each port's test suite builds a client with every case it can pass (Go's and Java's setters take
+  only a string, so they skip the non-string cases) and checks the header sent at the token endpoint
+  (`DPoP` or `OAuth-Client-Attestation-PoP`), or that nothing was sent.
+- `spire-cli.json`: fake `spire-agent` shell scripts that start a helper holding stdout open (or writing
+  to it), and the token or exact error every port's SPIRE CLI source must give for each, within a time
+  limit. A helper that holds stdout holds it longer than the case's limit, so a port that waits for the
+  pipe to close instead of ending the grace period fails the case. The rule: the agent's exit decides.
+  While the agent is running, more than 1 MiB of stdout kills it and fails the fetch; that includes what it
+  wrote just before exiting, which is still in the pipe when its exit is first seen, even if it is read
+  after. Once it has exited, stdout is read for at most 250 ms more and at most 1 MiB in all, then closed;
+  on exit status 0 what was read is parsed (the first token wins), and any other status or a kill fails
+  the fetch. So output a helper writes after the agent exits never turns a success into a failure. If
+  reading stopped at the 1 MiB or the 250 ms, a token is only taken from a line that ends in a newline.
+  The cases for that last sentence are tested in each port rather than here: on Linux and macOS the JDK
+  closes the pipe as the agent exits, so a helper's later output never reaches Java.
 
 ## The `htu` rule
 

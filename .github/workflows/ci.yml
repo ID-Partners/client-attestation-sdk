@@ -182,6 +182,17 @@ jobs:
       - run: npm run test:edge   # the bundled SDK in workerd (Cloudflare Workers runtime), no Node compat
       - name: Public API matches docs/api-surface/typescript.txt (see CONTRIBUTING.md)
         run: python3 ../scripts/api_surface.py --check typescript
+      # The release's npm steps, minus the upload: pack as npm-build does, then publish the tarball by the same
+      # ./npm-dist/ path as release.yml with --dry-run. 1.1.0 missed npm because that path was first tried in a
+      # real release (npm read a bare npm-dist/x.tgz as a GitHub owner/repo).
+      - name: npm pack and publish --dry-run, as release.yml does
+        if: matrix.node == '22'
+        run: |
+          npm run build
+          mkdir -p npm-dist
+          npm pack --ignore-scripts --pack-destination npm-dist
+          version=$(node -p "require('./package.json').version")
+          npm publish "./npm-dist/idpartners-client-attestation-sdk-$version.tgz" --dry-run --access public --ignore-scripts
 
   java:
     name: java ${{ matrix.java }}

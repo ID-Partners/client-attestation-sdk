@@ -83,6 +83,7 @@ def bare_env(monkeypatch, tmp_path):
     refused port, no AWS credentials. Each test then turns on exactly what it wants."""
     for var in (evidence_mod.ENV_SVID, evidence_mod.ENV_TOKEN_FILE, evidence_mod.ENV_SPIFFE_SOCKET,
                 "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
                 "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_ID", "AWS_REGION"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(evidence_mod, "DEFAULT_TOKEN_FILE", str(tmp_path / "no-token"))
@@ -244,9 +245,33 @@ def test_spire_source_caps_stdout_at_1_mib(tmp_path):
     line = f"token(spiffe://example.org/wl): {SPIRE_SVID}\n"
     at_cap = line + "x" * ((1 << 20) - len(line))
     assert _spire(tmp_path, at_cap).fetch("aud") == SPIRE_SVID
+    # One byte more while the agent is still running fails the fetch.
+    (tmp_path / "over").write_text(at_cap + "x")
+    script = tmp_path / "over-agent"
+    script.write_text(f"#!/bin/sh\ncat {tmp_path / 'over'}\nexec sleep 5\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
     with pytest.raises(RuntimeError) as caught:
-        _spire(tmp_path, at_cap + "x").fetch("aud")
+        SpireWorkloadApiSvidSource(spire_agent=str(script)).fetch("aud")
     assert str(caught.value) == "spire-agent fetch failed: output is larger than 1048576 bytes"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake spire-agent is a shell script")
+def test_spire_source_agent_that_writes_past_the_cap_and_exits_always_fails(tmp_path):
+    # The agent itself writes 1 MiB + 1 byte and exits at once, so the last bytes may be read either side of
+    # its exit. They were written while it ran, so the fetch fails every time, as in the other ports.
+    script = tmp_path / "over-exit-agent"
+    script.write_text("#!/bin/sh\nexec head -c 1048577 /dev/zero\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    ok = 0
+    for _ in range(50):
+        try:
+            SpireWorkloadApiSvidSource(spire_agent=str(script)).fetch("aud")
+            ok += 1
+        except evidence_mod.EvidenceNotFound:   # read as post-exit output: cut at the cap, no token in it
+            ok += 1
+        except RuntimeError as e:
+            assert str(e) == "spire-agent fetch failed: output is larger than 1048576 bytes"
+    assert ok == 0, f"{ok} of 50 runs did not fail with the size error"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake spire-agent is a shell script")
@@ -360,6 +385,10 @@ def test_azure_imds_never_requests_a_resource_the_caller_did_not_name(bare_env, 
 @pytest.mark.parametrize("env", [
     {"AWS_WEB_IDENTITY_TOKEN_FILE": "/var/run/aws/token"},
     {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"},
+    # EKS Pod Identity
+    {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.23/v1/credentials",
+     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/var/run/eks-pod-identity-token"},
+    {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.23/v1/credentials"},
     {"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "s"},
 ])
 def test_aws_is_detected_from_visible_credentials(bare_env, env):
@@ -369,6 +398,20 @@ def test_aws_is_detected_from_visible_credentials(bare_env, env):
     source = evidence_mod.auto_detect_evidence()
     assert isinstance(source, evidence_mod.AwsWebIdentitySvidSource)
     assert source.region == "ap-southeast-2"
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    # Neither of these is a credential on its own, and nothing probes EC2 IMDS.
+    {"AWS_REGION": "us-east-1"},
+    {"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/var/run/token"},
+    {"AWS_CONTAINER_CREDENTIALS_FULL_URI": ""},
+])
+def test_no_aws_signal_falls_through_to_evidence_not_found(bare_env, env):
+    for key, value in env.items():
+        bare_env.setenv(key, value)
+    with pytest.raises(evidence_mod.EvidenceNotFound):
+        evidence_mod.auto_detect_evidence()
 
 
 def test_aws_access_key_without_secret_is_not_detected(bare_env):

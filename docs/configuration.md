@@ -67,7 +67,7 @@ functions passed to `NewClientAttestation`. Java uses methods on `ClientAttestat
 | Instance-key algorithm | `algorithm` | `algorithm` | `WithAlgorithm` | `.algorithm` | `ES256`. |
 | Token refresh margin | `expiry_skew_seconds` | `expirySkewSeconds` | `WithExpirySkew` | `.expirySkewSeconds` | 30 seconds. Go takes a `time.Duration`. |
 | HTTP timeout per SDK request | `timeout` | `timeoutMs` | `WithTimeout` | `.timeout` | 20 seconds. Python takes seconds, TypeScript milliseconds, Go and Java a duration. |
-| Token-endpoint proof | `pop_method` | `popMethod` | `WithPopMethod` | `.popMethod` | `attestation_pop_jwt`. Also accepts `dpop_combined`. |
+| Token-endpoint proof | `pop_method` | `popMethod` | `WithPopMethod` | `.popMethod` | `attestation_pop_jwt`. Also accepts `dpop_combined`. Unset, null or `""` means the default. Other values, case variants included, are refused when the client is built. |
 | Require an advertised challenge | `require_challenge` | `requireChallenge` | `WithRequireChallenge` | `.requireChallenge` | `true`. A failed challenge request stops token acquisition. |
 | Repeat the mint challenge at the token endpoint | `challenge_at_token` | `challengeAtToken` | `WithChallengeAtToken` | `.challengeAtToken` | `true`. |
 | Allow HTTP on non-loopback hosts | `allow_insecure` | `allowInsecure` | `WithAllowInsecure()` | `.allowInsecure` | `false`. Loopback HTTP is allowed. |

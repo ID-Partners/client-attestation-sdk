@@ -45,7 +45,7 @@ func TestNewAcceptsHTTPSAndLoopback(t *testing.T) {
 		"http://[::1]:8080/jwks",
 	} {
 		cfg := &Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKSURI: u,
-			Introspection: &IntrospectionConfig{Endpoint: u}}
+			Introspection: &IntrospectionConfig{Endpoint: u, ClientID: "rs", ClientSecret: "secret"}}
 		if _, err := New(cfg); err != nil {
 			t.Errorf("%q: %v", u, err)
 		}
@@ -81,7 +81,7 @@ func TestNewCopiesTheConfig(t *testing.T) {
 		cfg := &Config{Issuer: testIssuer, Audiences: []string{testAudience}, JWKS: jwks,
 			RequiredScopes: []string{"read"}, AcceptedAlgorithms: []string{"ES256"},
 			AcceptedTokenTypes: []string{"at+jwt"},
-			Introspection:      &IntrospectionConfig{Endpoint: "https://as.test/introspect"}}
+			Introspection:      &IntrospectionConfig{Endpoint: "https://as.test/introspect", ClientID: "rs", ClientSecret: "secret"}}
 		val, err := New(cfg, WithHTTPPost(func(endpoint, _ string, _ map[string]string) (map[string]any, error) {
 			posted = endpoint
 			return map[string]any{"active": true, "scope": "read"}, nil
@@ -115,5 +115,44 @@ func TestNewCopiesTheConfig(t *testing.T) {
 	cfg.Introspection.Endpoint = "http://attacker.example/introspect"
 	if _, err := val.ValidateActive("opaque", nil); err != nil || posted != "https://as.test/introspect" {
 		t.Errorf("introspection went to %q (%v)", posted, err)
+	}
+}
+
+// F5: only client_secret_basic (also "") and client_secret_post are accepted. Anything else, a typo
+// included, is refused rather than taken as client_secret_post, which would move the secret into the form.
+func TestNewIntrospectionAuthMethod(t *testing.T) {
+	for _, method := range []string{"", "client_secret_basic", "client_secret_post"} {
+		cfg := &Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{
+			Endpoint: "https://issuer.example.com/introspect", ClientID: "rs", ClientSecret: "s3cret", AuthMethod: method}}
+		if _, err := New(cfg); err != nil {
+			t.Errorf("AuthMethod %q: want accepted, got %v", method, err)
+		}
+	}
+	for _, method := range []string{"client_secret_basci", "private_key_jwt", "client_secret_jwt", "CLIENT_SECRET_BASIC",
+		" client_secret_basic", "none", " "} {
+		cfg := &Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{
+			Endpoint: "https://issuer.example.com/introspect", ClientID: "rs", ClientSecret: "s3cret", AuthMethod: method}}
+		if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "AuthMethod") ||
+			strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("AuthMethod %q: want a refusal naming AuthMethod, got %v", method, err)
+		}
+	}
+}
+
+// The client id and secret must not be empty; the error names the field. A bad AuthMethod is never echoed,
+// since a secret put in the wrong field would land in the message.
+func TestIntrospectionCredentialsAndAuthMethodMessages(t *testing.T) {
+	for _, tc := range []struct{ id, secret, field string }{{"", "s3cret", "ClientID"}, {"rs", "", "ClientSecret"}} {
+		_, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{
+			Endpoint: "https://issuer.example.com/introspect", ClientID: tc.id, ClientSecret: tc.secret}})
+		if err == nil || !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("empty %s: want an error naming it, got %v", tc.field, err)
+		}
+	}
+	_, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{
+		Endpoint: "https://issuer.example.com/introspect", ClientID: "rs", ClientSecret: "s3cret",
+		AuthMethod: "hunter2-secret"}})
+	if err == nil || strings.Contains(err.Error(), "hunter2") || !strings.Contains(err.Error(), "14 characters") {
+		t.Errorf("want a refusal that describes the value without echoing it, got %v", err)
 	}
 }

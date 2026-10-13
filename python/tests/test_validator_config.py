@@ -156,6 +156,49 @@ def test_a_config_changed_before_the_validator_is_built_is_checked_again():
             AccessTokenValidator(changed(**attrs))
 
 
+# -- introspection auth_method (F5): only the two methods the SDK speaks; a typo is refused, not taken as post
+
+
+@pytest.mark.parametrize("method, chosen", [("client_secret_basic", "client_secret_basic"),
+                                            ("client_secret_post", "client_secret_post"),
+                                            # unset, e.g. auth_method=os.environ.get(...) with no variable
+                                            (None, "client_secret_basic"), ("", "client_secret_basic")])
+def test_introspection_auth_methods_are_accepted(method, chosen):
+    introspection = IntrospectionConfig(ISSUER + "/introspect", "rs", "s3cret", auth_method=method)
+    assert introspection.auth_method == chosen
+    posted = []
+    validator = AccessTokenValidator(ValidatorConfig(ISSUER, AUDIENCE, introspection=introspection),
+                                     http_post=lambda url, body, headers: posted.append(headers) or {"active": True})
+    validator.introspect("opaque")
+    assert ("Authorization" in posted[0]) == (chosen == "client_secret_basic")
+    assert IntrospectionConfig(ISSUER + "/introspect", "rs", "s3cret").auth_method == "client_secret_basic"
+
+
+@pytest.mark.parametrize("method", ["client_secret_basci", "private_key_jwt", "client_secret_jwt",
+                                    "CLIENT_SECRET_BASIC", " client_secret_basic", "none", " ", 0, False, 1])
+def test_other_introspection_auth_methods_are_refused(method):
+    with pytest.raises(ValueError, match="auth_method") as info:
+        IntrospectionConfig(ISSUER + "/introspect", "rs", "s3cret", auth_method=method)
+    assert "s3cret" not in str(info.value)
+
+
+def test_an_auth_method_changed_after_construction_is_refused():
+    introspection = IntrospectionConfig(ISSUER + "/introspect", "rs", "s3cret")
+    introspection.auth_method = "client_secret_basci"
+    with pytest.raises(ValueError, match="auth_method"):
+        ValidatorConfig(ISSUER, AUDIENCE, introspection=introspection)
+    config = ValidatorConfig(ISSUER, AUDIENCE, introspection=IntrospectionConfig(ISSUER + "/introspect", "rs", "s"))
+    config.introspection.auth_method = "private_key_jwt"
+    with pytest.raises(ValueError, match="auth_method"):
+        AccessTokenValidator(config)
+    # unset after construction is still the default: the validator's copy sends Basic
+    config.introspection.auth_method = None
+    posted = []
+    AccessTokenValidator(config, http_post=lambda url, body, headers: posted.append(headers) or {"active": True}
+                         ).introspect("opaque")
+    assert "Authorization" in posted[0]
+
+
 # -- discovery
 
 
@@ -234,3 +277,28 @@ def test_the_validator_copy_does_not_normalise_token_types_twice():
     cfg = ValidatorConfig(ISSUER, AUDIENCE, accepted_token_types=["application/application/foo"])
     assert cfg.accepted_token_types == ("application/foo",)
     assert AccessTokenValidator(cfg).config.accepted_token_types == ("application/foo",)
+
+
+@pytest.mark.parametrize("field", ["client_id", "client_secret"])
+@pytest.mark.parametrize("bad", [None, 123, b"bytes", ["x"]])
+def test_introspection_credentials_must_be_strings(field, bad):
+    args = {"client_id": "rs", "client_secret": "s3cret"}
+    args[field] = bad
+    with pytest.raises(ValueError) as exc:
+        IntrospectionConfig("https://as.example/introspect", args["client_id"], args["client_secret"])
+    assert field in str(exc.value)
+    assert "s3cret" not in str(exc.value)  # the secret is never echoed
+
+
+@pytest.mark.parametrize("field", ["client_id", "client_secret"])
+def test_introspection_credentials_must_not_be_empty(field):
+    args = {"client_id": "rs", "client_secret": "s3cret"}
+    args[field] = ""
+    with pytest.raises(ValueError, match=field):
+        IntrospectionConfig("https://as.example/introspect", args["client_id"], args["client_secret"])
+
+
+def test_auth_method_refusal_does_not_echo_the_value():
+    with pytest.raises(ValueError) as exc:
+        IntrospectionConfig("https://as.example/introspect", "rs", "s3cret", "hunter2-secret")
+    assert "hunter2" not in str(exc.value) and "14 characters" in str(exc.value)

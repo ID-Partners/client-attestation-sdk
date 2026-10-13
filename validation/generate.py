@@ -11,15 +11,19 @@
   `validate_active` / `validateActive` / `ValidateActive` for each (`expect`), and of the
   `ProtectedResource.authenticate_active` guard (`expect_guard`) for the `guard` resource, whose validator
   accepts every audience in `guard.audiences`. `"raises"` means the call must fail with the port's error (an
-  exception, or Go's returned error) rather than return a verdict.
-- validation/config.json: validator configurations (a `jwks_uri`, an introspection `endpoint`,
-  `allow_insecure`, `leeway_seconds`, each on top of the shared config) and whether building a validator from
-  each must be `"accepted"` or `"refused"` with the port's config error.
+  exception, or Go's returned error) rather than return a verdict. Its `client_auth` cases pin how the
+  resource server authenticates: for a client id, secret and `auth_method` (omitted, null or "": the
+  default), the exact `Authorization` header (`expect_authorization`, null for none) and the decoded
+  `client_id` / `client_secret` form fields (`expect_form`, null for none) of the introspection request.
+- validation/config.json: validator configurations (a `jwks_uri`, an introspection `endpoint` and
+  `auth_method`, `allow_insecure`, `leeway_seconds`, each on top of the shared config) and whether building a
+  validator from each must be `"accepted"` or `"refused"` with the port's config error.
 
 validation/SEMANTICS.md says what every verdict means. Run: `python3 validation/generate.py`."""
 import base64
 import json
 import os
+import urllib.parse
 
 from cryptography.hazmat.primitives import hashes, hmac, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
@@ -508,14 +512,58 @@ introspection_cases = [
     icase("transport_error", "raises", transport_error=True),
     icase("no_endpoint", "raises", no_endpoint=True),
 ]
+
+
+def basic_authorization(client_id, client_secret):
+    """RFC 6749 section 2.3.1: each half form-urlencoded (quote_plus with nothing safe), then joined and base64'd."""
+    raw = urllib.parse.quote_plus(client_id, safe="") + ":" + urllib.parse.quote_plus(client_secret, safe="")
+    return "Basic " + base64.b64encode(raw.encode("ascii")).decode("ascii")
+
+
+# ":" in the id (the separator), "%" and "+" (which an RFC decoder would misread), a space, the characters
+# encodeURIComponent and URLEncoder leave alone or encode differently, and non-ASCII in and outside the BMP
+AUTH_CLIENT_ID = "rs:1 a+b%c"
+AUTH_SECRET = "s3cr*t~-._!'()/?#&=\u00e9\U0001F600"
+assert basic_authorization(AUTH_CLIENT_ID, AUTH_SECRET) == (
+    "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA=")
+
+
+OMITTED = object()
+
+
+def acase(name, client_id, client_secret, auth_method=OMITTED):
+    c = {"name": name, "client_id": client_id, "client_secret": client_secret}
+    if auth_method is not OMITTED:
+        c["auth_method"] = auth_method
+    if auth_method == "client_secret_post":
+        c["expect_authorization"] = None
+        c["expect_form"] = {"client_id": client_id, "client_secret": client_secret}
+    else:
+        c["expect_authorization"] = basic_authorization(client_id, client_secret)
+        c["expect_form"] = None
+    return c
+
+
+client_auth_cases = [
+    acase("basic_default", AUTH_CLIENT_ID, AUTH_SECRET),
+    acase("basic_explicit", AUTH_CLIENT_ID, AUTH_SECRET, "client_secret_basic"),
+    # unset, as an environment variable that isn't there reads: the default
+    acase("basic_null", AUTH_CLIENT_ID, AUTH_SECRET, None),
+    acase("basic_empty", AUTH_CLIENT_ID, AUTH_SECRET, ""),
+    acase("basic_plain", "rs", "secret"),
+    acase("post", AUTH_CLIENT_ID, AUTH_SECRET, "client_secret_post"),
+]
 with open(os.path.join(HERE, "introspection.json"), "w") as fh:
     json.dump({
         "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, "
                     "with required_scopes and audience from tokens.json. `raises`: the call must fail with the "
                     "port's error. expect_guard: the verdict of ProtectedResource.authenticate_active for the "
-                    "guard resource, whose validator accepts guard.audiences. Semantics: SEMANTICS.md.",
+                    "guard resource, whose validator accepts guard.audiences. client_auth: the Authorization "
+                    "header and decoded client_id / client_secret form fields each port sends. Semantics: "
+                    "SEMANTICS.md.",
         "guard": {"resource": AUDIENCE, "audiences": [AUDIENCE, OTHER_RESOURCE]},
         "cases": introspection_cases,
+        "client_auth": client_auth_cases,
     }, fh, indent=2, ensure_ascii=True)
     fh.write("\n")
 
@@ -546,6 +594,32 @@ config_cases = [
     ccase("introspection_http_allow_insecure", "accepted",
           introspection_endpoint="http://issuer.example.com/introspect", allow_insecure=True),
     ccase("introspection_http_loopback", "accepted", introspection_endpoint="http://127.0.0.1:9000/introspect"),
+    # only the two client authentication methods; anything else used to be taken as client_secret_post
+    ccase("introspection_auth_method_basic", "accepted", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method="client_secret_basic"),
+    ccase("introspection_auth_method_post", "accepted", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method="client_secret_post"),
+    # unset (null or "") is the default, client_secret_basic; client_auth in introspection.json pins the header
+    ccase("introspection_auth_method_null", "accepted", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method=None),
+    ccase("introspection_auth_method_empty", "accepted", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method=""),
+    ccase("introspection_auth_method_typo", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method="client_secret_basci"),
+    ccase("introspection_auth_method_private_key_jwt", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method="private_key_jwt"),
+    ccase("introspection_auth_method_upper_case", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_auth_method="CLIENT_SECRET_BASIC"),
+    # the client id and secret must be non-empty strings (omitted from a case: "rs" and "secret"). Go has no
+    # null, so its emitter reads null as "": both are refused, so every port agrees
+    ccase("introspection_client_id_empty", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_client_id=""),
+    ccase("introspection_client_id_null", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_client_id=None),
+    ccase("introspection_client_secret_empty", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_client_secret=""),
+    ccase("introspection_client_secret_null", "refused", introspection_endpoint=ISSUER + "/introspect",
+          introspection_client_secret=None),
     ccase("leeway_zero", "accepted", leeway_seconds=0),
     ccase("leeway_negative", "refused", leeway_seconds=-1),
 ]
@@ -559,4 +633,5 @@ with open(os.path.join(HERE, "config.json"), "w") as fh:
     fh.write("\n")
 
 print(f"wrote validation/tokens.json ({len(cases)} cases), validation/introspection.json "
-      f"({len(introspection_cases)} cases) and validation/config.json ({len(config_cases)} cases)")
+      f"({len(introspection_cases)} cases, {len(client_auth_cases)} client_auth) and validation/config.json "
+      f"({len(config_cases)} cases)")

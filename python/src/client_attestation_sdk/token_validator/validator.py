@@ -35,6 +35,17 @@ def _default_post(url, body, headers):
         raise TransportError(f"introspection endpoint returned {exc}", status=response.status) from None
 
 
+def _basic_authorization(client_id, client_secret):
+    """The ``client_secret_basic`` Authorization header value (RFC 6749 section 2.3.1): the client id and the
+    secret are each form-urlencoded (Appendix B), joined with ``:`` and base64'd. The encoding is
+    ``urllib.parse.quote_plus(s, safe="")``: each UTF-8 byte of ``A-Z a-z 0-9 - . _ ~`` stays as it is, a space
+    becomes ``+``, and every other byte is ``%XX`` with uppercase hex (so ``:`` is ``%3A``, ``%`` is ``%25``,
+    ``+`` is ``%2B`` and ``*`` is ``%2A``). Every port sends the same bytes: validation/SEMANTICS.md,
+    Introspection."""
+    raw = urllib.parse.quote_plus(client_id, safe="") + ":" + urllib.parse.quote_plus(client_secret, safe="")
+    return "Basic " + base64.b64encode(raw.encode("ascii")).decode("ascii")
+
+
 class AccessTokenValidator:
     """Validates access tokens for a resource server.
 
@@ -140,12 +151,11 @@ class AccessTokenValidator:
             raise ValueError("no introspection endpoint configured")
         form = {"token": token, "token_type_hint": token_type_hint}
         headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
-        if cfg.auth_method == "client_secret_basic":
-            raw = f"{cfg.client_id}:{cfg.client_secret}".encode("utf-8")
-            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
-        else:
+        if cfg.auth_method == "client_secret_post":
             form["client_id"] = cfg.client_id
             form["client_secret"] = cfg.client_secret
+        else:  # client_secret_basic (the config refuses anything but the two, or unset)
+            headers["Authorization"] = _basic_authorization(cfg.client_id, cfg.client_secret)
         try:
             data = self._http_post(cfg.endpoint, urllib.parse.urlencode(form), headers)
             if not isinstance(data, dict):

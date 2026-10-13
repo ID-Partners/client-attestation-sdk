@@ -1,5 +1,5 @@
 {
-  "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, with required_scopes and audience from tokens.json. `raises`: the call must fail with the port's error. expect_guard: the verdict of ProtectedResource.authenticate_active for the guard resource, whose validator accepts guard.audiences. Semantics: SEMANTICS.md.",
+  "_comment": "Canned RFC 7662 responses fed to each port's validate_active through an injected transport, with required_scopes and audience from tokens.json. `raises`: the call must fail with the port's error. expect_guard: the verdict of ProtectedResource.authenticate_active for the guard resource, whose validator accepts guard.audiences. client_auth: the Authorization header and decoded client_id / client_secret form fields each port sends. Semantics: SEMANTICS.md.",
   "guard": {
     "resource": "https://api.example.com",
     "audiences": [
@@ -275,6 +275,57 @@
       "expect": "raises",
       "expect_guard": "raises",
       "no_endpoint": true
+    }
+  ],
+  "client_auth": [
+    {
+      "name": "basic_default",
+      "client_id": "rs:1 a+b%c",
+      "client_secret": "s3cr*t~-._!'()/?#&=\u00e9\ud83d\ude00",
+      "expect_authorization": "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA=",
+      "expect_form": null
+    },
+    {
+      "name": "basic_explicit",
+      "client_id": "rs:1 a+b%c",
+      "client_secret": "s3cr*t~-._!'()/?#&=\u00e9\ud83d\ude00",
+      "auth_method": "client_secret_basic",
+      "expect_authorization": "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA=",
+      "expect_form": null
+    },
+    {
+      "name": "basic_null",
+      "client_id": "rs:1 a+b%c",
+      "client_secret": "s3cr*t~-._!'()/?#&=\u00e9\ud83d\ude00",
+      "auth_method": null,
+      "expect_authorization": "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA=",
+      "expect_form": null
+    },
+    {
+      "name": "basic_empty",
+      "client_id": "rs:1 a+b%c",
+      "client_secret": "s3cr*t~-._!'()/?#&=\u00e9\ud83d\ude00",
+      "auth_method": "",
+      "expect_authorization": "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA=",
+      "expect_form": null
+    },
+    {
+      "name": "basic_plain",
+      "client_id": "rs",
+      "client_secret": "secret",
+      "expect_authorization": "Basic cnM6c2VjcmV0",
+      "expect_form": null
+    },
+    {
+      "name": "post",
+      "client_id": "rs:1 a+b%c",
+      "client_secret": "s3cr*t~-._!'()/?#&=\u00e9\ud83d\ude00",
+      "auth_method": "client_secret_post",
+      "expect_authorization": null,
+      "expect_form": {
+        "client_id": "rs:1 a+b%c",
+        "client_secret": "s3cr*t~-._!'()/?#&=\u00e9\ud83d\ude00"
+      }
     }
   ]
 }

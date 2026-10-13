@@ -4,6 +4,7 @@ import global.idpartners.clientattestation.tokenvalidator.IntrospectionConfig;
 import global.idpartners.clientattestation.tokenvalidator.ProtectedResource;
 import global.idpartners.clientattestation.tokenvalidator.ValidationResult;
 import global.idpartners.clientattestation.tokenvalidator.ValidatorConfig;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -140,6 +141,41 @@ public final class ValidateEmit {
             }
         }
 
+        List<Map<String, Object>> clientAuthResults = new ArrayList<>();
+        for (Map<String, Object> c : (List<Map<String, Object>>) introspection.get("client_auth")) {
+            Map<String, Object> sent = new LinkedHashMap<>();
+            AccessTokenValidator validator = AccessTokenValidator.builder(configFor(null)
+                    .introspection(new IntrospectionConfig("https://issuer.example.com/introspect",
+                            (String) c.get("client_id"), (String) c.get("client_secret"),
+                            (String) c.get("auth_method")))
+                    .build())
+                    .httpPost((url, body, headers) -> {
+                        sent.put("body", body);
+                        sent.put("headers", headers);
+                        return Map.of("active", true);
+                    })
+                    .build();
+            validator.introspect("opaque-token");
+            Map<String, String> form = new LinkedHashMap<>();
+            for (String pair : ((String) sent.get("body")).split("&")) {
+                String[] kv = pair.split("=", 2);
+                form.put(URLDecoder.decode(kv[0], StandardCharsets.UTF_8),
+                        kv.length > 1 ? URLDecoder.decode(kv[1], StandardCharsets.UTF_8) : "");
+            }
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("name", c.get("name"));
+            row.put("authorization", ((Map<String, String>) sent.get("headers")).get("Authorization"));
+            if (form.containsKey("client_id") || form.containsKey("client_secret")) {
+                Map<String, Object> credentials = new LinkedHashMap<>();
+                credentials.put("client_id", form.get("client_id"));
+                credentials.put("client_secret", form.get("client_secret"));
+                row.put("form", credentials);
+            } else {
+                row.put("form", null);
+            }
+            clientAuthResults.add(row);
+        }
+
         Map<String, Object> configCases = JsonUtil.parseJson(
                 Files.readString(validation.resolve("config.json"), StandardCharsets.UTF_8));
         List<Map<String, Object>> configResults = new ArrayList<>();
@@ -149,10 +185,6 @@ public final class ValidateEmit {
             if (cfg.containsKey("jwks_uri")) {
                 config.jwks((Map<String, Object>) null).jwksUri((String) cfg.get("jwks_uri"));
             }
-            if (cfg.containsKey("introspection_endpoint")) {
-                config.introspection(
-                        new IntrospectionConfig((String) cfg.get("introspection_endpoint"), "rs", "secret"));
-            }
             if (cfg.containsKey("allow_insecure")) {
                 config.allowInsecure((Boolean) cfg.get("allow_insecure"));
             }
@@ -160,6 +192,14 @@ public final class ValidateEmit {
                 config.leewaySeconds(((Number) cfg.get("leeway_seconds")).intValue());
             }
             try {
+                // IntrospectionConfig refuses a bad auth method itself, before the validator config is built
+                if (cfg.containsKey("introspection_endpoint")) {
+                    config.introspection(new IntrospectionConfig((String) cfg.get("introspection_endpoint"),
+                            cfg.containsKey("introspection_client_id") ? (String) cfg.get("introspection_client_id") : "rs",
+                            cfg.containsKey("introspection_client_secret")
+                                    ? (String) cfg.get("introspection_client_secret") : "secret",
+                            (String) cfg.get("introspection_auth_method")));
+                }
                 AccessTokenValidator.builder(config.build()).build();
                 configResults.add(row(c.get("name"), true, null));
             } catch (IllegalArgumentException e) {
@@ -172,6 +212,7 @@ public final class ValidateEmit {
         out.put("results", results);
         out.put("introspection_results", introspectionResults);
         out.put("guard_results", guardResults);
+        out.put("client_auth_results", clientAuthResults);
         out.put("config_results", configResults);
         Files.createDirectories(validation.resolve("out"));
         Files.writeString(validation.resolve("out").resolve("java.json"), JsonUtil.toJson(out),

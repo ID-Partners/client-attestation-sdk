@@ -29,7 +29,11 @@ export interface IntrospectionConfig {
   endpoint: string;
   clientId: string;
   clientSecret: string;
-  /** Defaults to `"client_secret_basic"`. */
+  /**
+   * Defaults to `"client_secret_basic"`, also when `null` or `""` (so an unset environment variable can be
+   * passed straight in). The validator refuses any other value than the two {@link IntrospectionAuthMethod}s,
+   * so a typo can't move the secret into the form body.
+   */
   authMethod?: IntrospectionAuthMethod;
 }
 
@@ -105,6 +109,8 @@ export function normaliseType(value: string): string {
   return lower.startsWith("application/") ? lower.slice("application/".length) : lower;
 }
 
+const AUTH_METHODS: readonly string[] = ["client_secret_basic", "client_secret_post"];
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 /** Refuse a non-https URL unless it is loopback or `allowInsecure` is set: the rule the client applies. */
@@ -162,6 +168,22 @@ export function resolveConfig(config: ValidatorConfig): ResolvedConfig {
   if (config.introspection?.endpoint) {
     checkSecure(config.introspection.endpoint, "introspection endpoint", allowInsecure);
   }
+  // JavaScript callers aren't held to the union type: anything else used to be taken as client_secret_post.
+  // Unset (undefined, null or "") is the default, client_secret_basic.
+  const authMethod: unknown = config.introspection?.authMethod;
+  const unset = authMethod == null || authMethod === "";
+  if (config.introspection != null && !unset && !AUTH_METHODS.includes(authMethod as string)) {
+    // never echo the value: a secret passed in the wrong field would end up in the message
+    throw new Error(`introspection authMethod must be "client_secret_basic" or "client_secret_post", got ${describe(authMethod)}`);
+  }
+  if (config.introspection != null) {
+    for (const field of ["clientId", "clientSecret"] as const) {
+      const value: unknown = config.introspection[field];
+      if (typeof value !== "string" || value === "") {
+        throw new Error(`introspection ${field} must be a non-empty string, got ${value === "" ? "an empty string" : describe(value)}`);
+      }
+    }
+  }
   const types = config.acceptedTokenTypes === undefined ? DEFAULT_TOKEN_TYPES : config.acceptedTokenTypes;
   return {
     issuer: config.issuer,
@@ -172,7 +194,16 @@ export function resolveConfig(config: ValidatorConfig): ResolvedConfig {
     requiredScopes: stringList(config.requiredScopes ?? [], "requiredScopes"),
     acceptedAlgorithms: stringList(config.acceptedAlgorithms ?? DEFAULT_ALGORITHMS, "acceptedAlgorithms"),
     leewaySeconds: leeway,
-    introspection: config.introspection == null ? undefined : { ...config.introspection },
+    introspection:
+      config.introspection == null
+        ? undefined
+        : { ...config.introspection, authMethod: config.introspection.authMethod || "client_secret_basic" },
     acceptedTokenTypes: types === null ? null : stringList(types, "acceptedTokenTypes").map(normaliseType),
   };
+}
+
+/** A value's type and size, never its content (it may be a secret). */
+function describe(value: unknown): string {
+  if (typeof value === "string") return `a string of ${[...value].length} characters`;
+  return value === null ? "null" : `a ${typeof value}`;
 }

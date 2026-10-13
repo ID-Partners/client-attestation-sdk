@@ -92,7 +92,7 @@ interface ClientAttestationOptions {
     algorithm?: string;
     expirySkewSeconds?: number;
     timeoutMs?: number;
-    popMethod?: "attestation_pop_jwt" | "dpop_combined";
+    popMethod?: "attestation_pop_jwt" | "dpop_combined" | "" | null;
     challengeAtToken?: boolean;
     requireChallenge?: boolean;
     allowInsecure?: boolean;

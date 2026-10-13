@@ -40,7 +40,7 @@ func TestIntrospectionVectorsMatchExpected(t *testing.T) {
 	for _, c := range file.Cases {
 		cfg := &Config{Issuer: v.Issuer, Audiences: []string{v.Audience}, JWKS: v.JWKS, RequiredScopes: v.RequiredScopes}
 		if !c.NoEndpoint {
-			cfg.Introspection = &IntrospectionConfig{Endpoint: "https://as.test/introspect"}
+			cfg.Introspection = &IntrospectionConfig{Endpoint: "https://as.test/introspect", ClientID: "rs", ClientSecret: "secret"}
 		}
 		val, err := New(cfg, WithHTTPPost(func(string, string, map[string]string) (map[string]any, error) {
 			if c.TransportError {
@@ -69,7 +69,7 @@ func introspectionServer(t *testing.T, status int, body string) *AccessTokenVali
 	}))
 	t.Cleanup(srv.Close)
 	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience},
-		Introspection: &IntrospectionConfig{Endpoint: srv.URL}})
+		Introspection: &IntrospectionConfig{Endpoint: srv.URL, ClientID: "rs", ClientSecret: "secret"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDefaultIntrospectionReplacesInvalidUTF8(t *testing.T) {
 
 func TestInjectedTransportReturningNothingIsAnError(t *testing.T) {
 	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience},
-		Introspection: &IntrospectionConfig{Endpoint: "https://as.test/introspect"}},
+		Introspection: &IntrospectionConfig{Endpoint: "https://as.test/introspect", ClientID: "rs", ClientSecret: "secret"}},
 		WithHTTPPost(func(string, string, map[string]string) (map[string]any, error) { return nil, nil }))
 	if err != nil {
 		t.Fatal(err)

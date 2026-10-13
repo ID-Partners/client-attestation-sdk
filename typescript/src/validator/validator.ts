@@ -225,13 +225,12 @@ export class AccessTokenValidator {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     };
-    const authMethod = cfg.authMethod ?? "client_secret_basic";
-    if (authMethod === "client_secret_basic") {
-      const raw = `${cfg.clientId}:${cfg.clientSecret}`;
-      headers.Authorization = `Basic ${base64(raw)}`;
-    } else {
+    if (cfg.authMethod === "client_secret_post") {
       form.set("client_id", cfg.clientId);
       form.set("client_secret", cfg.clientSecret);
+    } else {
+      // client_secret_basic: resolveConfig refuses anything but the two, or unset
+      headers.Authorization = basicAuthorization(cfg.clientId, cfg.clientSecret);
     }
     try {
       const data: unknown = await this.#httpPost(cfg.endpoint, form.toString(), headers);
@@ -283,8 +282,35 @@ export class AccessTokenValidator {
   }
 }
 
-function base64(value: string): string {
-  return base64Encode(utf8Encode(value));
+/**
+ * The `client_secret_basic` Authorization header value (RFC 6749 section 2.3.1): the client id and the secret
+ * are each form-urlencoded (Appendix B), joined with `:` and base64'd. The encoding is the same bytes as
+ * Python's `urllib.parse.quote_plus(s, safe="")`: each UTF-8 byte of `A-Z a-z 0-9 - . _ ~` stays as it is, a
+ * space becomes `+`, and every other byte is `%XX` with uppercase hex (so `:` is `%3A`, `%` is `%25`, `+` is
+ * `%2B` and `*` is `%2A`). Not `encodeURIComponent`, which leaves `! ' ( ) *` alone, nor `URLSearchParams`,
+ * which leaves `*` alone and encodes `~`. validation/SEMANTICS.md, Introspection.
+ *
+ * @internal
+ */
+export function basicAuthorization(clientId: string, clientSecret: string): string {
+  return `Basic ${base64Encode(utf8Encode(`${formEncode(clientId)}:${formEncode(clientSecret)}`))}`;
+}
+
+const HEX = "0123456789ABCDEF";
+
+function formEncode(value: string): string {
+  let out = "";
+  for (const b of utf8Encode(value)) {
+    const unreserved =
+      (b >= 0x30 && b <= 0x39) || // 0-9
+      (b >= 0x41 && b <= 0x5a) || // A-Z
+      (b >= 0x61 && b <= 0x7a) || // a-z
+      b === 0x2d || b === 0x2e || b === 0x5f || b === 0x7e; // - . _ ~
+    if (unreserved) out += String.fromCharCode(b);
+    else if (b === 0x20) out += "+";
+    else out += "%" + HEX[b >> 4] + HEX[b & 0x0f];
+  }
+  return out;
 }
 
 function errMessage(exc: unknown): string {

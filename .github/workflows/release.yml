@@ -178,9 +178,10 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
       # npm publish runs here, in the job npm trusts, so the provenance names this workflow; it publishes the
-      # tarball npm-build packed and runs no package scripts.
+      # tarball npm-build packed and runs no package scripts. The path starts with ./ so npm reads it as a file:
+      # a bare `npm-dist/x.tgz` is a GitHub `owner/repo` shorthand to npm, which then tries to clone it (1.1.0).
       - if: steps.published.outputs.skip != 'true'
-        run: npm publish "npm-dist/idpartners-client-attestation-sdk-$VERSION.tgz" --provenance --access public --ignore-scripts
+        run: npm publish "./npm-dist/idpartners-client-attestation-sdk-$VERSION.tgz" --provenance --access public --ignore-scripts
 
   java:
     name: publish java (Maven Central)

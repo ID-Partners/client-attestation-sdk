@@ -130,13 +130,29 @@ They are separate from the workload's Client Attestation credential.
 | Endpoint | `endpoint` | `endpoint` | `Endpoint` | `endpoint` | Introspection endpoint URL. |
 | Resource-server client identifier | `client_id` | `clientId` | `ClientID` | `clientId` | Supplied by the authorisation server administrator. |
 | Resource-server secret | `client_secret` | `clientSecret` | `ClientSecret` | `clientSecret` | Supplied at runtime. |
-| Authentication method | `auth_method` | `authMethod` | `AuthMethod` | `authMethod` | `client_secret_basic` by default. Also supports `client_secret_post`. |
+| Authentication method | `auth_method` | `authMethod` | `AuthMethod` | `authMethod` | `client_secret_basic` by default, also when `null` or `""`. Also supports `client_secret_post`. Any other value is refused. |
 
 `client_secret_basic` sends the credentials in the `Authorization` header.
+As RFC 6749 section 2.3.1 requires, the client identifier and the secret are each form-urlencoded before
+they are joined with `:` and base64-encoded. Every byte except `A-Z`, `a-z`, `0-9`, `-`, `.`, `_` and `~` is
+sent as `%XX` (uppercase hex, of its UTF-8 encoding), and a space as `+`.
+All four ports send the same header; `validation/SEMANTICS.md` (Introspection) gives the exact rule.
 `client_secret_post` sends `client_id` and `client_secret` as form fields.
-Use one of those exact values.
+
+Use one of those exact values. They are case-sensitive.
+Any other value is refused with the port's configuration error: Python `ValueError` and Java
+`IllegalArgumentException` from the `IntrospectionConfig` constructor, TypeScript `Error` from the
+`AccessTokenValidator` constructor, and Go an error from `tokenvalidator.New`.
+Python also checks again when the validator is built, in case `auth_method` was changed afterwards.
+Unset selects Basic in every port: Python `None` or `""`, TypeScript an omitted, `null` or `""`
+`authMethod`, Go an empty `AuthMethod`, and Java `null` or `""`.
+So a method read from an environment variable that isn't set takes the default.
+Before this release, Python `None` or `""` and TypeScript or Java `""` sent `client_secret_post`; set
+`client_secret_post` explicitly if your authorisation server expects it.
 Java's three-argument constructor selects Basic. Its four-argument constructor accepts the method.
-Go's empty `AuthMethod` selects Basic.
+The client id and secret must be non-empty strings in every port. A missing, `null`, empty or non-string
+value is refused when the config (Python, Java) or the validator (TypeScript, Go) is built.
+Error messages name the field and never include a credential or the refused `auth_method` value.
 The default introspection timeout is 10 seconds.
 The default response limit is 1048576 bytes (1 MiB).
 Timeout and limit have no supported setters - use a custom HTTP POST hook for other transport requirements.

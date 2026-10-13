@@ -26,7 +26,7 @@ Requires JDK 17 or later. Add this dependency to your application's `pom.xml`:
 <dependency>
   <groupId>global.idpartners</groupId>
   <artifactId>client-attestation-sdk</artifactId>
-  <version>1.1.0</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 

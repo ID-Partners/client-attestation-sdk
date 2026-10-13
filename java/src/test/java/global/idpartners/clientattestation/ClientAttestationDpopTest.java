@@ -749,4 +749,142 @@ class ClientAttestationDpopTest {
         assertTrue(ClientAttestation.sameOrigin(URI.create("https://as.example/a"), URI.create("https://AS.example:443/b")));
         assertFalse(ClientAttestation.sameOrigin(URI.create("https://as.example/a"), URI.create("https://other.example/a")));
     }
+
+    @Test
+    void sameOriginNormalisesThePortOnlyToTheSchemesOwnDefaultAndRefusesAnyOtherPort() {
+        String z = "[fe80::1%25eth0]";
+        Object[][] cases = {
+            // the scheme's own default port is the same as none; a leading zero is the same number
+            {"https://as.example/a", "https://as.example:443/b", true},
+            {"https://as.example:0443/a", "https://AS.example/b", true},
+            {"http://as.example/a", "http://as.example:80/b", true},
+            {"http://as.example:080/a", "http://as.example/b", true},
+            {"https://as.example:08443/a", "https://as.example:8443/b", true},
+            {"https://u@as.example:00008443/a", "https://as.example:8443", true},
+            {"https://as.example:1/", "https://as.example:01/", true},
+            {"https://as.example:65535/", "https://as.example:65535/", true},
+            {"https://" + z + "/a", "https://" + z + ":443/b", true},
+            {"https://User@[FE80::1%25eth0]:08443/a?x=1", "https://" + z + ":8443/b", true},
+            {"http://" + z + ":80/a", "http://" + z + "/b", true},
+            // a default port belongs to its own scheme only
+            {"https://as.example:80/", "http://as.example/", false},
+            {"https://as.example:80/", "http://as.example:80/", false},
+            {"https://as.example:80/", "https://as.example/", false},
+            {"http://as.example:443/", "https://as.example/", false},
+            {"http://as.example:443/", "https://as.example:443/", false},
+            {"http://as.example:443/", "http://as.example/", false},
+            {"https://" + z + ":80/", "http://" + z + "/", false},
+            {"http://" + z + ":443/", "https://" + z + "/", false},
+            // other ports, hosts and zones
+            {"https://as.example:8443/", "https://as.example:9443/", false},
+            {"https://as.example:8443/", "https://as.example/", false},
+            {"https://" + z + ":8443/", "https://[fe80::1%25eth1]:8443/", false},
+            {"https://" + z + ":8443/", "https://[fe80::1%25ETH0]:8443/", false},
+            {"https://" + z + ":8443/", "https://[fe80::1]:8443/", false},
+            {"https://" + z + ":8443/", "https://[fe80::2%25eth0]:8443/", false},
+        };
+        for (Object[] c : cases) {
+            URI a = URI.create((String) c[0]);
+            URI b = URI.create((String) c[1]);
+            assertEquals(c[2], ClientAttestation.sameOrigin(a, b), c[0] + " vs " + c[1]);
+            assertEquals(c[2], ClientAttestation.sameOrigin(b, a), c[1] + " vs " + c[0]);
+        }
+        // A port that is not a number from 1 to 65535 puts the URI on no origin: not even the identical
+        // string is the same origin, nor the URI without the port. (A raw space or sign is not a valid URI
+        // port either; whitespace can only reach a URI percent-encoded.)
+        String[] badPorts = {"0", "00", "65536", "065536", "99999", "4294967739", "4294967296", "99999999999999999999",
+            "", "+443", "-1", "-0", "%20443", "443%20", "0x1bb", "44a", "\u0661"};
+        for (String host : new String[] {"as.example", "AS.example", z, "[::1]"}) {
+            for (String scheme : new String[] {"https", "http"}) {
+                for (String port : badPorts) {
+                    String text = scheme + "://" + host + ":" + port + "/a";
+                    URI bad;
+                    try {
+                        bad = URI.create(text);
+                    } catch (IllegalArgumentException e) {
+                        continue;   // not a URI at all, so it never reaches the guard
+                    }
+                    assertFalse(ClientAttestation.sameOrigin(bad, URI.create(text)), text + " vs itself");
+                    assertFalse(ClientAttestation.sameOrigin(bad, bad), text + " vs the same URI");
+                    URI bare = URI.create(scheme + "://" + host + "/a");
+                    assertFalse(ClientAttestation.sameOrigin(bad, bare), text + " vs no port");
+                    assertFalse(ClientAttestation.sameOrigin(bare, bad), "no port vs " + text);
+                }
+            }
+        }
+    }
+
+    @Test
+    void sendGuardsAnIpv6ZoneLiteralByItsOrigin() throws Exception {
+        // send() itself, with a zone literal (which the htu rule refuses), against a local server: a request on
+        // the same origin (another path or query, the port written with leading zeros) is sent; one on another
+        // port, zone or scheme, or with a port that is no port, is refused before any connection is made.
+        java.net.NetworkInterface loopback = java.net.NetworkInterface.networkInterfaces()
+                .filter(nif -> {
+                    try {
+                        return nif.isLoopback() && nif.isUp();
+                    } catch (java.net.SocketException e) {
+                        return false;
+                    }
+                })
+                .findFirst().orElse(null);
+        org.junit.jupiter.api.Assumptions.assumeTrue(loopback != null, "no loopback interface");
+        com.sun.net.httpserver.HttpServer zoneServer;
+        try {
+            zoneServer = com.sun.net.httpserver.HttpServer.create(
+                    new java.net.InetSocketAddress(java.net.InetAddress.getByName("::1"), 0), 0);
+        } catch (IOException e) {
+            org.junit.jupiter.api.Assumptions.abort("no IPv6 loopback: " + e);
+            return;
+        }
+        AtomicInteger hits = new AtomicInteger();
+        AtomicReference<String> authorization = new AtomicReference<>();
+        zoneServer.createContext("/zone", exchange -> {
+            hits.incrementAndGet();
+            authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        zoneServer.start();
+        try {
+            this.tokenType = "Bearer";
+            ClientAttestation ca = ClientAttestation.builder(this.server.url("")).evidence(new SvidSource.Static("svid"))
+                    .evidenceAudience(AUD).allowInsecure(true).build();   // Bearer: a zone literal has no htu
+            int port = zoneServer.getAddress().getPort();
+            // The JDK's URI takes the zone ID unescaped ([::1%lo0]); that is the form HttpClient connects to.
+            String origin = "http://[::1%" + loopback.getName() + "]:" + port;
+            URI uri = URI.create(origin + "/zone?x=1");
+            HttpResponse<Void> resp = ca.send(this.client, HttpRequest.newBuilder(URI.create(origin + "/zone")).GET(),
+                    "GET", uri, HttpResponse.BodyHandlers.discarding());
+            assertEquals(204, resp.statusCode());
+            assertEquals(1, hits.get());
+            assertEquals("Bearer " + ca.token(), authorization.get());
+            // the same origin with the port written with leading zeros is still sent
+            resp = ca.send(this.client, HttpRequest.newBuilder(URI.create(origin.replace("]:", "]:00") + "/zone")).GET(),
+                    "GET", uri, HttpResponse.BodyHandlers.discarding());
+            assertEquals(204, resp.statusCode());
+            assertEquals(2, hits.get());
+
+            String[] elsewhere = {
+                "http://[::1%" + loopback.getName() + "]:" + (port == 65535 ? port - 1 : port + 1) + "/zone",
+                "http://[::1%" + loopback.getName() + "x]:" + port + "/zone",
+                "http://[::1]:" + port + "/zone",
+                "https://[::1%" + loopback.getName() + "]:" + port + "/zone",
+            };
+            for (String other : elsewhere) {
+                IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> ca.send(this.client,
+                        HttpRequest.newBuilder(URI.create(other)).GET(), "GET", uri, HttpResponse.BodyHandlers.discarding()),
+                        other);
+                assertTrue(e.getMessage().contains("another origin"), e.getMessage());
+            }
+            // a port that is no port is on no origin, even when the request and the credentials name it alike
+            URI noPort = URI.create("http://[::1%" + loopback.getName() + "]:0/zone");
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> ca.send(this.client,
+                    HttpRequest.newBuilder(noPort).GET(), "GET", noPort, HttpResponse.BodyHandlers.discarding()));
+            assertTrue(e.getMessage().contains("another origin"), e.getMessage());
+            assertEquals(2, hits.get());
+        } finally {
+            zoneServer.stop(0);
+        }
+    }
 }

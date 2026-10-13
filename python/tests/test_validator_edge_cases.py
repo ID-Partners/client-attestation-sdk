@@ -1,3 +1,4 @@
+import base64
 import json
 import threading
 import time
@@ -107,6 +108,33 @@ def test_introspection_client_secret_post():
     assert "Authorization" not in captured["headers"]
     form = urllib.parse.parse_qs(captured["body"])
     assert form["client_id"] == ["rs-1"] and form["client_secret"] == ["s3cret"]
+
+
+# F6: the same fixture and header are in every port's tests and in validation/introspection.json
+BASIC_CLIENT_ID = "rs:1 a+b%c"
+BASIC_CLIENT_SECRET = "s3cr*t~-._!'()/?#&=\u00e9\U0001F600"
+BASIC_HEADER = ("Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYl"
+                "OTglODA=")
+
+
+def test_introspection_client_secret_basic_form_encodes_the_credentials():
+    captured = {}
+
+    def fake_post(url, body, headers):
+        captured.update(body=body, headers=headers)
+        return {"active": True, "scope": "read", "aud": AUDIENCE}
+
+    cfg = _config(introspection=IntrospectionConfig(
+        "https://issuer.example.com/introspect", BASIC_CLIENT_ID, BASIC_CLIENT_SECRET))
+    assert AccessTokenValidator(cfg, http_post=fake_post).validate_active("opaque-token").valid
+    assert captured["headers"]["Authorization"] == BASIC_HEADER
+    form = urllib.parse.parse_qs(captured["body"])
+    assert "client_id" not in form and "client_secret" not in form
+    # RFC 6749 section 2.3.1: an AS decodes each half after splitting on the first ":"
+    decoded = base64.b64decode(BASIC_HEADER[len("Basic "):]).decode("ascii")
+    client_id, _, secret = decoded.partition(":")
+    assert (urllib.parse.unquote_plus(client_id), urllib.parse.unquote_plus(secret)) == (
+        BASIC_CLIENT_ID, BASIC_CLIENT_SECRET)
 
 
 def test_validate_active_missing_scope():

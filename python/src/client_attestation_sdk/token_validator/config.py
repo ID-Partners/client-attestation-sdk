@@ -11,14 +11,29 @@ DEFAULT_TOKEN_TYPES = ("at+jwt",)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+# the client authentication methods IntrospectionConfig accepts
+_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
+
+
 class IntrospectionConfig:
-    """RFC 7662 introspection endpoint + client credentials (the resource server authenticating to the AS)."""
+    """RFC 7662 introspection endpoint + client credentials (the resource server authenticating to the AS).
+
+    ``auth_method`` is ``"client_secret_basic"`` (the default, also chosen by ``None`` or ``""``, so an unset
+    environment variable can be passed straight in) or ``"client_secret_post"``. Any other value is refused
+    with ``ValueError``, here and again when a validator is built, so a typo can't move the secret from the
+    ``Authorization`` header into the form body."""
 
     def __init__(self, endpoint, client_id, client_secret, auth_method="client_secret_basic"):
+        _check_auth_method(auth_method)
+        for name, value in (("client_id", client_id), ("client_secret", client_secret)):
+            if not isinstance(value, str) or value == "":
+                # never echo the value: it may be the secret
+                raise ValueError(f"IntrospectionConfig {name} must be a non-empty string, got "
+                                 f"{'an empty string' if value == '' else _describe(value)}")
         self.endpoint = endpoint
         self.client_id = client_id
         self.client_secret = client_secret
-        self.auth_method = auth_method  # "client_secret_basic" | "client_secret_post"
+        self.auth_method = auth_method or "client_secret_basic"
 
 
 class ValidatorConfig:
@@ -58,6 +73,8 @@ class ValidatorConfig:
             _require_https(jwks_uri, "jwks_uri", allow_insecure)
         if introspection is not None and introspection.endpoint:
             _require_https(introspection.endpoint, "introspection endpoint", allow_insecure)
+        if introspection is not None:
+            _check_auth_method(introspection.auth_method)
         self.accepted_token_types = (
             None if accepted_token_types is None
             else tuple(_normalise_type(t) for t in _string_list(accepted_token_types, "accepted_token_types")))
@@ -100,6 +117,24 @@ def _string_list(value, what):
     if not all(isinstance(item, str) for item in items):
         raise ValueError(f"{what} must be a list of strings")
     return items
+
+
+def _check_auth_method(auth_method):
+    """Refuse an introspection ``auth_method`` other than the two this SDK speaks, or unset (``None`` or
+    ``""``, the default). Anything else used to be taken as ``client_secret_post``."""
+    if auth_method is None or auth_method == "":
+        return
+    if not isinstance(auth_method, str) or auth_method not in _AUTH_METHODS:
+        # never echo the value: a secret passed in the wrong argument would end up in the message
+        raise ValueError("introspection auth_method must be 'client_secret_basic' or 'client_secret_post', "
+                         f"got {_describe(auth_method)}")
+
+
+def _describe(value):
+    """A value's type and size, never its content."""
+    if isinstance(value, str):
+        return f"a string of {len(value)} characters"
+    return f"a {type(value).__name__}"
 
 
 def _require_https(url, what, allow_insecure):

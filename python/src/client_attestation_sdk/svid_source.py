@@ -12,6 +12,7 @@ import re
 import selectors
 import subprocess
 import threading
+import time
 from typing import Protocol, runtime_checkable
 
 from . import _http
@@ -68,24 +69,32 @@ class SpireWorkloadApiSvidSource:
 
     def fetch(self, audience: str) -> str:
         """Return the first JWT-SVID the agent prints on stdout. Raises
-        :class:`~client_attestation_sdk.evidence.EvidenceNotFound` if there is none. At most 1 MiB of stdout
-        is read: an agent that prints more is killed and ``RuntimeError`` is raised. The agent's stderr is
-        discarded, never read as output or held in memory. An agent that has not exited within 30 seconds
-        is killed and :class:`subprocess.TimeoutExpired` is raised.
+        :class:`~client_attestation_sdk.evidence.EvidenceNotFound` if there is none. The agent's stderr is
+        discarded, never read as output or held in memory. An agent that has not exited within 30 seconds is
+        killed and :class:`subprocess.TimeoutExpired` is raised.
 
-        The agent's exit decides the outcome, as in the other ports: once it has exited, stdout is read for
-        at most 250 ms more (a helper the agent started can inherit the pipe and hold it open), then the
-        pipe is closed. On exit status 0, what was read is parsed; on any other status ``RuntimeError`` is
-        raised. A helper holding stdout never turns a success into a failure, and never keeps ``fetch``
-        waiting longer than that."""
+        The agent's exit decides the outcome, as in the other ports. While the agent is running, more than
+        1 MiB of stdout kills it and ``RuntimeError`` is raised; that includes what it wrote just before
+        exiting, which is still in the pipe when its exit is seen. Once it has exited, stdout is read for at most
+        250 ms more and at most 1 MiB in all (a helper the agent started can inherit the pipe and keep writing
+        to it or hold it open), then the pipe is closed. On exit status 0 what was read is parsed; on any other
+        status ``RuntimeError`` is raised. So output a helper writes after the agent has exited never turns a
+        success into a failure, and never keeps ``fetch`` waiting longer than that. If reading stopped at the
+        1 MiB or at the end of the 250 ms, the last line may be cut off, so a token is only taken from a line
+        that ends in a newline.
+
+        On Windows a pipe can't be polled, so stdout is read with plain blocking reads: ``fetch`` still
+        returns after the 250 ms, but if a helper holds the pipe open, the reading thread (a daemon) and the
+        pipe stay open until the helper exits or writes again, and output the agent writes past the 1 MiB just
+        before it exits may be read either side of its exit."""
         args = [self._bin, "api", "fetch", "jwt", "-audience", audience, "-socketPath", self._socket]
-        raw, returncode = _run_capped(args, _SPIRE_AGENT_TIMEOUT, _SPIRE_AGENT_MAX_OUTPUT)
+        raw, returncode, complete = _run_capped(args, _SPIRE_AGENT_TIMEOUT, _SPIRE_AGENT_MAX_OUTPUT)
         if raw is None:
             raise RuntimeError(f"spire-agent fetch failed: output is larger than {_SPIRE_AGENT_MAX_OUTPUT} bytes")
         if returncode != 0:
             raise RuntimeError(f"spire-agent fetch failed: exit status {returncode}")
         stdout = raw.decode("utf-8", "replace")
-        svid = _parse_spire_jwt_output(stdout)
+        svid = _parse_spire_jwt_output(_complete_lines(stdout, complete))
         if svid:
             return svid
         from .evidence import EvidenceNotFound  # evidence imports this module
@@ -98,45 +107,63 @@ class SpireWorkloadApiSvidSource:
 
 
 _SPIRE_AGENT_TIMEOUT = 30
-_SPIRE_AGENT_MAX_OUTPUT = 1 << 20   # the most stdout read from spire-agent, as in the other ports
+# The most stdout read from spire-agent, as in the other ports. More while the agent is running fails the
+# fetch; once it has exited, reading stops there.
+_SPIRE_AGENT_MAX_OUTPUT = 1 << 20
 # How long stdout is still read after spire-agent has exited, as in the other ports. A helper the agent
 # started can inherit the pipe and hold it open; after this the pipe is closed.
 _SPIRE_AGENT_STDOUT_GRACE = 0.25
 _POLL_INTERVAL = 0.05   # how often the reader checks whether it should stop
+_WAIT_INTERVAL = 0.01   # how often the waiting thread checks whether the agent has exited
 
 
-def _run_capped(args: list, timeout: float, max_bytes: int) -> "tuple[bytes | None, int]":
-    """Run ``args`` with stdin and stderr on the null device and return (stdout, exit status). stdout is read
-    on a separate thread so a chatty agent can't block the wait; past ``max_bytes`` the process is killed and
-    stdout is ``None``. A process still running after ``timeout`` seconds is killed and
+def _complete_lines(out: str, complete: bool) -> str:
+    """``out``, or, if reading stopped before the end of stdout (at the cap or the end of the grace period),
+    ``out`` up to its last newline: the line after that may have been cut off."""
+    return out if complete else out[:out.rfind("\n") + 1]
+
+
+def _run_capped(args: list, timeout: float, max_bytes: int) -> "tuple[bytes | None, int, bool]":
+    """Run ``args`` with stdin and stderr on the null device and return (stdout, exit status, whether stdout
+    was read to its end). A process still running after ``timeout`` seconds is killed and
     :class:`subprocess.TimeoutExpired` raised, without any of its output.
 
-    The process's exit decides: once it has exited, stdout is read for at most ``_SPIRE_AGENT_STDOUT_GRACE``
-    seconds more, then the reader stops and closes the pipe, and what was read so far is returned. A helper
-    that inherited the pipe can keep it open, but never keeps this call waiting longer than that."""
+    stdout is read on a separate thread so a chatty agent can't block the wait. That thread only reads: it
+    keeps at most ``max_bytes`` and stops when more arrives. Output counts as the running process's if it was
+    read before this thread first saw the process's exit, or was in the pipe at that moment (the process
+    wrote it before exiting, though it may be read after): past ``max_bytes``, that kills the process and
+    stdout is ``None``. Only output that arrives after that moment is post-exit output: stdout is its first
+    ``max_bytes`` and the exit status decides. Once the process has exited, stdout is read for at most
+    ``_SPIRE_AGENT_STDOUT_GRACE`` seconds more, then the reader stops and closes the pipe, and what was read
+    so far is returned. A helper that inherited the pipe can keep it open, but never keeps this call
+    waiting longer than that."""
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    lock = threading.Lock()   # guards kept, over and stop between the reader and this thread
+    lock = threading.Lock()   # guards kept and state between the reader and this thread
     kept = bytearray()
-    state = {"over": False, "stop": False}
+    # over: past max_bytes while running; exited: this thread has seen the exit; closed: the reader closed
+    # the pipe
+    state = {"over": False, "complete": False, "stop": False, "exited": False, "closed": False}
+    wake = threading.Event()   # set when the reader is done: the end of stdout, or the cap
+    fd = proc.stdout.fileno()
+    pollable = os.name == "posix"   # Windows can't select on a pipe: there, plain blocking reads
 
     def keep(chunk: bytes) -> bool:
-        """Add a chunk; False once the reader should stop."""
-        with lock:
-            if state["stop"]:
-                return False
-            if len(kept) + len(chunk) > max_bytes:
+        """Add a chunk, up to max_bytes; False once the reader should stop. Called with lock held."""
+        if state["stop"]:
+            return False
+        if len(kept) + len(chunk) > max_bytes:
+            if state["exited"]:   # output after the exit was seen: stop at the cap, the exit status decides
+                kept.extend(chunk[:max_bytes - len(kept)])
+            else:                 # the running process's output: this thread kills it
                 state["over"] = True
-                kept.clear()
-                proc.kill()
-                return False
-            kept.extend(chunk)
-            return True
+            return False
+        kept.extend(chunk)
+        return True
 
     def drain():  # owns the pipe: only this thread reads or closes it
         selector = None
         try:
-            fd = proc.stdout.fileno()
-            if os.name == "posix":   # Windows can't select on a pipe: there, plain blocking reads
+            if pollable:
                 selector = selectors.DefaultSelector()
                 selector.register(fd, selectors.EVENT_READ)
             while True:
@@ -145,32 +172,87 @@ def _run_capped(args: list, timeout: float, max_bytes: int) -> "tuple[bytes | No
                         if state["stop"]:
                             return
                     continue
-                chunk = os.read(fd, 65536)
-                if not chunk or not keep(chunk):
-                    return
+                if pollable:
+                    # The read doesn't block (the pipe is readable) and is kept under the lock, so what was
+                    # read and what is still in the pipe are counted together when the exit is first seen.
+                    with lock:
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            state["complete"] = not state["stop"]
+                            return
+                        if not keep(chunk):
+                            return
+                else:
+                    chunk = os.read(fd, 65536)
+                    with lock:
+                        if not chunk:
+                            state["complete"] = not state["stop"]
+                            return
+                        if not keep(chunk):
+                            return
         except (OSError, ValueError):
             return
         finally:
             if selector is not None:
                 selector.close()
-            proc.stdout.close()
+            with lock:
+                state["closed"] = True
+                proc.stdout.close()
+            wake.set()
 
     reader = threading.Thread(target=drain, name="spire-agent-output", daemon=True)
     reader.start()
     try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _stop(proc, lock, state)
-        raise subprocess.TimeoutExpired(args, timeout) from None
+        deadline = time.monotonic() + timeout
+        while True:
+            with lock:
+                over = state["over"]
+            if over:   # past the cap while the agent is running: kill it (from this thread, which reaps it)
+                _stop(proc, lock, state)
+                return None, proc.returncode, False
+            if proc.poll() is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop(proc, lock, state)
+                raise subprocess.TimeoutExpired(args, timeout)
+            if wake.is_set():   # stdout ended before the agent exited: just wait for the exit
+                time.sleep(min(remaining, _WAIT_INTERVAL))
+            else:
+                wake.wait(min(remaining, _WAIT_INTERVAL))
     except BaseException:   # e.g. KeyboardInterrupt: don't leave the agent running
-        _stop(proc, lock, state)
+        if proc.poll() is None:
+            _stop(proc, lock, state)
         raise
-    # The agent has exited. What it wrote is in the pipe; give the reader the grace period to finish, then
-    # take what it has and stop it, whether or not a helper still holds the pipe open.
+    # The agent has exited. What it wrote before exiting has been read or is in the pipe now: past the cap
+    # with what was read, it is the running agent's overflow. Only what arrives after this is post-exit output.
+    with lock:
+        state["exited"] = True
+        if not state["over"] and not state["closed"] and len(kept) + _pipe_pending(fd) > max_bytes:
+            state["over"] = True
+        if state["over"]:
+            state["stop"] = True
+            return None, proc.returncode, False
+    # Give the reader the grace period to finish (the end of stdout, or the cap: the exit status decides),
+    # then take what it has and stop it, whether or not a helper still holds the pipe open.
     reader.join(_SPIRE_AGENT_STDOUT_GRACE)
     with lock:
         state["stop"] = True
-        return (None if state["over"] else bytes(kept)), proc.returncode
+        return bytes(kept), proc.returncode, state["complete"]
+
+
+def _pipe_pending(fd: int) -> int:
+    """How many bytes are waiting in the pipe ``fd``. On Windows, where it is not asked, 0: there, output the
+    agent writes past the cap just before it exits may be read either side of its exit."""
+    if os.name != "posix":
+        return 0
+    import fcntl
+    import struct
+    import termios
+    try:
+        return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+    except OSError:
+        return 0
 
 
 def _stop(proc: subprocess.Popen, lock: threading.Lock, state: dict) -> None:

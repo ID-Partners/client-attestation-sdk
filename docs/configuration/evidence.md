@@ -22,12 +22,16 @@ Passing `evidence` explicitly bypasses this selection.
 | 5 | `/tmp/spire-agent/public/api.sock` exists | SPIRE CLI source. |
 | 6 | GCP metadata probe succeeds | GCP metadata identity source. The probe timeout is 300 milliseconds. The probe and the source require HTTP 200 and the `Metadata-Flavor: Google` response header, so another host answering `metadata.google.internal` is not used. |
 | 7 | Azure IMDS probe succeeds - Python only | Azure source. The probe timeout is 300 milliseconds and it requires HTTP 200 with the instance-metadata JSON. `AZURE_CLIENT_ID` selects a user-assigned identity. `CLIENT_ATTESTATION_AZURE_RESOURCE` names the only Entra resource it may request; without it, fetching fails. |
-| 8 | AWS credential environment signals exist - Python only | AWS source. `AWS_REGION` is passed as its region. |
+| 8 | AWS credential environment signals exist - Python only | AWS source. `AWS_REGION` is passed as its region. EC2 instance profiles are not detected. |
 
-Python's AWS signals are `AWS_WEB_IDENTITY_TOKEN_FILE`,
-`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, or both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+Python's AWS signals are `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (ECS),
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` (EKS Pod Identity, among others: ECS Anywhere, Greengrass, SnapStart
+Lambda and aws-vault's `--server` mode set it too), or both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 These select the source. Boto3 resolves the credentials for the later STS call.
 The SDK does not read `AWS_WEB_IDENTITY_TOKEN_FILE` as a static SVID through this branch.
+EC2 instance profiles are not auto-detected: that would add an IMDS probe to every host that isn't on AWS.
+On EC2, pass `evidence=AwsWebIdentitySvidSource()` explicitly; boto3's default credential chain then
+finds the instance-profile credentials.
 
 If no source is found, acquisition raises `EvidenceNotFound` or returns that error in Go.
 A configured missing file or socket stops selection.
@@ -59,7 +63,9 @@ TypeScript's second constructor argument overrides the identity URL for tests.
 The SPIRE source defaults to `/tmp/spire-agent/public/api.sock` and executable `spire-agent`.
 It runs `spire-agent api fetch jwt -audience <audience> -socketPath <path>`.
 Its subprocess deadline is 30 seconds in every port; a `spire-agent` still running then is killed.
-Once `spire-agent` has exited, its stdout is read for at most 250 ms more and then closed, so a helper that holds stdout open cannot fail or delay the fetch; on exit status 0 what was read is parsed, and any other status fails.
+While `spire-agent` is running, more than 1 MiB of stdout kills it and fails the fetch; that includes what it wrote just before exiting, which is still in the pipe when its exit is seen.
+Once it has exited, its stdout is read for at most 250 ms more and at most 1 MiB in all, then closed, so a helper that holds stdout open or keeps writing to it cannot fail or delay the fetch; on exit status 0 what was read is parsed, and any other status fails.
+If reading stopped at the 1 MiB or the 250 ms, the last line may be cut off, so a token is only taken from a line that ends in a newline.
 The socket must be accessible to the process and the executable must be on `PATH`, unless its path is supplied.
 Changing the client HTTP timeout does not change this deadline.
 This CLI source is Experimental.
@@ -77,7 +83,7 @@ Use it for the supplied local demonstration endpoints.
 | `AzureImdsSvidSource` | `timeout` | `5.0` seconds | Timeout for the IMDS HTTP request. |
 | `AzureImdsSvidSource` | `client_id` | `None` | Optional user-assigned managed identity selector. Auto-detection supplies `AZURE_CLIENT_ID`. |
 | `AzureImdsSvidSource` | `resource` (keyword) | `None` | Required. The only Entra resource the source requests, for example `api://attester`. The attester's `evidence_audience` must equal it. Auto-detection supplies `CLIENT_ATTESTATION_AZURE_RESOURCE`. |
-| `AwsWebIdentitySvidSource` | `region` | `None` | Passed to `boto3.client("sts", region_name=region)`. Auto-detection supplies `AWS_REGION`. |
+| `AwsWebIdentitySvidSource` | `region` | `None` | Passed to `boto3.client("sts", region_name=region)`. With `None`, boto3 resolves the region itself. Auto-detection supplies `AWS_REGION`. |
 
 Azure uses `http://169.254.169.254/metadata/identity/oauth2/token`.
 It sends `api-version=2018-02-01`, `resource=<audience>` and `Metadata: true`.
@@ -86,7 +92,9 @@ for any other audience, `fetch` raises `ClientAttestationError` and IMDS is not 
 token for any resource it is asked for, so this stops an attester from obtaining a token for another
 Azure resource.
 It extracts `access_token` from the JSON response.
-AWS requires the `aws` package extra.
+AWS requires the `aws` package extra. Without boto3, `fetch` raises `EvidenceNotFound`.
+The source uses boto3's default credential chain, so constructed explicitly it also works with an EC2
+instance profile, which auto-detection does not pick up.
 The implementation calls `get_web_identity_token(Audience=[audience], SigningAlgorithm="RS256")`.
 It extracts `WebIdentityToken` from the response.
 Both integrations are Experimental and have not been verified against a live attester.

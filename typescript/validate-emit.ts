@@ -8,7 +8,12 @@ import { fileURLToPath } from "node:url";
 import type { JSONWebKeySet } from "jose";
 
 import { TransportError } from "./src/errors.js";
-import { AccessTokenValidator, ProtectedResource, type ValidatorConfig } from "./src/validator/index.js";
+import {
+  AccessTokenValidator,
+  ProtectedResource,
+  type IntrospectionAuthMethod,
+  type ValidatorConfig,
+} from "./src/validator/index.js";
 
 interface Overrides {
   accepted_algorithms?: string[];
@@ -44,7 +49,22 @@ interface IntrospectionCase {
 
 interface ConfigCase {
   name: string;
-  config: { jwks_uri?: string; introspection_endpoint?: string; allow_insecure?: boolean; leeway_seconds?: number };
+  config: {
+    jwks_uri?: string;
+    introspection_endpoint?: string;
+    introspection_auth_method?: string;
+    introspection_client_id?: string | null;
+    introspection_client_secret?: string | null;
+    allow_insecure?: boolean;
+    leeway_seconds?: number;
+  };
+}
+
+interface ClientAuthCase {
+  name: string;
+  client_id: string;
+  client_secret: string;
+  auth_method?: string;
 }
 
 type Row = { name: string; valid: boolean; error: string | null; description?: string | null };
@@ -143,6 +163,38 @@ for (const c of introspection.cases) {
   }
 }
 
+const clientAuthResults: {
+  name: string;
+  authorization: string | null;
+  form: { client_id: string | null; client_secret: string | null } | null;
+}[] = [];
+for (const c of load<{ client_auth: ClientAuthCase[] }>("introspection.json").client_auth) {
+  let sent: { body: string; headers: Record<string, string> } = { body: "", headers: {} };
+  const config = configFor();
+  config.introspection = {
+    endpoint: "https://issuer.example.com/introspect",
+    clientId: c.client_id,
+    clientSecret: c.client_secret,
+    authMethod: c.auth_method as IntrospectionAuthMethod | undefined,
+  };
+  const validator = new AccessTokenValidator(config, {
+    httpPost: async (_url, body, headers) => {
+      sent = { body, headers };
+      return { active: true };
+    },
+  });
+  await validator.introspect("opaque-token");
+  const form = new URLSearchParams(sent.body);
+  clientAuthResults.push({
+    name: c.name,
+    authorization: sent.headers.Authorization ?? null,
+    form:
+      form.has("client_id") || form.has("client_secret")
+        ? { client_id: form.get("client_id"), client_secret: form.get("client_secret") }
+        : null,
+  });
+}
+
 const configResults: Row[] = [];
 for (const c of load<{ cases: ConfigCase[] }>("config.json").cases) {
   const config = configFor();
@@ -151,7 +203,16 @@ for (const c of load<{ cases: ConfigCase[] }>("config.json").cases) {
     config.jwksUri = c.config.jwks_uri;
   }
   if (c.config.introspection_endpoint !== undefined) {
-    config.introspection = { endpoint: c.config.introspection_endpoint, clientId: "rs", clientSecret: "secret" };
+    config.introspection = {
+      endpoint: c.config.introspection_endpoint,
+      // passed through untyped, as a JavaScript caller might: null is refused like ""
+      clientId: (c.config.introspection_client_id === undefined ? "rs" : c.config.introspection_client_id) as string,
+      clientSecret: (c.config.introspection_client_secret === undefined ? "secret" : c.config.introspection_client_secret) as string,
+    };
+    if (c.config.introspection_auth_method !== undefined) {
+      // the emitter passes the vector's string through untyped, as a JavaScript caller would
+      (config.introspection as { authMethod?: string }).authMethod = c.config.introspection_auth_method;
+    }
   }
   if (c.config.allow_insecure !== undefined) config.allowInsecure = c.config.allow_insecure;
   if (c.config.leeway_seconds !== undefined) config.leewaySeconds = c.config.leeway_seconds;
@@ -172,6 +233,7 @@ writeFileSync(
       results,
       introspection_results: introspectionResults,
       guard_results: guardResults,
+      client_auth_results: clientAuthResults,
       config_results: configResults,
     },
     null,

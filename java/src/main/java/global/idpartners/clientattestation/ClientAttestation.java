@@ -84,6 +84,8 @@ public final class ClientAttestation {
     static final String DEFAULT_POP_METHOD = "attestation_pop_jwt";
     /** PoP method that sends a single DPoP proof (RFC 9449) instead of a separate PoP JWT. */
     static final String DPOP_COMBINED_POP_METHOD = "dpop_combined";
+    /** The PoP method names, case-sensitive: used by both {@link #checkPopMethod} and the flow. */
+    static final List<String> POP_METHODS = List.of(DEFAULT_POP_METHOD, DPOP_COMBINED_POP_METHOD);
     /** Refresh this many seconds before the token actually expires, so a token is never used at the edge. */
     static final int DEFAULT_EXPIRY_SKEW_SECONDS = 30;
     /** A token is cached for at most this long, whatever {@code expires_in} the token endpoint gives. */
@@ -170,7 +172,7 @@ public final class ClientAttestation {
         this.operator = b.operator;
         this.challengeAtToken = b.challengeAtToken;
         this.algorithm = b.algorithm;
-        this.popMethod = b.popMethod;
+        this.popMethod = checkPopMethod(b.popMethod);
         this.skewSeconds = b.expirySkewSeconds;
         this.timeout = b.timeout;
         this.requireChallenge = b.requireChallenge;
@@ -180,6 +182,22 @@ public final class ClientAttestation {
             requireSecure(this.baseUrl, "attester_url", this.allowInsecure);
         }
         this.http = HttpTransport.client(b.timeout);
+    }
+
+    /**
+     * The PoP method to use. {@code null} or {@code ""} (unset) is the default; any other value must be
+     * exactly one of the two the draft names (case-sensitive), so a misspelt value can't quietly send a
+     * PoP JWT (vectors/pop-method.json).
+     */
+    static String checkPopMethod(String popMethod) {
+        if (popMethod == null || popMethod.isEmpty()) {
+            return DEFAULT_POP_METHOD;
+        }
+        if (!POP_METHODS.contains(popMethod)) {
+            throw new IllegalArgumentException("popMethod must be \"" + DEFAULT_POP_METHOD + "\" or \""
+                    + DPOP_COMBINED_POP_METHOD + "\", got \"" + popMethod + "\"");
+        }
+        return popMethod;
     }
 
     /**
@@ -472,6 +490,11 @@ public final class ClientAttestation {
     // ── the flow ────────────────────────────────────────────────────────────────────────────────────
 
     private Minted runFlow() throws Exception {
+        // build() refused anything else. A value that still isn't one of the two fails here, before any
+        // request, rather than falling back to a PoP JWT.
+        if (!POP_METHODS.contains(this.popMethod)) {
+            throw new ClientAttestationException("unsupported popMethod \"" + this.popMethod + "\"");
+        }
         boolean pinned = this.evidenceAudience != null && !this.evidenceAudience.isEmpty();
         if (!pinned && !this.staticMetadata) {
             throw new ClientAttestationException(PIN_REQUIRED);
@@ -526,7 +549,7 @@ public final class ClientAttestation {
                     nonce -> new DpopProofBuilder(instanceKey).method("POST").uri(tokenEndpoint).nonce(nonce)
                             .build(),
                     true);
-        } else {
+        } else {   // DEFAULT_POP_METHOD, checked at the top of the flow
             String pop = new PopBuilder(instanceKey).clientId(clientId).audience(popAudience)
                     .challenge(tokenChallenge).build();
             response = callTokenEndpoint(tokenEndpoint, attestation, POP_HEADER, tokenChallenge, nonce -> pop,
@@ -784,24 +807,93 @@ public final class ClientAttestation {
     }
 
     /**
-     * Whether two URIs are on one origin, for {@link #send}'s guard. A URI the htu rule refuses (an IPv6 zone
-     * literal, say) is its own nonce key, whole URL and all, so for those the origin is read off the URI:
-     * its scheme and authority, lower-cased, without userinfo. Otherwise a same-origin request with another
-     * path or query would be refused.
+     * Whether two URIs are on one origin, for {@link #send}'s guard: the same scheme, host and port, read off
+     * each URI's own scheme and authority, so a request that differs only in path, query or userinfo is on
+     * the same origin. Scheme and host are compared lower-cased (ASCII only; an IPv6 zone ID is kept as
+     * written, so {@code %25eth0} and {@code %25ETH0} differ), and the port as the htu rule normalises it: as
+     * a number ({@code :08443} is {@code :8443}) and dropped when it is the scheme's own default ({@code :443}
+     * for https, {@code :80} for http, and no other pairing). This also covers URIs the htu rule refuses (an
+     * IPv6 zone literal, say), which are their own nonce key. A URI with no scheme or host, or whose port is
+     * not a plain number from 1 to 65535 (empty, signed, {@code 0}, too large), is on no origin: it is not on
+     * the same origin as anything, itself included, so the guard refuses it.
      */
     static boolean sameOrigin(URI a, URI b) {
-        return originOf(a).equals(originOf(b));
+        String x = originOf(a);
+        return x != null && x.equals(originOf(b));
     }
 
+    /** {@code scheme://host[:port]} as {@link #sameOrigin} compares it, or {@code null} if it has none. */
     private static String originOf(URI uri) {
-        String text = uri.toString();
-        String key = nonceKey(text);
-        if (!key.equals(text) || uri.getScheme() == null) {
-            return key;
+        String scheme = uri.getScheme();
+        String authority = uri.getRawAuthority();
+        if (scheme == null || authority == null) {
+            return null;
         }
-        String authority = uri.getRawAuthority() == null ? "" : uri.getRawAuthority();
-        authority = authority.substring(authority.lastIndexOf('@') + 1);
-        return (uri.getScheme() + "://" + authority).toLowerCase(Locale.ROOT);
+        scheme = asciiLower(scheme);
+        String hostport = authority.substring(authority.lastIndexOf('@') + 1);
+        String host;
+        String port = null;
+        if (hostport.startsWith("[")) {
+            int close = hostport.indexOf(']');
+            if (close < 0) {
+                return null;
+            }
+            String literal = hostport.substring(1, close);
+            String after = hostport.substring(close + 1);
+            if (!after.isEmpty()) {
+                if (after.charAt(0) != ':') {
+                    return null;
+                }
+                port = after.substring(1);
+            }
+            int zone = literal.indexOf('%');   // the address folds case; the zone ID is kept as written
+            host = "[" + (zone < 0 ? asciiLower(literal)
+                    : asciiLower(literal.substring(0, zone)) + literal.substring(zone)) + "]";
+        } else {
+            int colon = hostport.indexOf(':');
+            host = asciiLower(colon < 0 ? hostport : hostport.substring(0, colon));
+            port = colon < 0 ? null : hostport.substring(colon + 1);
+        }
+        if (host.isEmpty() || host.equals("[]")) {
+            return null;
+        }
+        if (port == null) {
+            return scheme + "://" + host;
+        }
+        int n = portNumber(port);
+        if (n < 0) {
+            return null;
+        }
+        return n == DEFAULT_PORTS.getOrDefault(scheme, -1) ? scheme + "://" + host : scheme + "://" + host + ":" + n;
+    }
+
+    private static final Map<String, Integer> DEFAULT_PORTS = Map.of("http", 80, "https", 443);
+
+    /** {@code port} as a number from 1 to 65535 (ASCII digits only, leading zeros allowed), else -1. */
+    private static int portNumber(String port) {
+        if (port.isEmpty()) {
+            return -1;
+        }
+        for (int i = 0; i < port.length(); i++) {
+            if (port.charAt(i) < '0' || port.charAt(i) > '9') {
+                return -1;
+            }
+        }
+        String digits = port.replaceFirst("^0+", "");
+        if (digits.isEmpty() || digits.length() > 5) {
+            return -1;
+        }
+        int n = Integer.parseInt(digits);
+        return n <= 65535 ? n : -1;
+    }
+
+    private static String asciiLower(String s) {
+        StringBuilder out = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            out.append(c >= 'A' && c <= 'Z' ? (char) (c + ('a' - 'A')) : c);
+        }
+        return out.toString();
     }
 
     /** Lets go of a response body the caller never sees, so it does not hold its connection open. */
@@ -1228,6 +1320,8 @@ public final class ClientAttestation {
          * PoP method: default {@code attestation_pop_jwt} (a dedicated {@code OAuth-Client-Attestation-PoP}
          * JWT), or {@code dpop_combined} to send a single DPoP proof (RFC 9449, header {@code DPoP})
          * instead, whose embedded {@code jwk} is the instance key bound in the attestation's {@code cnf}.
+         * {@code null} or {@code ""} means the default. The names are case-sensitive; {@link #build()} throws
+         * {@link IllegalArgumentException} for any other value, including one with surrounding whitespace.
          */
         public Builder popMethod(String popMethod) {
             this.popMethod = popMethod;
@@ -1283,7 +1377,11 @@ public final class ClientAttestation {
             return this;
         }
 
-        /** @throws ClientAttestationException if the host is not https, not loopback and not allowed */
+        /**
+         * @throws ClientAttestationException if the host is not https, not loopback and not allowed
+         * @throws IllegalArgumentException if the PoP method is set and is not {@code attestation_pop_jwt} or
+         *         {@code dpop_combined} ({@code null} or {@code ""} means the default)
+         */
         public ClientAttestation build() {
             return new ClientAttestation(this);
         }

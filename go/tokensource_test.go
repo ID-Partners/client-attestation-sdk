@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -417,6 +418,115 @@ func TestNegativeExpirySkewIsRejected(t *testing.T) {
 	}
 	if _, err := NewClientAttestation("https://attester.example.com", WithExpirySkew(0)); err != nil {
 		t.Fatalf("zero skew: %v", err)
+	}
+}
+
+// TestPopMethodVectors runs the shared PoP method cases (vectors/pop-method.json). An accepted value is
+// checked by the header sent at the token endpoint; a refused one fails NewClientAttestation before any
+// request or evidence fetch. null is "WithPopMethod not given"; a non-string can't be passed in Go.
+func TestPopMethodVectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "vectors", "pop-method.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Cases []struct {
+			Name      string          `json:"name"`
+			PopMethod json.RawMessage `json:"pop_method"`
+			Expect    string          `json:"expect"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range file.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			var opts []Option
+			if string(tc.PopMethod) != "null" {
+				var method string
+				if err := json.Unmarshal(tc.PopMethod, &method); err != nil {
+					t.Skipf("not a string (%s): Go's WithPopMethod takes only a string", tc.PopMethod)
+				}
+				opts = append(opts, WithPopMethod(method))
+			}
+			srv, captured := fakeAttester(t)
+			var requests, tokenRequests atomic.Int32
+			inner := srv.Config.Handler
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.URL.Path == "/as/token.oauth2" {
+					tokenRequests.Add(1)
+				}
+				inner.ServeHTTP(w, r)
+			})
+			source := &recordingSource{}
+			opts = append(opts, WithEvidence(source), WithEvidenceAudience(fakeAudience))
+			ca, err := NewClientAttestation(srv.URL, opts...)
+			if tc.Expect == "refused" {
+				if err == nil || ca != nil || !strings.HasPrefix(err.Error(), "pop method must be") {
+					t.Fatalf("want a construction error, got %v, %v", ca, err)
+				}
+				if n := requests.Load(); n != 0 || len(source.audiences) != 0 {
+					t.Fatalf("a refused pop method made %d requests and %d evidence fetches", n, len(source.audiences))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ca.Token(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if n := tokenRequests.Load(); n != 1 {
+				t.Fatalf("want 1 token request, got %d", n)
+			}
+			sentDPoP, sentPoP := captured.dpop != "", captured.pop != ""
+			if want := tc.Expect == PopMethodDpopCombined; sentDPoP != want || sentPoP == want {
+				t.Fatalf("expect %s: sent DPoP=%v PoP=%v", tc.Expect, sentDPoP, sentPoP)
+			}
+		})
+	}
+}
+
+// The flow re-checks the method it was built with: a value that isn't one of the two (only reachable by
+// bypassing NewClientAttestation) fails before any request or evidence fetch rather than sending a PoP JWT.
+func TestFlowRefusesAnUnexpectedPopMethod(t *testing.T) {
+	srv, _ := fakeAttester(t)
+	var requests atomic.Int32
+	inner := srv.Config.Handler
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		inner.ServeHTTP(w, r)
+	})
+	source := &recordingSource{}
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience), WithEvidence(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca.popMethod = "DPOP_COMBINED"
+	_, err = ca.Token(context.Background())
+	var cae *ClientAttestationError
+	if !errors.As(err, &cae) || cae.Message != `unsupported pop method "DPOP_COMBINED"` {
+		t.Fatalf("err = %v", err)
+	}
+	if n := requests.Load(); n != 0 || len(source.audiences) != 0 {
+		t.Fatalf("the flow made %d requests and %d evidence fetches", n, len(source.audiences))
+	}
+}
+
+// WithPopMethod("") is ignored, like WithAlgorithm(""), so an earlier WithPopMethod still applies.
+func TestEmptyWithPopMethodKeepsAnEarlierOne(t *testing.T) {
+	srv, captured := fakeAttester(t)
+	ca, err := NewClientAttestation(srv.URL, WithEvidenceAudience(fakeAudience),
+		WithEvidence(StaticSvidSource{SVID: "fake-svid"}), WithPopMethod(PopMethodDpopCombined), WithPopMethod(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ca.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if captured.dpop == "" || captured.pop != "" {
+		t.Fatalf("sent DPoP=%q PoP=%q, want DPoP only", captured.dpop, captured.pop)
 	}
 }
 

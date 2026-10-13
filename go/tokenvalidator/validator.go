@@ -59,8 +59,9 @@ func WithHTTPPost(f HTTPPostFunc) Option { return func(v *AccessTokenValidator) 
 func WithClock(now func() time.Time) Option { return func(v *AccessTokenValidator) { v.now = now } }
 
 // New builds a validator from config. It refuses a config without an issuer or an audience, with a
-// negative LeewaySeconds, or with a plain-http JWKSURI or introspection endpoint on a non-loopback host
-// (unless AllowInsecure is set).
+// negative LeewaySeconds, with a plain-http JWKSURI or introspection endpoint on a non-loopback host
+// (unless AllowInsecure is set), or with an introspection AuthMethod other than "client_secret_basic",
+// "client_secret_post" or "".
 //
 // The validator keeps its own copy of config: changing the Config (or its slices) after New returns does
 // not change what the validator accepts.
@@ -249,12 +250,11 @@ func (v *AccessTokenValidator) Introspect(token string) (map[string]any, error) 
 		"Content-Type": "application/x-www-form-urlencoded",
 		"Accept":       "application/json",
 	}
-	if cfg.AuthMethod == "" || cfg.AuthMethod == "client_secret_basic" {
-		creds := base64.StdEncoding.EncodeToString([]byte(cfg.ClientID + ":" + cfg.ClientSecret))
-		headers["Authorization"] = "Basic " + creds
-	} else {
+	if cfg.AuthMethod == authClientSecretPost {
 		form.Set("client_id", cfg.ClientID)
 		form.Set("client_secret", cfg.ClientSecret)
+	} else { // client_secret_basic or "": New refuses any other AuthMethod
+		headers["Authorization"] = basicAuthorization(cfg.ClientID, cfg.ClientSecret)
 	}
 	post := v.httpPost
 	if post == nil {
@@ -272,6 +272,16 @@ func (v *AccessTokenValidator) Introspect(token string) (map[string]any, error) 
 			"status", sdklog.NonZero(int64(status)), "reason", reason)
 	}
 	return data, err
+}
+
+// basicAuthorization is the client_secret_basic Authorization header value (RFC 6749 section 2.3.1): the client
+// id and the secret are each form-urlencoded (Appendix B), joined with ":" and base64'd. The encoding is
+// url.QueryEscape, the same bytes as Python's urllib.parse.quote_plus(s, safe=""): each UTF-8 byte of
+// A-Z a-z 0-9 - . _ ~ stays as it is, a space becomes "+", and every other byte is %XX with uppercase hex
+// (so ":" is %3A, "%" is %25, "+" is %2B and "*" is %2A). validation/SEMANTICS.md, Introspection.
+func basicAuthorization(clientID, clientSecret string) string {
+	raw := url.QueryEscape(clientID) + ":" + url.QueryEscape(clientSecret)
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))
 }
 
 // ValidateActive introspects the token and enforces active, then scope, then the audience when the response

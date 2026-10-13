@@ -163,6 +163,34 @@ describe("introspection edge cases", () => {
     expect(captured!.body).toContain("client_secret=s3cret");
   });
 
+  // F6: the same fixture and header are in every port's tests and in validation/introspection.json
+  it("client_secret_basic form-urlencodes the client id and the secret", async () => {
+    let captured: { body: string; headers: Record<string, string> } | null = null;
+    const httpPost = async (_url: string, body: string, headers: Record<string, string>) => {
+      captured = { body, headers };
+      return { active: true };
+    };
+    for (const authMethod of [undefined, "client_secret_basic"] as const) {
+      const validator = newValidator(
+        {
+          introspection: {
+            ...INTROSPECTION,
+            clientId: "rs:1 a+b%c",
+            clientSecret: "s3cr*t~-._!'()/?#&=\u00e9\u{1F600}",
+            authMethod,
+          },
+        },
+        { httpPost },
+      );
+      await validator.introspect("opaque-token");
+      expect(captured!.headers.Authorization).toBe(
+        "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA=",
+      );
+      expect(captured!.body).not.toContain("client_id");
+      expect(captured!.body).not.toContain("client_secret");
+    }
+  });
+
   it("validateActive enforces required scopes", async () => {
     const validator = newValidator(
       { introspection: INTROSPECTION },

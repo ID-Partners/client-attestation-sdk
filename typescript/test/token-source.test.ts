@@ -492,11 +492,32 @@ describe("SpireWorkloadApiSvidSource with a fake spire-agent", () => {
     const line = `token(spiffe://example.org/wl): ${SVID}\n`;
     const atCap = line + "x".repeat((1 << 20) - line.length);
     expect(await new SpireWorkloadApiSvidSource("/s", fakeAgent(atCap)).fetch("aud")).toBe(SVID);
-    const err = (await new SpireWorkloadApiSvidSource("/s", fakeAgent(atCap + "x"))
-      .fetch("aud")
-      .catch((e: unknown) => e)) as Error;
+    // One byte more while the agent is still running fails the fetch.
+    const over = fakeAgent(atCap + "x");
+    writeFileSync(over, `#!/bin/sh\ncat "${dir}/stdout"\nexec sleep 5\n`);
+    const err = (await new SpireWorkloadApiSvidSource("/s", over).fetch("aud").catch((e: unknown) => e)) as Error;
     expect(err.message).toBe("spire-agent fetch failed: output is larger than 1048576 bytes");
   });
+
+  it("an agent that writes past the cap and exits always fails", async () => {
+    // The agent itself writes 1 MiB + 1 byte and exits at once, so the last bytes may be read either side of
+    // its exit. They were written while it ran, so the fetch fails every time, as in the other ports.
+    const bin = fakeAgent("");
+    writeFileSync(bin, "#!/bin/sh\nexec head -c 1048577 /dev/zero\n");
+    let ok = 0;
+    for (let i = 0; i < 50; i++) {
+      const err = await new SpireWorkloadApiSvidSource("/s", bin).fetch("aud").then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      if (err === undefined || err instanceof EvidenceNotFound) {
+        ok++; // read as post-exit output: cut at the cap, no token in it
+      } else {
+        expect(err.message).toBe("spire-agent fetch failed: output is larger than 1048576 bytes");
+      }
+    }
+    expect(`${ok} of 50 runs did not fail with the size error`).toBe("0 of 50 runs did not fail with the size error");
+  }, 30_000);
 
   it("discards a flood of stderr", async () => {
     const bin = fakeAgent(OUTPUT, "e".repeat(4 << 20));

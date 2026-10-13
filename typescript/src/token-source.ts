@@ -43,6 +43,11 @@ export const ATTESTATION_HEADER = "OAuth-Client-Attestation";
 export const POP_HEADER = "OAuth-Client-Attestation-PoP";
 /** Refresh this many seconds before the token actually expires, so a token is never used at the edge. */
 export const DEFAULT_EXPIRY_SKEW_SECONDS = 30;
+/** The PoP method names, case-sensitive, used by both the constructor's check and the flow. */
+type PopMethod = Exclude<NonNullable<ClientAttestationOptions["popMethod"]>, "">;
+const POP_JWT = "attestation_pop_jwt" satisfies PopMethod;
+const DPOP_COMBINED = "dpop_combined" satisfies PopMethod;
+const POP_METHODS: readonly PopMethod[] = [POP_JWT, DPOP_COMBINED];
 const PIN_REQUIRED =
   "evidenceAudience is required: set it to the audience your attester expects the workload's " +
   "identity token for, so the attester's discovery document can't choose it";
@@ -114,9 +119,11 @@ export interface ClientAttestationOptions {
   /**
    * How to prove possession of the instance key at the token endpoint: the dedicated
    * `OAuth-Client-Attestation-PoP` JWT (`"attestation_pop_jwt"`, the default), or a `DPoP` proof
-   * carrying the same challenge in `nonce` (`"dpop_combined"`).
+   * carrying the same challenge in `nonce` (`"dpop_combined"`). `undefined`, `null` or `""` means the
+   * default. The names are case-sensitive; the constructor throws a `RangeError` for any other value,
+   * including one with surrounding whitespace or a non-string.
    */
-  popMethod?: "attestation_pop_jwt" | "dpop_combined";
+  popMethod?: "attestation_pop_jwt" | "dpop_combined" | "" | null;
   /**
    * Whether the attester-issued challenge also rides in the token-endpoint proof (the PoP's
    * `challenge` claim, or the DPoP `nonce`), on top of the mint-time instance proof it always
@@ -205,7 +212,7 @@ export class ClientAttestation {
   readonly #algorithm: string;
   readonly #skew: number;
   readonly #timeoutMs: number;
-  readonly #popMethod: "attestation_pop_jwt" | "dpop_combined";
+  readonly #popMethod: PopMethod;
   readonly #requireChallenge: boolean;
   readonly #allowInsecure: boolean;
   readonly #logger: Logger;
@@ -239,7 +246,7 @@ export class ClientAttestation {
       throw new RangeError(`expirySkewSeconds must be a finite number, not negative: ${this.#skew}`);
     }
     this.#timeoutMs = opts.timeoutMs ?? 20_000;
-    this.#popMethod = opts.popMethod ?? "attestation_pop_jwt";
+    this.#popMethod = checkPopMethod(opts.popMethod);
     this.#requireChallenge = opts.requireChallenge ?? true;
     this.#allowInsecure = opts.allowInsecure ?? false;
     this.#logger = opts.logger ?? NOOP_LOGGER;
@@ -305,7 +312,7 @@ export class ClientAttestation {
     // never costs a mint and token request on a cold cache. Otherwise only what parsers disagree on is
     // refused up front: a Bearer token carries no htu.
     try {
-      if (this.#popMethod === "dpop_combined") normalizeHtu(url);
+      if (this.#popMethod === DPOP_COMBINED) normalizeHtu(url);
       else checkHtu(url);
     } catch (err) {
       throw new ClientAttestationError((err as Error).message);
@@ -443,6 +450,11 @@ export class ClientAttestation {
   }
 
   async #runFlow(): Promise<{ response: TokenResponse; key: SigningKeyPair }> {
+    // The constructor refused anything else. A value that still isn't one of the two fails here, before
+    // any request, rather than falling back to a PoP JWT.
+    if (!POP_METHODS.includes(this.#popMethod)) {
+      throw new ClientAttestationError(`unsupported popMethod ${describe(this.#popMethod)}`);
+    }
     if (!this.#evidenceAudience && !this.#staticMetadata) throw new ClientAttestationError(PIN_REQUIRED);
     const meta = await this.attesterMetadata();
     const audience = meta.evidenceAudience;
@@ -506,13 +518,14 @@ export class ClientAttestation {
       });
       return { response, key: instanceKey };
     };
-    if (this.#popMethod !== "dpop_combined") {
+    if (this.#popMethod === POP_JWT) {
       const headers = await credential.popHeaders(clientId, popAudience, tokenChallenge ?? null);
       return obtained(this.#tokenResponse(tokenEndpoint, await this.#postToken(tokenEndpoint, headers)));
     }
 
-    // DPoP combined: the attester challenge rides as the DPoP nonce. If the AS demands its own nonce
-    // (400 use_dpop_nonce + DPoP-Nonce), retry once with that — the server's demand wins.
+    // DPoP combined, the only other value (checked at the top of the flow): the attester challenge rides
+    // as the DPoP nonce. If the AS demands its own nonce (400 use_dpop_nonce + DPoP-Nonce), retry once
+    // with that — the server's demand wins.
     let res = await this.#postToken(tokenEndpoint, await credential.dpopHeaders("POST", tokenEndpoint, tokenChallenge ?? null));
     const serverNonce = usableNonce(res.headers.get(DPOP_NONCE_HEADER));
     if (serverNonce) this.#rememberNonce(tokenEndpoint, serverNonce);
@@ -778,6 +791,35 @@ function sortKeys(value: unknown): unknown {
     return Object.fromEntries(Object.keys(obj).sort().map((k) => [k, sortKeys(obj[k])]));
   }
   return value;
+}
+
+/**
+ * The PoP method to use. `undefined`, `null` or `""` (unset) is the default; any other value must be
+ * exactly one of the two the draft names (case-sensitive), so a misspelt value can't quietly send a PoP
+ * JWT (vectors/pop-method.json).
+ */
+function checkPopMethod(popMethod: unknown): PopMethod {
+  if (popMethod === undefined || popMethod === null || popMethod === "") return POP_JWT;
+  const known = POP_METHODS.find((name) => name === popMethod);
+  if (known === undefined) {
+    throw new RangeError(`popMethod must be "${POP_JWT}" or "${DPOP_COMBINED}", got ${describe(popMethod)}`);
+  }
+  return known;
+}
+
+/** A value for an error message: JSON where that works, never a throw (BigInt, a cycle, a symbol). */
+function describe(value: unknown): string {
+  try {
+    const json = JSON.stringify(value);
+    if (json !== undefined) return json;
+  } catch {
+    // fall through
+  }
+  try {
+    return typeof value === "bigint" ? `${value}n` : String(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
 }
 
 /** @internal */

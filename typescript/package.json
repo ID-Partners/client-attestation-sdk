@@ -1,6 +1,6 @@
 {
   "name": "@idpartners/client-attestation-sdk",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Client-side builder SDK for OAuth Attestation-Based Client Authentication",
   "type": "module",
   "main": "dist/index.js",

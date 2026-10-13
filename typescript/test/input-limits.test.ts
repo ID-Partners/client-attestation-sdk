@@ -281,7 +281,7 @@ describe("SpireWorkloadApiSvidSource timeout", () => {
 
   it.skipIf(process.platform === "win32")("kills at the timeout even if a helper holds stdout open", async () => {
     const bin = join(dir, "spire-agent");
-    writeFileSync(bin, "#!/bin/sh\nsleep 30 &\nexec sleep 30\n");
+    writeFileSync(bin, "#!/bin/sh\nsleep 4 &\nexec sleep 30\n");
     chmodSync(bin, 0o755);
     vi.resetModules();
     vi.doMock("../src/runtime.js", async (importOriginal) => {

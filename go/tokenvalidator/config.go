@@ -41,9 +41,16 @@ type IntrospectionConfig struct {
 	Endpoint     string
 	ClientID     string
 	ClientSecret string
-	// AuthMethod is "client_secret_basic" (default) or "client_secret_post".
+	// AuthMethod is "client_secret_basic" (the default, also chosen by "") or "client_secret_post". New
+	// refuses any other value, so a typo can't move the secret from the Authorization header into the form.
 	AuthMethod string
 }
+
+// The client authentication methods IntrospectionConfig.AuthMethod accepts.
+const (
+	authClientSecretBasic = "client_secret_basic"
+	authClientSecretPost  = "client_secret_post"
+)
 
 // Config describes what a resource server accepts: the trusted issuer, its own
 // audience identifier(s), the signing keys (static JWKS or a JWKSURI to fetch),
@@ -128,6 +135,21 @@ func (c *Config) check() error {
 	if c.Introspection != nil && c.Introspection.Endpoint != "" {
 		if err := c.checkSecure(c.Introspection.Endpoint, "introspection Endpoint"); err != nil {
 			return err
+		}
+	}
+	if c.Introspection != nil {
+		switch c.Introspection.AuthMethod {
+		case "", authClientSecretBasic, authClientSecretPost:
+		default:
+			// never echo the value: a secret passed in the wrong field would end up in the message
+			return fmt.Errorf("tokenvalidator: introspection AuthMethod must be %q or %q, got a string of %d characters",
+				authClientSecretBasic, authClientSecretPost, len([]rune(c.Introspection.AuthMethod)))
+		}
+		if c.Introspection.ClientID == "" {
+			return errors.New("tokenvalidator: introspection ClientID must not be empty")
+		}
+		if c.Introspection.ClientSecret == "" {
+			return errors.New("tokenvalidator: introspection ClientSecret must not be empty")
 		}
 	}
 	return nil

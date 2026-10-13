@@ -141,7 +141,8 @@ Without `evidence=`, the platform identity is auto-detected on each mint, in thi
 `CLIENT_ATTESTATION_SVID`, `CLIENT_ATTESTATION_TOKEN_FILE` (default `/var/run/secrets/tokens/attester-token`),
 `SPIFFE_ENDPOINT_SOCKET` (default `/tmp/spire-agent/public/api.sock`), the GCP metadata server, Azure IMDS
 (set `CLIENT_ATTESTATION_AZURE_RESOURCE` to the Entra resource the attester's evidence audience must
-equal), and AWS web identity (needs the `[aws]` extra). `CLIENT_ATTESTATION_TOKEN_FILE` or `SPIFFE_ENDPOINT_SOCKET`
+equal), and AWS web identity (needs the `[aws]` extra; EC2 instance profiles aren't detected, so pass
+`evidence=AwsWebIdentitySvidSource()` there). `CLIENT_ATTESTATION_TOKEN_FILE` or `SPIFFE_ENDPOINT_SOCKET`
 set to a path that does not exist raises `EvidenceNotFound` naming the variable, instead of falling through
 to the next evidence source. `EvidenceNotFound` is a `RuntimeError`, not a `ClientAttestationError`.
 

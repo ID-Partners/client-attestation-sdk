@@ -291,13 +291,11 @@ public final class AccessTokenValidator {
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("Content-Type", "application/x-www-form-urlencoded");
         headers.put("Accept", "application/json");
-        if (IntrospectionConfig.CLIENT_SECRET_BASIC.equals(cfg.authMethod())) {
-            String raw = cfg.clientId() + ":" + cfg.clientSecret();
-            headers.put("Authorization",
-                    "Basic " + Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8)));
-        } else {
+        if (IntrospectionConfig.CLIENT_SECRET_POST.equals(cfg.authMethod())) {
             form.put("client_id", cfg.clientId());
             form.put("client_secret", cfg.clientSecret());
+        } else { // client_secret_basic: IntrospectionConfig refuses anything but the two, or unset
+            headers.put("Authorization", basicAuthorization(cfg.clientId(), cfg.clientSecret()));
         }
         try {
             Map<String, Object> data = this.httpPost.post(cfg.endpoint(), formEncode(form), headers);
@@ -418,6 +416,38 @@ public final class AccessTokenValidator {
             }
         }
         return out;
+    }
+
+    /**
+     * The {@code client_secret_basic} Authorization header value (RFC 6749 section 2.3.1): the client id and the
+     * secret are each form-urlencoded (Appendix B), joined with {@code :} and base64'd. The encoding is the same
+     * bytes as Python's {@code urllib.parse.quote_plus(s, safe="")}: each UTF-8 byte of
+     * {@code A-Z a-z 0-9 - . _ ~} stays as it is, a space becomes {@code +}, and every other byte is {@code %XX}
+     * with uppercase hex (so {@code :} is {@code %3A}, {@code %} is {@code %25}, {@code +} is {@code %2B} and
+     * {@code *} is {@code %2A}). Not {@link URLEncoder}, which leaves {@code *} alone and encodes {@code ~}.
+     * validation/SEMANTICS.md, Introspection.
+     */
+    static String basicAuthorization(String clientId, String clientSecret) {
+        String raw = credentialEncode(clientId) + ":" + credentialEncode(clientSecret);
+        return "Basic " + Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
+
+    private static String credentialEncode(String value) {
+        StringBuilder out = new StringBuilder();
+        for (byte raw : String.valueOf(value).getBytes(StandardCharsets.UTF_8)) {
+            int b = raw & 0xff;
+            if (b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+                    || b == '-' || b == '.' || b == '_' || b == '~') {
+                out.append((char) b);
+            } else if (b == ' ') {
+                out.append('+');
+            } else {
+                out.append('%').append(HEX[b >> 4]).append(HEX[b & 0x0f]);
+            }
+        }
+        return out.toString();
     }
 
     private static String formEncode(Map<String, String> form) {

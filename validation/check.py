@@ -7,7 +7,11 @@ introspection cases run through ProtectedResource.authenticate_active, checked a
 error code; an introspection call that failed with the port's error reports error "raises"; a config row is
 "accepted", or error "refused"). Every port must return the expected verdict for every case, and must report
 every case: a missing or extra row fails the check. A case with an `expect_description` also needs that exact
-error description from every port."""
+error description from every port.
+
+client_auth_results are introspection.json's `client_auth` cases: {name, authorization, form}, the Authorization
+header the port sent (or null) and the decoded client_id / client_secret form fields (or null). Each must equal
+the case's `expect_authorization` and `expect_form` exactly."""
 import json
 import os
 import sys
@@ -74,6 +78,36 @@ for source, key, cases, passed in suites:
             failures += 1
         print("  %-*s %-22s %s%s" % (width, name, want, "".join("%-22s" % got[lang] for lang in order),
                                      "" if ok else "  <-- MISMATCH"))
+
+# the introspection request's client authentication, compared exactly
+with open(os.path.join(HERE, "introspection.json")) as fh:
+    client_auth = json.load(fh)["client_auth"]
+print(f"\nintrospection.json client_auth ({len(client_auth)} cases)")
+auth_names = [c["name"] for c in client_auth]
+auth_rows = {lang: {r["name"]: r for r in outputs[lang].get("client_auth_results") or []} for lang in order}
+for lang in order:
+    extra = sorted(set(auth_rows[lang]) - set(auth_names))
+    if extra:
+        failures += 1
+        print(f"  {lang} reported client_auth cases introspection.json doesn't have: {', '.join(extra)}  <-- MISMATCH")
+for c in client_auth:
+    total += 1
+    want = (c["expect_authorization"], c["expect_form"])
+    bad = []
+    for lang in order:
+        r = auth_rows[lang].get(c["name"])
+        if r is None:
+            got = "MISSING"
+        elif "authorization" not in r or "form" not in r:
+            got = f"row without authorization/form: {sorted(r)}"
+        else:
+            got = (r["authorization"], r["form"])
+        if got != want:
+            bad.append(f"{lang}: {got!r}")
+    if bad:
+        failures += 1
+    print(f"  {c['name']:<16} " + ("all ports send the expected header and form" if not bad else
+                                   f"expected {want!r}; " + "; ".join(bad) + "  <-- MISMATCH"))
 
 print(f"\nVALIDATION AGREEMENT OK — all {len(order)} ports match the expected verdicts on all {total} cases"
       if failures == 0 else f"\nVALIDATION FAILED — {failures} case(s) disagree")

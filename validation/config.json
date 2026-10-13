@@ -116,6 +116,94 @@
       }
     },
     {
+      "name": "introspection_auth_method_basic",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": "client_secret_basic"
+      }
+    },
+    {
+      "name": "introspection_auth_method_post",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": "client_secret_post"
+      }
+    },
+    {
+      "name": "introspection_auth_method_null",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": null
+      }
+    },
+    {
+      "name": "introspection_auth_method_empty",
+      "expect": "accepted",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": ""
+      }
+    },
+    {
+      "name": "introspection_auth_method_typo",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": "client_secret_basci"
+      }
+    },
+    {
+      "name": "introspection_auth_method_private_key_jwt",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": "private_key_jwt"
+      }
+    },
+    {
+      "name": "introspection_auth_method_upper_case",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_auth_method": "CLIENT_SECRET_BASIC"
+      }
+    },
+    {
+      "name": "introspection_client_id_empty",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_client_id": ""
+      }
+    },
+    {
+      "name": "introspection_client_id_null",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_client_id": null
+      }
+    },
+    {
+      "name": "introspection_client_secret_empty",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_client_secret": ""
+      }
+    },
+    {
+      "name": "introspection_client_secret_null",
+      "expect": "refused",
+      "config": {
+        "introspection_endpoint": "https://issuer.example.com/introspect",
+        "introspection_client_secret": null
+      }
+    },
+    {
       "name": "leeway_zero",
       "expect": "accepted",
       "config": {

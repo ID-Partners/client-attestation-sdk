@@ -67,7 +67,7 @@ class SpireCliVectorsTest {
         // Not in spire-cli.json: it shortens the 30 s timeout.
         assumeTrue(!System.getProperty("os.name").toLowerCase().contains("win"), "fake spire-agent is a shell script");
         Path bin = Files.writeString(this.dir.resolve("spire-agent"),
-                "#!/bin/sh\nsleep 60 &\nprintf 'token(spiffe://example.org/wl): x.y.z\\n'\nexec sleep 60\n");
+                "#!/bin/sh\nsleep 4 &\nprintf 'token(spiffe://example.org/wl): x.y.z\\n'\nexec sleep 60\n");
         Files.setPosixFilePermissions(bin, PosixFilePermissions.fromString("rwx------"));
         long started = System.nanoTime();
         IllegalStateException e = assertThrows(IllegalStateException.class,

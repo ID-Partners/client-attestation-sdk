@@ -122,3 +122,60 @@ describe("the validator keeps its own copy of its config", () => {
     expect(forged.error).toBe(errors.INVALID_SIGNATURE);
   });
 });
+
+describe("introspection authMethod", () => {
+  // F5: anything but the two methods used to be taken as client_secret_post, moving the secret into the form
+  const introspection = (authMethod: unknown) => ({
+    introspection: { endpoint: ISSUER + "/introspect", clientId: "rs", clientSecret: "s3cret", authMethod },
+  });
+
+  // unset (undefined, null or "", e.g. process.env.X with no variable) is the default, client_secret_basic
+  it.each([
+    [undefined, true],
+    [null, true],
+    ["", true],
+    ["client_secret_basic", true],
+    ["client_secret_post", false],
+  ])("accepts %s", async (method, basic) => {
+    let headers: Record<string, string> = {};
+    const validator = new AccessTokenValidator(
+      { issuer: ISSUER, audiences: [AUDIENCE], jwks: JWKS, ...introspection(method) } as ValidatorConfig,
+      {
+        httpPost: async (_url, _body, h) => {
+          headers = h;
+          return { active: true };
+        },
+      },
+    );
+    await validator.introspect("opaque");
+    expect("Authorization" in headers).toBe(basic);
+  });
+
+  it.each(["client_secret_basci", "private_key_jwt", "client_secret_jwt", "CLIENT_SECRET_BASIC", " client_secret_basic",
+    "none", " ", 0, false, 1, {}])("refuses %s", (method) => {
+    expect(() => build(introspection(method))).toThrow("authMethod");
+    expect(() => build(introspection(method))).not.toThrow("s3cret");
+  });
+});
+
+describe("introspection credentials", () => {
+  it.each([
+    ["clientId", { clientId: "", clientSecret: "s3cret" }],
+    ["clientId", { clientId: null, clientSecret: "s3cret" }],
+    ["clientId", { clientSecret: "s3cret" }],
+    ["clientSecret", { clientId: "rs", clientSecret: "" }],
+    ["clientSecret", { clientId: "rs", clientSecret: null }],
+    ["clientSecret", { clientId: "rs", clientSecret: 7 }],
+  ])("refuses a missing, empty or non-string %s", (field, creds) => {
+    const build_ = () => build({ introspection: { endpoint: ISSUER + "/introspect", ...creds } });
+    expect(build_).toThrow(field);
+    expect(build_).not.toThrow("s3cret");
+  });
+
+  it("describes a bad authMethod without echoing it", () => {
+    const build_ = () =>
+      build({ introspection: { endpoint: ISSUER + "/introspect", clientId: "rs", clientSecret: "s3cret", authMethod: "hunter2-secret" } });
+    expect(build_).toThrow("14 characters");
+    expect(build_).not.toThrow("hunter2");
+  });
+});

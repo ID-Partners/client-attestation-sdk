@@ -326,10 +326,39 @@ func TestSpireWorkloadAPISvidSource(t *testing.T) {
 		if got, err := (SpireWorkloadAPISvidSource{SpireAgentBin: bin}).Fetch("aud"); err != nil || got != spireTestSVID {
 			t.Fatalf("1 MiB of output: svid = %q, err = %v", got, err)
 		}
-		bin, _ = fakeSpireAgent(t, atCap+"x", 0)
-		_, err := SpireWorkloadAPISvidSource{SpireAgentBin: bin}.Fetch("aud")
+		// One byte more while the agent is still running fails the fetch.
+		over := filepath.Join(t.TempDir(), "spire-agent")
+		script := "#!/bin/sh\ncat '" + writeTemp(t, "over", atCap+"x") + "'\nexec sleep 5\n"
+		if err := os.WriteFile(over, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		_, err := SpireWorkloadAPISvidSource{SpireAgentBin: over}.Fetch("aud")
 		if err == nil || err.Error() != "spire-agent fetch failed: output is larger than 1048576 bytes" {
 			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("an agent that writes past the cap and exits always fails", func(t *testing.T) {
+		// The agent itself writes 1 MiB + 1 byte and exits at once, so the last bytes may be read either side
+		// of its exit. They were written while it ran, so the fetch fails every time, as in the other ports.
+		if runtime.GOOS == "windows" {
+			t.Skip("fake spire-agent is a POSIX shell script")
+		}
+		bin := filepath.Join(t.TempDir(), "spire-agent")
+		if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec head -c 1048577 /dev/zero\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		ok := 0
+		for i := 0; i < 50; i++ {
+			_, err := SpireWorkloadAPISvidSource{SpireAgentBin: bin}.Fetch("aud")
+			var nf *EvidenceNotFound
+			if errors.As(err, &nf) || err == nil { // read as post-exit output: cut at the cap
+				ok++
+			} else if err.Error() != "spire-agent fetch failed: output is larger than 1048576 bytes" {
+				t.Fatalf("err = %v", err)
+			}
+		}
+		if ok != 0 {
+			t.Fatalf("%d of 50 runs did not fail with the size error", ok)
 		}
 	})
 	t.Run("a flood of stderr is discarded", func(t *testing.T) {

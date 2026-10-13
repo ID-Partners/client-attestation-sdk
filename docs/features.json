@@ -46,7 +46,7 @@
         {"label": "Evidence auto-detect", "explainer_label": "Find available platform identity evidence automatically", "sub": "Environment token, token file, SPIRE socket, GCP metadata",
          "ports": ["go", "java", "python", "typescript"]},
         {"label": "Azure IMDS evidence", "explainer_label": "Use identity evidence from Microsoft Azure", "ports": ["python"]},
-        {"label": "AWS web-identity evidence", "explainer_label": "Use web-identity evidence from AWS", "sub": "Lambda, ECS, EC2, AgentCore", "ports": ["python"]},
+        {"label": "AWS web-identity evidence", "explainer_label": "Use web-identity evidence from AWS", "sub": "Lambda, ECS, EKS, AgentCore; EC2 when passed explicitly", "ports": ["python"]},
         {"label": "SPIFFE issuance bootstrap", "explainer_label": "Obtain a Client Attestation using SPIFFE platform identity", "ports": ["go", "java", "python", "typescript"]}
       ]
     },

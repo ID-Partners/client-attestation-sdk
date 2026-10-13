@@ -356,7 +356,7 @@ func TestIntrospectionClientSecretPost(t *testing.T) {
 func TestValidateActiveInsufficientScopeViaConfig(t *testing.T) {
 	val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience},
 		RequiredScopes: []string{"admin"},
-		Introspection:  &IntrospectionConfig{Endpoint: "https://as.test/introspect"},
+		Introspection:  &IntrospectionConfig{Endpoint: "https://as.test/introspect", ClientID: "rs", ClientSecret: "secret"},
 	}, WithHTTPPost(func(endpoint, body string, headers map[string]string) (map[string]any, error) {
 		return map[string]any{"active": true, "scope": "read"}, nil
 	}))
@@ -372,7 +372,7 @@ func TestValidateActiveInsufficientScopeViaConfig(t *testing.T) {
 func TestValidateActiveWrongAudience(t *testing.T) {
 	val, err := New(&Config{Issuer: testIssuer,
 		Audiences:     []string{"https://rs.test"},
-		Introspection: &IntrospectionConfig{Endpoint: "https://as.test/introspect"},
+		Introspection: &IntrospectionConfig{Endpoint: "https://as.test/introspect", ClientID: "rs", ClientSecret: "secret"},
 	}, WithHTTPPost(func(endpoint, body string, headers map[string]string) (map[string]any, error) {
 		return map[string]any{"active": true, "aud": "https://other.test"}, nil
 	}))
@@ -387,7 +387,7 @@ func TestValidateActiveWrongAudience(t *testing.T) {
 
 func TestDefaultHTTPPostErrors(t *testing.T) {
 	newVal := func(endpoint string) *AccessTokenValidator {
-		val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{Endpoint: endpoint},
+		val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience}, Introspection: &IntrospectionConfig{Endpoint: endpoint, ClientID: "rs", ClientSecret: "secret"},
 			AllowInsecure: true}) // so "://bad" reaches the transport
 		if err != nil {
 			t.Fatal(err)
@@ -550,5 +550,37 @@ func TestJWKDeclaredAlgBindsTheKey(t *testing.T) {
 	}
 	if r := val.Validate(signClaims(t, key, map[string]any{"exp": time.Now().Unix() + 300}), nil); r.Error != ErrKeyNotFound {
 		t.Errorf("got %s, want %s", r.Error, ErrKeyNotFound)
+	}
+}
+
+// F6: client_secret_basic form-urlencodes the client id and the secret before joining them (RFC 6749 section
+// 2.3.1). The same fixture and header are in every port's tests and in validation/introspection.json.
+func TestIntrospectBasicAuthFormEncodesCredentials(t *testing.T) {
+	var gotAuth, gotBody string
+	post := func(_ string, body string, headers map[string]string) (map[string]any, error) {
+		gotAuth, gotBody = headers["Authorization"], body
+		return map[string]any{"active": true}, nil
+	}
+	for _, method := range []string{"", "client_secret_basic"} {
+		val, err := New(&Config{Issuer: testIssuer, Audiences: []string{testAudience},
+			Introspection: &IntrospectionConfig{Endpoint: "https://issuer.example.com/introspect",
+				ClientID: "rs:1 a+b%c", ClientSecret: "s3cr*t~-._!'()/?#&=\u00e9\U0001F600", AuthMethod: method},
+		}, WithHTTPPost(post))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := val.Introspect("opaque"); err != nil {
+			t.Fatal(err)
+		}
+		want := "Basic cnMlM0ExK2ElMkJiJTI1YzpzM2NyJTJBdH4tLl8lMjElMjclMjglMjklMkYlM0YlMjMlMjYlM0QlQzMlQTklRjAlOUYlOTglODA="
+		if gotAuth != want {
+			t.Errorf("AuthMethod %q: Authorization = %q, want %q", method, gotAuth, want)
+		}
+		if strings.Contains(gotBody, "client_id") || strings.Contains(gotBody, "client_secret") {
+			t.Errorf("AuthMethod %q: body carries credentials: %q", method, gotBody)
+		}
+	}
+	if got := basicAuthorization("rs", "secret"); got != "Basic cnM6c2VjcmV0" {
+		t.Errorf("plain credentials: %q", got)
 	}
 }

@@ -83,6 +83,15 @@ Obtain its accepted fields from the attester administrator.
 `pop_method="attestation_pop_jwt"` sends `OAuth-Client-Attestation-PoP` to the token endpoint.
 `pop_method="dpop_combined"` sends a `DPoP` proof using the instance key.
 The corresponding option names are `popMethod`, `WithPopMethod` and `.popMethod`.
+Leaving it unset, `None`/`null`/`undefined` or `""`, means `attestation_pop_jwt`, so a value read from an
+unset environment variable keeps the default.
+In Go, `WithPopMethod("")` is ignored, like `WithAlgorithm("")`, so an earlier `WithPopMethod` still
+applies; leaving the option out gives the default.
+Any other value must be exactly one of the two names, which are case-sensitive.
+Anything else, a case variant, surrounding whitespace or a non-string included, is refused when the client
+is built, before any request: `ValueError` (Python), `RangeError` (TypeScript), an error from
+`NewClientAttestation` (Go) or `IllegalArgumentException` from `build()` (Java).
+The shared cases are in [`vectors/pop-method.json`](../../vectors/pop-method.json).
 The authorisation server must accept the selected method.
 
 `require_challenge` defaults to `True`.

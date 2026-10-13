@@ -5,6 +5,112 @@ and versions follow [semver](https://semver.org/) as described under "Status and
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-14
+
+A security and fix release. It is a minor release because one Stable type widened: TypeScript's
+`ClientAttestationOptions.popMethod` now also allows `""` and `null`, values the runtime already
+accepted. Upgrade from 1.1.0, or from 1.0.1 on npm.
+
+1.1.0 was published to PyPI, Maven Central and the Go module proxy but not to npm: the release workflow's
+`npm publish` read the tarball path as a GitHub repository. TypeScript users go from 1.0.1 to this release,
+and should read the 1.1.0 notes below too.
+
+Five changes refuse or send differently something earlier releases accepted - check these before you
+upgrade. They ship under the security exception in the README's versioning policy:
+
+- **PoP method**: use exactly `attestation_pop_jwt` or `dpop_combined` (case-sensitive); a misspelt value
+  now fails when the client is built. Unset or `""` still means `attestation_pop_jwt`.
+- **Java `send()` port**: a request URI whose port is empty (`https://h:/t`) or `0` now throws
+  `IllegalArgumentException`. Write the port out or leave it off.
+- **Introspection `auth_method`**: use exactly `client_secret_basic` or `client_secret_post` (or leave it
+  unset for `client_secret_basic`). Any other value, a typo included, is now a config error; it used to send
+  the secret as `client_secret_post`. Also: Python `auth_method=None` or `""`, and `""` in TypeScript and
+  Java, used to send `client_secret_post` and now send `client_secret_basic`. If your authorisation server
+  expects `client_secret_post`, set it explicitly.
+- **Basic credentials**: with `client_secret_basic` the client id and secret are form-urlencoded per
+  RFC 6749 section 2.3.1 before they are joined and base64-encoded. An authorisation server that compared
+  them raw needs credentials made only of unreserved characters (`A-Z a-z 0-9 - . _ ~`), or
+  `client_secret_post`.
+- **Introspection credentials**: the client id and secret must be non-empty strings. A missing, `null`,
+  empty or non-string value is now a config error naming the field. Before, TypeScript sent `rs:` for a
+  missing secret, Java `rs:null`, and Go and Python sent an empty one.
+
+### Changed
+
+- Java: `ClientAttestation.send()` throws `IllegalArgumentException` for a request URI whose port is empty
+  (`https://h:/t`) or `0`, before anything is sent. `HttpClient` sends such a URI to the scheme's default
+  port, so code that relied on that must write the port out or leave it off. See the `send()` entry under
+  Fixed.
+- All four ports (Stable behaviour change): the one-call client refuses a PoP method other than
+  `attestation_pop_jwt` or `dpop_combined` when it is built, before any request: `ValueError` (Python),
+  `RangeError` (TypeScript), an error from `NewClientAttestation` (Go) or `IllegalArgumentException` from
+  `build()` (Java). The names are case-sensitive, and a value with surrounding whitespace or a non-string
+  is refused too. Unset, `None`/`null`/`undefined` or `""`, still means `attestation_pop_jwt` in every port.
+  Before, any other value, such as `DPOP_COMBINED` or a typo of `dpop_combined`, quietly fell back to a PoP
+  JWT, so a caller who asked for DPoP-bound tokens got Bearer tokens without being told: a silent downgrade
+  of sender constraint, which the fail-closed defaults exist to prevent. A caller passing a misspelt value
+  now gets an error at build time; fix the spelling. In Go, `WithPopMethod("")` is ignored, like
+  `WithAlgorithm("")`, so an earlier `WithPopMethod` still applies. The token flow also fails before any
+  request, rather than sending a PoP JWT, if it ever holds a value that isn't one of the two. The cases are
+  shared in `vectors/pop-method.json`.
+- TypeScript (Stable, additive): `ClientAttestationOptions.popMethod` is typed
+  `"attestation_pop_jwt" | "dpop_combined" | "" | null`, so a typed caller can pass the unset values the
+  constructor already took without a cast.
+- All four ports (Stable behaviour change): the introspection client authentication follows RFC 6749
+  section 2.3.1, and a bad method is refused. Both changes are what the RFC requires or what the config
+  says, so a resource server's secret is never sent in a way it didn't ask for. `client_secret_basic` now
+  form-urlencodes the client id and the secret before joining them with `:` and base64-encoding them: every
+  byte except `A-Z a-z 0-9 - . _ ~` is `%XX` (uppercase hex, UTF-8) and a space is `+`, the same bytes in
+  every port and pinned by `client_auth` in `validation/introspection.json`. Before, they were joined raw,
+  so an authorisation server that decodes per the RFC failed a client id containing `:` or a secret
+  containing `%` or `+`. Credentials made only of those unreserved characters send the same header as
+  before. An authorisation server that did not decode, and so accepted the raw form, now fails credentials
+  with any other character: register credentials without them, or switch to `client_secret_post`. Also,
+  `auth_method` (`authMethod`, `AuthMethod`) other than exactly `client_secret_basic` or
+  `client_secret_post` is now refused with the port's config error, when the `IntrospectionConfig`
+  (Python, Java) or the validator (TypeScript, Go) is built. Any other value, a typo included, used to be
+  taken as `client_secret_post`, which moved the secret into the form body; a caller that relied on that
+  must name `client_secret_post`. Unset means `client_secret_basic` in every port, and unset is the same
+  everywhere: `null` / `None`, `""`, or (Python, TypeScript) leaving it out, so a method read from an
+  environment variable that isn't set takes the default. That changes what some unset values sent before:
+  Python `None` and `""`, and `""` in TypeScript and Java, sent `client_secret_post` and now send
+  `client_secret_basic` (TypeScript `null`/`undefined`, Java `null` and Go `""` already sent Basic). Set
+  `client_secret_post` explicitly if the authorisation server expects it (security model F5, F6).
+
+### Fixed
+
+- All four ports: a refused introspection `auth_method` is described by its type and length in the error,
+  never echoed, so a secret passed in the wrong argument doesn't end up in the message or a log.
+- Release: the npm publish step passes the tarball as `./npm-dist/…`, so npm reads it as a file.
+- All four ports: output a helper started by `spire-agent` writes after the agent has exited no longer fails
+  the SPIRE fetch. While the agent is running, more than 1 MiB of stdout still kills it and fails the fetch;
+  once it has exited, stdout is read for at most 250 ms more and at most 1 MiB in all, and the exit status
+  decides. In 1.1.0 a helper writing more than 1 MiB in that window failed the fetch in Go, Python and
+  TypeScript, while Java returned the token. When reading stops at the 1 MiB or the 250 ms, the last line may
+  be cut off, so a token is only taken from a line that ends in a newline. Java's reader no longer blocks in
+  a read after the agent exits (it reads what the pipe has available), and Python kills an over-limit agent
+  from the calling thread.
+- SPIRE CLI source: an agent that itself writes more than 1 MiB and exits at once now always fails the fetch
+  with `output is larger than 1048576 bytes`. What it wrote before exiting can still be in the pipe when its
+  exit is seen, and was read as post-exit output (cut at 1 MiB, the exit status deciding). That happened in
+  most runs in Java and in occasional runs in Python and Go. Now what was read so far plus what is waiting
+  in the pipe at the moment the exit is first seen counts as written while the agent ran (`available()` in
+  Java; FIONREAD in Python on POSIX and in Go on Linux, macOS and the BSDs). Only output that arrives after
+  that moment is post-exit output. TypeScript always failed and is unchanged. Each port has a 50-run test of
+  this. In `vectors/spire-cli.json`, helpers that hold stdout now outlive the case's time limit (4 s against
+  3 s), so a port that waited for the pipe to close instead of ending the 250 ms grace period fails the case.
+- Java: `ClientAttestation.send()` compared the port as written when checking a request's URI against
+  the URL the credentials are for (it does this for a URL the `htu` rule refuses, such as an IPv6 zone
+  literal). So `:08443` and `:8443`, or `:443` and no port on https, were different origins. Now the port is
+  compared as a number and dropped only when it is the scheme's own default: `:443` on https, `:80` on http.
+  A URI whose port is not a number from 1 to 65535 (empty, signed, `0`, too large, not digits) is on no
+  origin, and `send()` refuses it, even when the request names exactly the same URI. The address of an IPv6
+  literal is compared case-insensitively; its zone ID is compared as written.
+- Python: evidence auto-detection picks the Experimental `AwsWebIdentitySvidSource` when
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI` is set (EKS Pod Identity, among others), which fell through to
+  `EvidenceNotFound`. EC2 instance profiles are
+  still not detected, and the docstrings that said they were are corrected: pass the source explicitly there.
+
 ## [1.1.0] - 2026-10-12
 
 A security release, and a minor one because it adds Stable API. It closes the findings of the second

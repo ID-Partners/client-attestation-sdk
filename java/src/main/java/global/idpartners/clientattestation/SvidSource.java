@@ -21,6 +21,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -174,24 +175,36 @@ public interface SvidSource {
      * if you prefer no subprocess.
      *
      * <p>The subprocess is bounded: if {@code spire-agent} has not exited within the timeout (default 30s)
-     * it is killed and {@link IllegalStateException} is thrown. Its stdout is drained on a separate thread so
-     * a chatty or hung agent cannot block the wait, and at most 1 MiB of it is read: an agent that prints more
-     * is killed and {@link IllegalStateException} is thrown. Its stderr is discarded, never read as output or
-     * held in memory. {@code fetch} returns the first JWT-SVID on stdout and throws
+     * it is killed and {@link IllegalStateException} is thrown. Its stdout is read on a separate thread so a
+     * chatty or hung agent cannot block the wait. Its stderr is discarded, never read as output or held in
+     * memory. {@code fetch} returns the first JWT-SVID on stdout and throws
      * {@link Evidence.EvidenceNotFoundException} if there is none, or {@link IllegalStateException} if the
      * agent exits with a non-zero status.
      *
-     * <p>The agent's exit decides the outcome, as in the other ports: once it has exited, stdout is read for at
-     * most 250 ms more (a helper the agent started can inherit the pipe and hold it open), then the pipe is
-     * closed. On exit status 0, what was read is parsed; on any other status the fetch fails. A helper holding
-     * stdout never turns a success into a failure, and never keeps {@code fetch} waiting longer than that.
+     * <p>The agent's exit decides the outcome, as in the other ports. While the agent is running, more than
+     * 1 MiB of stdout kills it and {@link IllegalStateException} is thrown; that includes what it wrote just
+     * before exiting, which is still in the pipe when its exit is seen. Once it has exited, stdout is read
+     * for at most 250 ms more and at most 1 MiB in all (a helper the agent started can inherit the pipe and
+     * keep writing to it or hold it open), then the pipe is closed. On exit status 0 what was read is parsed;
+     * on any other status the fetch fails. So output a helper writes after the agent has exited never turns a
+     * success into a failure, and never keeps {@code fetch} waiting longer than that. If reading stopped at
+     * the 1 MiB or at the end of the 250 ms, the last line may be cut off, so a token is only taken from a
+     * line that ends in a newline.
+     *
+     * <p>In Java the reader never blocks on the pipe: it reads only what is available, so it cannot be left
+     * stuck in a read after the agent has exited. On Linux and macOS the JDK itself closes the pipe when the
+     * agent exits, keeping what was in it at that moment, so a helper's later output is not read at all, and
+     * once that has been read the output is complete.
       *
       * <p><b>Experimental</b> (see docs/api.md): it shells out to the spire-agent CLI, and its constructor
       * will change when it moves to the Workload API socket.
      */
     final class SpireWorkloadApi implements SvidSource {
         static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
-        /** The most stdout read from {@code spire-agent}; more fails the fetch (as in the other ports). */
+        /**
+         * The most stdout read from {@code spire-agent} (as in the other ports). More while the agent is running
+         * fails the fetch; once it has exited, reading stops there.
+         */
         static final int MAX_OUTPUT_BYTES = 1 << 20;
         /**
          * How long stdout is still read after {@code spire-agent} has exited (as in the other ports). A helper the
@@ -223,11 +236,10 @@ public interface SvidSource {
                     "-audience", audience, "-socketPath", this.socketPath)
                     .redirectError(ProcessBuilder.Redirect.DISCARD).start();
             p.getOutputStream().close();
-            StdoutReader stdout = new StdoutReader(p);
+            StdoutReader stdout = new StdoutReader(p.getInputStream(), p::isAlive, p::destroyForcibly);
             Thread drain = new Thread(stdout, "spire-agent-output");
             drain.setDaemon(true);
             drain.start();
-            byte[] raw;
             try {
                 if (!p.waitFor(this.timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                     p.destroyForcibly();
@@ -244,20 +256,20 @@ public interface SvidSource {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted waiting for spire-agent", e);
             }
-            raw = stdout.stop();
-            if (raw == null) {
+            StdoutReader.Output output = stdout.stop();
+            if (output.over()) {
                 throw new IllegalStateException(
                         "spire-agent fetch failed: output is larger than " + MAX_OUTPUT_BYTES + " bytes");
+            }
+            if (p.exitValue() != 0) {
+                throw new IllegalStateException("spire-agent fetch failed: exit status " + p.exitValue());
             }
             IOException readError = stdout.error();
             if (readError != null) {
                 throw new IllegalStateException("could not read spire-agent output: " + readError, readError);
             }
-            if (p.exitValue() != 0) {
-                throw new IllegalStateException("spire-agent fetch failed: exit status " + p.exitValue());
-            }
-            String out = new String(raw, StandardCharsets.UTF_8);
-            String svid = parseJwtOutput(out);
+            String out = new String(output.bytes(), StandardCharsets.UTF_8);
+            String svid = parseJwtOutput(completeLines(out, output.complete()));
             if (svid != null) {
                 return svid;
             }
@@ -268,30 +280,82 @@ public interface SvidSource {
         }
 
         /**
-         * Reads the agent's stdout on its own thread, keeping at most {@link #MAX_OUTPUT_BYTES}: past that it kills
-         * the agent and keeps nothing. {@link #stop} hands back what has been read and closes the pipe.
+         * {@code out}, or, if reading stopped before the end of the output (at the cap or the end of the grace
+         * period), {@code out} up to its last newline: the line after that may have been cut off.
          */
-        private static final class StdoutReader implements Runnable {
-            private final Process process;
+        static String completeLines(String out, boolean complete) {
+            return complete ? out : out.substring(0, out.lastIndexOf('\n') + 1);
+        }
+
+        /**
+         * Reads the agent's stdout on its own thread, keeping at most {@link #MAX_OUTPUT_BYTES}. It never blocks
+         * in a read: it reads only what {@link InputStream#available()} reports and otherwise sleeps briefly,
+         * so it always notices {@link #stop} (closing a pipe does not wake a read blocked on it on every
+         * platform) and never holds the stream's lock while the JDK takes what is left in the pipe as the agent
+         * exits. Once the agent has exited and nothing more is available, everything it wrote has been read and
+         * the output is complete. Output counts as the running agent's if it was read before the reader first
+         * saw the agent's exit, or was available at that moment (the agent wrote it before exiting, though it
+         * may be read after); past the cap, that kills the agent and nothing is kept. Only output that arrives
+         * after that moment is post-exit output: reading stops at the cap, keeping exactly the first
+         * {@link #MAX_OUTPUT_BYTES}, and the exit status decides.
+         * {@link #stop} hands back what has been read and closes the pipe.
+         */
+        static final class StdoutReader implements Runnable {
+            /** How long the reader sleeps when nothing is available. */
+            private static final long POLL_MILLIS = 5;
+
+            /** What was read; {@code over} if the cap was passed while the agent was running. */
+            record Output(byte[] bytes, boolean over, boolean complete) {
+            }
+
             private final InputStream in;
+            private final BooleanSupplier alive;
+            private final Runnable kill;
             private final ByteArrayOutputStream kept = new ByteArrayOutputStream();
             private boolean over;
+            private boolean complete;
             private boolean stopped;
             private IOException error;
 
-            StdoutReader(Process process) {
-                this.process = process;
-                this.in = process.getInputStream();
+            StdoutReader(InputStream in, BooleanSupplier alive, Runnable kill) {
+                this.in = in;
+                this.alive = alive;
+                this.kill = kill;
             }
 
             @Override
             public void run() {
                 byte[] chunk = new byte[65536];
-                try (InputStream stream = this.in) {
-                    int n;
-                    while ((n = stream.read(chunk)) >= 0) {
-                        if (!keep(chunk, n)) {
+                boolean exitSeen = false;
+                try {
+                    while (!isStopped()) {
+                        // Whether the agent had exited is read before what is available: if it had, everything
+                        // it wrote is already in the pipe, so nothing available then means nothing more to read.
+                        boolean exited = !this.alive.getAsBoolean();
+                        int available = this.in.available();
+                        if (exited && !exitSeen) {
+                            // The first time the exit is seen, what is available then was written before it:
+                            // with what was read already, past the cap is the running agent's overflow, read
+                            // either side of its exit. Only what arrives after this is post-exit output.
+                            exitSeen = true;
+                            if (!keepAtExit(available)) {
+                                return;
+                            }
+                        }
+                        if (available > 0) {
+                            int n = this.in.read(chunk, 0, Math.min(available, chunk.length));
+                            if (n < 0) {
+                                finished();
+                                return;
+                            }
+                            if (!keep(chunk, n, !exitSeen)) {
+                                return;
+                            }
+                        } else if (exited) {
+                            finished();
                             return;
+                        } else {
+                            Thread.sleep(POLL_MILLIS);
                         }
                     }
                 } catch (IOException e) {
@@ -300,33 +364,67 @@ public interface SvidSource {
                             this.error = e;
                         }
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
             }
 
-            /** Adds a chunk; false once reading should stop. */
-            private synchronized boolean keep(byte[] chunk, int n) {
-                if (this.stopped || this.over) {
+            private synchronized boolean isStopped() {
+                return this.stopped;
+            }
+
+            private synchronized void finished() {
+                this.complete = !this.stopped;
+            }
+
+            /**
+             * At the first sight of the agent's exit, with {@code available} bytes readable then: false (and
+             * {@code over}) if those and what was read already pass the cap.
+             */
+            private synchronized boolean keepAtExit(int available) {
+                if (this.stopped) {
                     return false;
                 }
-                if (this.kept.size() + n > MAX_OUTPUT_BYTES) {
-                    this.over = true;
-                    this.kept.reset();
-                    this.process.destroyForcibly();   // too much output: stop the agent rather than read on
+                if ((long) this.kept.size() + available > MAX_OUTPUT_BYTES) {
+                    overflow();
+                    return false;
+                }
+                return true;
+            }
+
+            /**
+             * Adds a chunk, read while the agent was {@code running} (before its exit was first seen) or after;
+             * false once reading should stop.
+             */
+            private synchronized boolean keep(byte[] chunk, int n, boolean running) {
+                if (this.stopped) {
+                    return false;
+                }
+                int room = MAX_OUTPUT_BYTES - this.kept.size();
+                if (n > room) {
+                    if (running) {
+                        overflow();   // too much output while running: stop the agent rather than read on
+                    } else {
+                        this.kept.write(chunk, 0, room);   // output after the agent's exit: stop at the cap
+                    }
                     return false;
                 }
                 this.kept.write(chunk, 0, n);
                 return true;
             }
 
-            /**
-             * Stops reading and closes the pipe (a helper may hold it open), returning what was read, or null if
-             * the output went past the cap.
-             */
-            byte[] stop() {
-                byte[] result;
+            private void overflow() {
+                this.over = true;
+                this.kept.reset();
+                this.kill.run();
+            }
+
+            /** Stops reading and closes the pipe (a helper may hold it open), returning what was read. */
+            Output stop() {
+                Output result;
                 synchronized (this) {
                     this.stopped = true;
-                    result = this.over ? null : this.kept.toByteArray();
+                    result = new Output(this.over ? new byte[0] : this.kept.toByteArray(), this.over, this.complete);
                 }
                 try {
                     this.in.close();

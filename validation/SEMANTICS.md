@@ -248,6 +248,18 @@ never discovered later as a token that slipped through:
   Python `allow_insecure=True`, TypeScript `allowInsecure: true`, Go `Config.AllowInsecure`, Java
   `Builder.allowInsecure(true)`. Python, like its client, exempts only `http://` on a loopback host; the
   other ports, like theirs, exempt a loopback host whatever the scheme.
+- **Introspection client authentication** is exactly `client_secret_basic` or `client_secret_post`
+  (case-sensitive). Any other value, such as `client_secret_basci` or `private_key_jwt`, is refused: it used
+  to be taken as `client_secret_post`, so a typo moved the secret from the `Authorization` header into the
+  form body. Unset means `client_secret_basic`, and unset is the same in every port: `null` (Python
+  `None`, TypeScript `undefined` or `null`, Java `null`), `""` (all four; Go has only this), or leaving it
+  out. So a method read from an environment variable that isn't set takes the default. (Before this rule,
+  Python `None` / `""` and TypeScript / Java `""` sent `client_secret_post`.) A refused method is described
+  in the error by its type and length, never echoed. The client id and secret must be non-empty strings:
+  missing, `null`, `""` or a non-string is refused, naming the field and never the value (Go has no
+  `null`, and its `""` is refused the same way). Python and Java
+  refuse a bad value in the `IntrospectionConfig` constructor (Python checks again when the validator is
+  built, for an object changed after construction); TypeScript and Go refuse it when the validator is built.
 
 [`config.json`](config.json) pins these: each case is a configuration on top of the shared one and whether
 building a validator from it is `accepted` or `refused`.
@@ -313,6 +325,30 @@ When the call succeeds, the response is checked in this order:
 Introspection does not check `exp`, `nbf`, `iat`, `iss` or the token type: that is the authorisation server's
 job, and `active: true` is its answer.
 
+### Client authentication
+
+The request authenticates the resource server to the authorisation server with its client id and secret:
+
+- `client_secret_basic` (the default) sends `Authorization: Basic <base64(id ":" secret)>` and no
+  credentials in the form. As RFC 6749 section 2.3.1 requires, the id and the secret are each
+  form-urlencoded (Appendix B) first, then joined with `:` and base64'd (standard alphabet, padded). The
+  encoding is byte for byte what Python's `urllib.parse.quote_plus(s, safe="")` produces: the string's UTF-8
+  bytes, with `A-Z`, `a-z`, `0-9`, `-`, `.`, `_` and `~` kept as they are, a space as `+`, and every other
+  byte as `%XX` in uppercase hex. So `:` is `%3A`, `%` is `%25`, `+` is `%2B`, `*` is `%2A` and `é` is
+  `%C3%A9`. Go uses `url.QueryEscape`, which produces the same bytes. Java and TypeScript have their own
+  encoder, because `URLEncoder` keeps `*` and encodes `~`, and `encodeURIComponent` keeps `! ' ( ) *` and
+  encodes a space as `%20`.
+- `client_secret_post` sends no `Authorization` header and puts `client_id` and `client_secret` in the form
+  body, with the rest of the form.
+
+Before this rule the id and secret were joined unencoded, so an authorisation server that decodes as the RFC
+says failed a client id containing `:`, or a secret containing `%` or `+`. Credentials made only of
+`A-Z a-z 0-9 - . _ ~` give the same header as before.
+
+`client_auth` in [`introspection.json`](introspection.json) pins the exact header and the decoded form
+fields for a client id and secret that contain `:`, `%`, `+`, a space, `*`, `~`, `! ' ( )`, `/ ? # & =` and
+non-ASCII characters (one outside the BMP), for each method and for the default.
+
 ### The introspection guard
 
 `ProtectedResource.authenticate_active` / `authenticateActive` / `AuthenticateActive` guards a request with
@@ -339,6 +375,10 @@ A failed introspection call fails the guard the same way it fails `validate_acti
   into U+FFFD before names are compared; the others compare the raw UTF-16 code units. So two names that
   differ only in unpaired surrogates are duplicates (and refused) in Go but distinct in the other ports.
   Only an issuer can put such names in a signed token.
+- **Unpaired surrogates in introspection credentials.** A client id or secret that isn't valid Unicode has
+  no UTF-8 form. Python refuses it when introspecting (a `UnicodeEncodeError`, which is a `ValueError`), Java
+  sends `?` for each unpaired surrogate, TypeScript sends U+FFFD, and Go, whose strings are bytes, encodes
+  the bytes it was given. A real client id or secret is never like this.
 - **Claims representation.** The verdict is identical; the in-memory claims map is each language's natural
   JSON type (`float64` in Go, `number` in TypeScript, `int`/`float` in Python, `Long`/`BigInteger`/`Double`
   in Java).

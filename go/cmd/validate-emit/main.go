@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -51,16 +52,57 @@ type introspectionVectors struct {
 		TransportError bool           `json:"transport_error"`
 		NoEndpoint     bool           `json:"no_endpoint"`
 	} `json:"cases"`
+	ClientAuth []struct {
+		Name         string `json:"name"`
+		ClientID     string `json:"client_id"`
+		ClientSecret string `json:"client_secret"`
+		AuthMethod   string `json:"auth_method"`
+	} `json:"client_auth"`
+}
+
+// clientAuthRow is the Authorization header and decoded form credentials an introspection request carried.
+type clientAuthRow struct {
+	Name          string              `json:"name"`
+	Authorization *string             `json:"authorization"`
+	Form          *map[string]*string `json:"form"`
+}
+
+// credential is a config case's client id or secret: absent gives def, and JSON null gives "", since Go has
+// no null string (both are refused, as null is in the other ports).
+func credential(raw json.RawMessage, def string) string {
+	if raw == nil {
+		return def
+	}
+	var s *string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		panic(err)
+	}
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// formField is a decoded form field, or nil when the request didn't send it (as the other ports emit null).
+func formField(form url.Values, key string) *string {
+	if !form.Has(key) {
+		return nil
+	}
+	v := form.Get(key)
+	return &v
 }
 
 type configVectors struct {
 	Cases []struct {
 		Name   string `json:"name"`
 		Config struct {
-			JWKSURI               *string `json:"jwks_uri"`
-			IntrospectionEndpoint *string `json:"introspection_endpoint"`
-			AllowInsecure         bool    `json:"allow_insecure"`
-			LeewaySeconds         *int    `json:"leeway_seconds"`
+			JWKSURI               *string         `json:"jwks_uri"`
+			IntrospectionEndpoint *string         `json:"introspection_endpoint"`
+			IntrospectionAuth     string          `json:"introspection_auth_method"`
+			IntrospectionClientID json.RawMessage `json:"introspection_client_id"`
+			IntrospectionSecret   json.RawMessage `json:"introspection_client_secret"`
+			AllowInsecure         bool            `json:"allow_insecure"`
+			LeewaySeconds         *int            `json:"leeway_seconds"`
 		} `json:"config"`
 	} `json:"cases"`
 }
@@ -236,6 +278,40 @@ func main() {
 		guard = append(guard, row(c.Name, decision.Result))
 	}
 
+	clientAuth := make([]clientAuthRow, 0, len(iv.ClientAuth))
+	for _, c := range iv.ClientAuth {
+		cfg := configFor(&v, nil)
+		cfg.Introspection = &tv.IntrospectionConfig{
+			Endpoint: "https://issuer.example.com/introspect", ClientID: c.ClientID, ClientSecret: c.ClientSecret,
+			AuthMethod: c.AuthMethod,
+		}
+		var sentBody string
+		var sentHeaders map[string]string
+		post := func(_ string, body string, headers map[string]string) (map[string]any, error) {
+			sentBody, sentHeaders = body, headers
+			return map[string]any{"active": true}, nil
+		}
+		validator, err := tv.New(cfg, tv.WithHTTPPost(post))
+		if err != nil {
+			panic(err)
+		}
+		if _, err := validator.Introspect("opaque-token"); err != nil {
+			panic(err)
+		}
+		row := clientAuthRow{Name: c.Name}
+		if auth, ok := sentHeaders["Authorization"]; ok {
+			row.Authorization = &auth
+		}
+		form, err := url.ParseQuery(sentBody)
+		if err != nil {
+			panic(err)
+		}
+		if form.Has("client_id") || form.Has("client_secret") {
+			row.Form = &map[string]*string{"client_id": formField(form, "client_id"), "client_secret": formField(form, "client_secret")}
+		}
+		clientAuth = append(clientAuth, row)
+	}
+
 	var cv configVectors
 	load(valDir, "config.json", &cv)
 	configResults := make([]outcome, 0, len(cv.Cases))
@@ -246,7 +322,10 @@ func main() {
 		}
 		if c.Config.IntrospectionEndpoint != nil {
 			cfg.Introspection = &tv.IntrospectionConfig{
-				Endpoint: *c.Config.IntrospectionEndpoint, ClientID: "rs", ClientSecret: "secret",
+				Endpoint:     *c.Config.IntrospectionEndpoint,
+				ClientID:     credential(c.Config.IntrospectionClientID, "rs"),
+				ClientSecret: credential(c.Config.IntrospectionSecret, "secret"),
+				AuthMethod:   c.Config.IntrospectionAuth,
 			}
 		}
 		cfg.AllowInsecure = c.Config.AllowInsecure
@@ -264,8 +343,9 @@ func main() {
 	}
 	data, err := json.MarshalIndent(map[string]any{
 		"language": "go", "results": results, "introspection_results": introspection,
-		"guard_results":  guard,
-		"config_results": configResults,
+		"guard_results":       guard,
+		"client_auth_results": clientAuth,
+		"config_results":      configResults,
 	}, "", "  ")
 	if err != nil {
 		panic(err)

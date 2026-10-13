@@ -8,6 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -285,10 +288,140 @@ class SvidSourceTest {
         String line = "token(spiffe://example.org/wl): " + SVID + "\n";
         String atCap = line + "x".repeat((1 << 20) - line.length());
         assertEquals(SVID, new SvidSource.SpireWorkloadApi("/s", agent("atcap", atCap, "", 0)).fetch("aud"));
-        String over = agent("over", atCap + "x", "", 0);
+        // One byte more while the agent is still running fails the fetch.
+        Path overOut = Files.writeString(this.dir.resolve("over.out"), atCap + "x");
+        String over = script("over", "cat '" + overOut + "'\nexec sleep 5");
         IllegalStateException e = assertThrows(IllegalStateException.class,
                 () -> new SvidSource.SpireWorkloadApi("/s", over).fetch("aud"));
         assertEquals("spire-agent fetch failed: output is larger than 1048576 bytes", e.getMessage());
+    }
+
+    @Test
+    void anAgentThatWritesPastTheCapAndExitsAlwaysFails() throws Exception {
+        // The agent itself writes 1 MiB + 1 byte and exits at once, so the last bytes may be read either side
+        // of its exit. They were written while it ran, so the fetch fails every time, as in the other ports.
+        String bin = script("overexit", "exec head -c 1048577 /dev/zero");
+        int ok = 0;
+        for (int i = 0; i < 50; i++) {
+            try {
+                new SvidSource.SpireWorkloadApi("/s", bin).fetch("aud");
+                ok++;
+            } catch (IllegalStateException e) {
+                assertEquals("spire-agent fetch failed: output is larger than 1048576 bytes", e.getMessage());
+            } catch (Evidence.EvidenceNotFoundException e) {
+                ok++;   // read as post-exit output: cut at the cap, no token in it
+            }
+        }
+        assertEquals(0, ok, ok + " of 50 runs did not fail with the size error");
+    }
+
+    @Test
+    void spireLastLineWithoutANewlineCountsWhenTheOutputEnds() throws Exception {
+        String bin = script("unterminated", "printf 'token(spiffe://example.org/wl): %s' '" + SVID + "'");
+        assertEquals(SVID, new SvidSource.SpireWorkloadApi("/s", bin).fetch("aud"));
+    }
+
+    // The reader on its own, fed from memory: whether the agent has exited when output passes the cap is not
+    // something a script can arrange in Java (the JDK closes the pipe as the agent exits), so these cases
+    // are not in vectors/spire-cli.json for Java; the other ports run them against a real helper process.
+
+    /** 1 MiB of output that ends part-way through a token line, then 2 MB more. */
+    private static byte[] tokenCutAtTheCap() {
+        String head = "token(spiffe://example.org/wl): ";
+        String cut = SVID.substring(0, SVID.lastIndexOf('.') + 11);   // the signature's first 10 characters
+        String filler = "x".repeat((1 << 20) - 1 - head.length() - cut.length());
+        return (filler + "\n" + head + SVID + "\n" + "x".repeat(2_000_000)).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * {@code data} as a pipe gives it: at most 64 KiB available at a time, so when the reader first sees the
+     * agent's exit only that much is in the pipe, and the rest arrives after it (as a helper's output).
+     */
+    private static InputStream pipeLike(byte[] data) {
+        return new ByteArrayInputStream(data) {
+            @Override
+            public synchronized int available() {
+                return Math.min(super.available(), 65536);
+            }
+        };
+    }
+
+    @Test
+    void spireOutputPastTheCapAfterTheAgentExitedIsCutThereAndACutLineIsNotATokenSource() {
+        boolean[] killed = {false};
+        var reader = new SvidSource.SpireWorkloadApi.StdoutReader(
+                pipeLike(tokenCutAtTheCap()), () -> false, () -> killed[0] = true);
+        reader.run();
+        var output = reader.stop();
+        assertFalse(output.over());
+        assertFalse(output.complete());
+        assertFalse(killed[0]);
+        assertEquals(1 << 20, output.bytes().length);
+        String out = new String(output.bytes(), StandardCharsets.UTF_8);
+        assertTrue(out.endsWith(SVID.substring(0, SVID.lastIndexOf('.') + 11)));
+        // The cut token still looks like a compact JWS; only the guard keeps it out.
+        assertEquals(SVID.substring(0, SVID.lastIndexOf('.') + 11), SvidSource.SpireWorkloadApi.parseJwtOutput(out));
+        assertEquals(null, SvidSource.SpireWorkloadApi.parseJwtOutput(
+                SvidSource.SpireWorkloadApi.completeLines(out, output.complete())));
+    }
+
+    @Test
+    void spireOutputPastTheCapWhileTheAgentRunsKillsIt() {
+        boolean[] killed = {false};
+        var reader = new SvidSource.SpireWorkloadApi.StdoutReader(
+                new ByteArrayInputStream(tokenCutAtTheCap()), () -> true, () -> killed[0] = true);
+        reader.run();
+        var output = reader.stop();
+        assertTrue(output.over());
+        assertTrue(killed[0]);
+        assertEquals(0, output.bytes().length);
+    }
+
+    @Test
+    void spireOutputAvailableWhenTheExitIsFirstSeenIsTheAgentsAndPastTheCapKillsIt() {
+        // Everything readable at the first sight of the exit was written before it: at the cap, all of it is
+        // kept; one byte more is the agent's overflow, even though the agent has exited.
+        for (int extra : new int[] {0, 1}) {
+            boolean[] killed = {false};
+            byte[] data = new byte[(1 << 20) + extra];
+            var reader = new SvidSource.SpireWorkloadApi.StdoutReader(
+                    new ByteArrayInputStream(data), () -> false, () -> killed[0] = true);
+            reader.run();
+            var output = reader.stop();
+            assertEquals(extra == 1, output.over());
+            assertEquals(extra == 1, killed[0]);
+            assertEquals(extra == 1 ? 0 : 1 << 20, output.bytes().length);
+            assertEquals(extra == 0, output.complete());
+        }
+        // Read partly while running and the rest available at the exit: the same.
+        boolean[] alive = {true};
+        boolean[] killed = {false};
+        byte[] data = new byte[(1 << 20) + 1];
+        var reader = new SvidSource.SpireWorkloadApi.StdoutReader(new ByteArrayInputStream(data) {
+            @Override
+            public synchronized int read(byte[] b, int off, int len) {
+                int n = super.read(b, off, Math.min(len, 1000));
+                alive[0] = false;   // the agent exits after the first chunk is read
+                return n;
+            }
+        }, () -> alive[0], () -> killed[0] = true);
+        reader.run();
+        assertTrue(reader.stop().over());
+        assertTrue(killed[0]);
+    }
+
+    @Test
+    void spireOutputReadToItsEndKeepsALastLineWithoutANewline() {
+        byte[] data = ("token(spiffe://example.org/wl): " + SVID).getBytes(StandardCharsets.UTF_8);
+        var reader = new SvidSource.SpireWorkloadApi.StdoutReader(new ByteArrayInputStream(data), () -> false, () -> { });
+        reader.run();
+        var output = reader.stop();
+        assertTrue(output.complete());
+        String out = new String(output.bytes(), StandardCharsets.UTF_8);
+        assertEquals(SVID, SvidSource.SpireWorkloadApi.parseJwtOutput(
+                SvidSource.SpireWorkloadApi.completeLines(out, output.complete())));
+        assertEquals("a\nb\n", SvidSource.SpireWorkloadApi.completeLines("a\nb\nc", false));
+        assertEquals("", SvidSource.SpireWorkloadApi.completeLines("abc", false));
     }
 
     @Test

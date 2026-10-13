@@ -8,7 +8,8 @@ comes from, depends on the runtime:
 - a SPIRE Workload API socket (SPIRE / SPIFFE),
 - the GCP metadata server (GCE, GKE, Cloud Run, Vertex AI Agent Engine),
 - Azure Instance Metadata Service (Container Apps, VMs, Functions — managed identity),
-- AWS `sts:GetWebIdentityToken` (Lambda/ECS/EC2/Bedrock AgentCore).
+- AWS `sts:GetWebIdentityToken` (Lambda/ECS/EKS/Bedrock AgentCore). EC2 instance profiles are not
+  auto-detected: pass `AwsWebIdentitySvidSource()` explicitly there.
 
 `auto_detect_evidence()` tries these in order and returns the first that applies, so a developer can
 write `ClientAttestation(attester_url, evidence_audience=...)` and have it work without naming the source. Override by passing an
@@ -149,8 +150,17 @@ class AwsWebIdentitySvidSource:
     the caller's role to have `sts:GetWebIdentityToken` (and the account to have run
     `aws iam enable-outbound-web-identity-federation`).
 
-    On EKS, prefer the projected-token path (`FileTokenSvidSource`) instead; this source is for
-    Lambda/ECS/EC2/AgentCore workloads whose identity is an IAM role rather than a Kubernetes SA.
+    This source is for workloads whose identity is an IAM role: Lambda, ECS, EKS (IRSA or Pod Identity),
+    AgentCore, and EC2 when passed explicitly. On EKS, a projected service-account token
+    (`FileTokenSvidSource`) is the alternative when the attester trusts the cluster's issuer; auto-detection
+    tries the token file before this source.
+
+    Auto-detection picks this source only when AWS credentials are visible in the environment
+    (`AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, or a static
+    key pair). EC2 instance profiles are not auto-detected, since that would mean probing IMDS on every
+    host: on EC2, pass `AwsWebIdentitySvidSource()` explicitly and boto3's default credential chain finds
+    the instance-profile credentials. `region` goes to `boto3.client("sts", region_name=region)`; with
+    `None`, boto3 resolves the region itself. Without boto3, `fetch` raises `EvidenceNotFound`.
 
     **Experimental** (see docs/api.md): Python only, and not yet run against a real attester.
     """
@@ -169,8 +179,13 @@ class AwsWebIdentitySvidSource:
 
 
 def _aws_credentials_available() -> bool:
-    if os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE") or os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"):
-        return True
+    """Whether AWS credentials are visible in the environment: an IRSA token file, an ECS, EKS Pod Identity (or other)
+    container-credentials endpoint (relative or full URI), or a static key pair. EC2 instance profiles are
+    deliberately not detected (it would take an IMDS probe on every host)."""
+    for var in ("AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI"):
+        if os.environ.get(var):
+            return True
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         return True
     return False
@@ -209,7 +224,8 @@ def auto_detect_evidence() -> SvidSource:
     """Return the first evidence source that applies to this runtime, or raise with guidance.
 
     Order: explicit env token, projected token file (GKE/EKS/AKS), SPIRE socket, GCP metadata server,
-    Azure IMDS, AWS web-identity (Lambda/ECS/EC2/AgentCore).
+    Azure IMDS, AWS web-identity (when AWS credentials are visible in the environment: Lambda, ECS, EKS Pod
+    Identity, AgentCore). EC2 instance profiles are not detected; pass ``AwsWebIdentitySvidSource()``.
 
     If ``CLIENT_ATTESTATION_TOKEN_FILE`` or ``SPIFFE_ENDPOINT_SOCKET`` is set but points at a path that does
     not exist, this raises :class:`EvidenceNotFound` naming the variable instead of trying the next source.
@@ -245,7 +261,8 @@ def auto_detect_evidence() -> SvidSource:
                                    resource=os.environ.get(ENV_AZURE_RESOURCE))
 
     # AWS is last: it needs an outbound STS call, so only reach for it when AWS credentials are visible in
-    # the environment (Lambda/ECS/EC2/AgentCore). On EKS, prefer a projected token file (handled above).
+    # the environment (Lambda/ECS/EKS Pod Identity/AgentCore). EC2 instance profiles are not detected: that
+    # would need an IMDS probe on every host. On EKS, prefer a projected token file (handled above).
     if _aws_credentials_available():
         return AwsWebIdentitySvidSource(region=os.environ.get("AWS_REGION"))
 

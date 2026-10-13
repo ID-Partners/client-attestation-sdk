@@ -1,0 +1,31 @@
+{
+  "_comment": "Shared vectors for the one-call client's PoP method setting (`pop_method`, `popMethod`, `WithPopMethod`, `.popMethod`). Each case gives the value passed and what every port must do: `attestation_pop_jwt` or `dpop_combined` is the method the client then uses, shown by the header it sends at the token endpoint; `refused` means building the client fails before any request. null and \"\" mean the default. vectors/README.md states the rule.",
+  "cases": [
+    {"name": "attestation_pop_jwt", "pop_method": "attestation_pop_jwt", "expect": "attestation_pop_jwt"},
+    {"name": "dpop_combined", "pop_method": "dpop_combined", "expect": "dpop_combined"},
+    {"name": "null_is_the_default", "pop_method": null, "expect": "attestation_pop_jwt"},
+    {"name": "empty_is_the_default", "pop_method": "", "expect": "attestation_pop_jwt"},
+    {"name": "upper_case", "pop_method": "DPOP_COMBINED", "expect": "refused"},
+    {"name": "upper_case_default", "pop_method": "ATTESTATION_POP_JWT", "expect": "refused"},
+    {"name": "mixed_case", "pop_method": "Dpop_Combined", "expect": "refused"},
+    {"name": "hyphen", "pop_method": "dpop-combined", "expect": "refused"},
+    {"name": "typo", "pop_method": "dpop_combind", "expect": "refused"},
+    {"name": "prefix_only", "pop_method": "dpop", "expect": "refused"},
+    {"name": "default_prefix_only", "pop_method": "attestation_pop", "expect": "refused"},
+    {"name": "leading_space", "pop_method": " dpop_combined", "expect": "refused"},
+    {"name": "trailing_space", "pop_method": "dpop_combined ", "expect": "refused"},
+    {"name": "trailing_newline", "pop_method": "dpop_combined\n", "expect": "refused"},
+    {"name": "leading_tab", "pop_method": "\tattestation_pop_jwt", "expect": "refused"},
+    {"name": "space_only", "pop_method": " ", "expect": "refused"},
+    {"name": "nul_suffix", "pop_method": "dpop_combined\u0000", "expect": "refused"},
+    {"name": "cyrillic_lookalike", "pop_method": "dpop_comb\u0456ned", "expect": "refused"},
+    {"name": "string_null", "pop_method": "null", "expect": "refused"},
+    {"name": "number", "pop_method": 1, "expect": "refused"},
+    {"name": "zero", "pop_method": 0, "expect": "refused"},
+    {"name": "true", "pop_method": true, "expect": "refused"},
+    {"name": "false", "pop_method": false, "expect": "refused"},
+    {"name": "empty_array", "pop_method": [], "expect": "refused"},
+    {"name": "array_of_name", "pop_method": ["dpop_combined"], "expect": "refused"},
+    {"name": "object", "pop_method": {"pop_method": "dpop_combined"}, "expect": "refused"}
+  ]
+}

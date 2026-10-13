@@ -12,7 +12,10 @@ import { decodeSegment, Malformed, parseObject } from "./validator/strict.js";
 const HTTP_SVID_TIMEOUT_MS = 20_000;
 /** How long `spire-agent` may run before it is killed (as in the other ports). */
 const SPIRE_AGENT_TIMEOUT_MS = 30_000;
-/** The most stdout read from `spire-agent`; more fails the fetch (as in the other ports). */
+/**
+ * The most stdout read from `spire-agent` (as in the other ports). More while the agent is running fails the
+ * fetch; once it has exited, reading stops there.
+ */
 const SPIRE_AGENT_MAX_OUTPUT = 1 << 20;
 /**
  * How long stdout is still read after `spire-agent` has exited (as in the other ports). A helper the agent
@@ -61,15 +64,17 @@ export class HttpSvidSource implements SvidSource {
  * The default source: fetch a JWT-SVID from a real SPIRE agent's Workload API via the `spire-agent`
  * CLI. Swap for a native Workload API client by implementing {@link SvidSource} if you prefer no
  * subprocess. An agent that has not exited within 30 s is killed and `fetch` rejects. `fetch` returns the
- * first JWT-SVID the agent prints on stdout and throws {@link EvidenceNotFound} if there is none. At most
- * 1 MiB of stdout is read: an agent that prints more is killed and `fetch` rejects. The agent's stderr is
- * discarded, never read as output or held in memory.
+ * first JWT-SVID the agent prints on stdout and throws {@link EvidenceNotFound} if there is none. The
+ * agent's stderr is discarded, never read as output or held in memory.
  *
- * The agent's exit decides the outcome, as in the other ports: once it has exited, stdout is read for at
- * most 250 ms more (a helper the agent started can inherit the pipe and hold it open), then the pipe is
- * closed. On exit status 0, what was read is parsed; on any other status, or if the agent was killed,
- * `fetch` rejects. A helper holding stdout never turns a success into a failure, and never keeps `fetch`
- * waiting longer than that.
+ * The agent's exit decides the outcome, as in the other ports. While the agent is running, more than
+ * 1 MiB of stdout kills it and `fetch` rejects. Once it has exited, stdout is read for at most 250 ms more
+ * and at most 1 MiB in all (a helper the agent started can inherit the pipe and keep writing to it or hold
+ * it open), then the pipe is closed. On exit status 0 what was read is parsed; on any other status, or if
+ * the agent was killed, `fetch` rejects. So output a helper writes after the agent has exited never turns a
+ * success into a failure, and never keeps `fetch` waiting longer than that. If reading stopped at the
+ * 1 MiB or at the end of the 250 ms, the last line may be cut off, so a token is only taken from a line
+ * that ends in a newline.
  *
  * Needs Node.js (it spawns a process): `node:child_process` is loaded on the first `fetch`, which throws
  * a `ClientAttestationError` on a runtime without it.
@@ -90,7 +95,7 @@ export class SpireWorkloadApiSvidSource implements SvidSource {
     );
     // stdout only: stderr goes to the null device, so a log line or version string the agent writes there
     // is never parsed, and a flood of it is never held in memory.
-    const stdout = await new Promise<string>((resolve, reject) => {
+    const { stdout, complete } = await new Promise<{ stdout: string; complete: boolean }>((resolve, reject) => {
       const args = ["api", "fetch", "jwt", "-audience", audience, "-socketPath", this.socketPath];
       const child = spawn(this.spireAgentBin, args, {
         stdio: ["ignore", "pipe", "ignore"],
@@ -99,7 +104,9 @@ export class SpireWorkloadApiSvidSource implements SvidSource {
       });
       const chunks: Uint8Array[] = [];
       let size = 0;
-      let over = false;
+      let over = false; // past the cap while the agent was running
+      let ended = false; // stdout was read to its end
+      let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
       let settled = false;
       let grace: ReturnType<typeof setTimeout> | undefined;
       // Settle once, and let go of stdout: a helper the agent started can inherit the pipe and hold it open
@@ -113,22 +120,33 @@ export class SpireWorkloadApiSvidSource implements SvidSource {
           const message = `spire-agent fetch failed: output is larger than ${SPIRE_AGENT_MAX_OUTPUT} bytes`;
           reject(Object.assign(new Error(message), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }));
         } else if (code === 0) {
-          resolve(concatUtf8(chunks, size));
+          resolve({ stdout: concatUtf8(chunks, size), complete: ended });
         } else {
           reject(spireAgentExitFailure(code, signal, child.killed));
         }
       };
       child.stdout?.on("data", (chunk: Uint8Array) => {
         if (over || settled) return;
-        size += chunk.length;
-        if (size > SPIRE_AGENT_MAX_OUTPUT) {
+        if (size + chunk.length > SPIRE_AGENT_MAX_OUTPUT) {
+          if (exited) {
+            // The agent has exited: stop at the cap, and let its exit status decide.
+            chunks.push(chunk.subarray(0, SPIRE_AGENT_MAX_OUTPUT - size));
+            size = SPIRE_AGENT_MAX_OUTPUT;
+            settle(exited.code, exited.signal);
+            return;
+          }
+          // Still running: kill it and fail.
           over = true;
           chunks.length = 0;
           child.kill("SIGKILL");
           settle(null, "SIGKILL");
           return;
         }
+        size += chunk.length;
         chunks.push(chunk);
+      });
+      child.stdout?.on("end", () => {
+        if (!settled) ended = true;
       });
       child.stdout?.on("error", () => {}); // the outcome comes from "exit" or "close"
       child.on("error", (err: NodeJS.ErrnoException) => {
@@ -141,11 +159,14 @@ export class SpireWorkloadApiSvidSource implements SvidSource {
       // The agent has exited (on its own, or killed at the timeout): what it wrote is in the pipe, so give
       // stdout a moment to drain, then settle whether or not something else still holds it open.
       child.on("exit", (code, signal) => {
+        exited = { code, signal };
         if (!settled) grace = setTimeout(() => settle(code, signal), SPIRE_AGENT_STDOUT_GRACE_MS);
       });
       child.on("close", (code, signal) => settle(code, signal));
     });
-    const svid = parseSpireJwtOutput(stdout);
+    // If reading stopped before the end of stdout (at the cap or the end of the grace period), the line
+    // after the last newline may have been cut off.
+    const svid = parseSpireJwtOutput(complete ? stdout : stdout.slice(0, stdout.lastIndexOf("\n") + 1));
     if (svid) return svid;
     // The output may hold a token or bundle that failed to parse, so the error gives only its size.
     const lines = stdout.split("\n").length - (stdout === "" || stdout.endsWith("\n") ? 1 : 0);

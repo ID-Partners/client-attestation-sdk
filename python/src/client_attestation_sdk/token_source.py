@@ -66,6 +66,11 @@ _STEP_LABELS = {"discover": "attester_url", "mint": "attestation_endpoint", "cha
 
 # Trace redaction (see `trace_redact`): header names whose values are credentials. The JSON/form members
 # and private JWK members live in `_redact`, shared with the loggers.
+# The two PoP methods the draft names (case-sensitive), the first being the default. `_check_pop_method`
+# and the flow both use these, so the flow can't take a value the check didn't.
+_POP_JWT = "attestation_pop_jwt"
+_DPOP_COMBINED = "dpop_combined"
+_POP_METHODS = (_POP_JWT, _DPOP_COMBINED)
 _SECRET_HEADERS = frozenset(h.lower() for h in ("Authorization", DPOP_HEADER, ATTESTATION_HEADER, POP_HEADER))
 _PIN_REQUIRED = ("evidence_audience is required: set it to the audience your attester expects the workload's "
                  "identity token for, so the attester's discovery document can't choose it")
@@ -99,7 +104,9 @@ class ClientAttestation:
             `"attestation_pop_jwt"` (default) sends a Client Attestation PoP JWT under the
             `OAuth-Client-Attestation-PoP` header. `"dpop_combined"` instead sends an RFC 9449
             DPoP proof (bound to the same instance key) under the `DPoP` header, with the
-            attester-issued challenge carried as the DPoP `nonce`.
+            attester-issued challenge carried as the DPoP `nonce`. `None` or `""` means the default.
+            The names are case-sensitive; any other value, including one with surrounding whitespace or
+            a non-string, raises `ValueError`.
         challenge_at_token: whether the attester-issued challenge also rides in the token-endpoint
             proof (the PoP's `challenge` claim, or the DPoP `nonce`), on top of the mint-time
             instance proof it always protects. Default `True` binds token issuance to the same
@@ -140,7 +147,7 @@ class ClientAttestation:
                  authorization_details: list = None,
                  operator: dict = None,
                  algorithm: str = "ES256", expiry_skew_seconds: int = DEFAULT_EXPIRY_SKEW_SECONDS,
-                 timeout: float = 20.0, pop_method: str = "attestation_pop_jwt",
+                 timeout: float = 20.0, pop_method: str = _POP_JWT,
                  challenge_at_token: bool = True,
                  trace: list = None, trace_redact: bool = True,
                  require_challenge: bool = True, allow_insecure: bool = False,
@@ -150,6 +157,7 @@ class ClientAttestation:
                 or not math.isfinite(expiry_skew_seconds) or expiry_skew_seconds < 0:
             raise ValueError("expiry_skew_seconds must be a finite number, not negative: "
                              f"{expiry_skew_seconds!r}")
+        pop_method = _check_pop_method(pop_method)
         self._profile = profile if profile is not None else PingFederateProfile()
         self._allow_insecure = allow_insecure
         if attester_url is None and (metadata is not None or profile is not None):
@@ -258,7 +266,7 @@ class ClientAttestation:
         # A client configured for DPoP checks the whole htu before fetching the token, so a URL with no
         # htu never costs a mint and token request on a cold cache. Otherwise only what parsers disagree
         # on is refused up front: a Bearer token carries no htu.
-        check = _normalize_htu if self._pop_method == "dpop_combined" else _check_htu
+        check = _normalize_htu if self._pop_method == _DPOP_COMBINED else _check_htu
         try:
             check(url)
         except ValueError as error:
@@ -456,6 +464,10 @@ class ClientAttestation:
     # ── the flow ──────────────────────────────────────────────────────────────────────────────────
     def _run_flow(self, *, asserted_context: dict = None):
         """Run the flow once; returns `(token_response, instance_key)`."""
+        # The constructor refused anything else. A value that still isn't one of the two fails here, before
+        # any request, rather than falling back to a PoP JWT.
+        if self._pop_method not in _POP_METHODS:
+            raise ClientAttestationError(f"unsupported pop_method {self._pop_method!r}")
         if not self._evidence_audience and not self._static_metadata:
             raise ClientAttestationError(_PIN_REQUIRED)
         meta = self.attester_metadata()
@@ -495,7 +507,7 @@ class ClientAttestation:
         # second time. Against one of those, only the mint gets the challenge.
         token_challenge = challenge if self._challenge_at_token else None
 
-        if self._pop_method == "dpop_combined":
+        if self._pop_method == _DPOP_COMBINED:
             # RFC 9449 DPoP proof, bound to the same instance key the attestation's cnf names. The
             # attester-issued challenge rides as the DPoP nonce — the AS ties it back to the mint the
             # same way it would a PoP JWT's `challenge` claim. If the AS demands its own nonce
@@ -506,7 +518,7 @@ class ClientAttestation:
             proof = dpop_proof(token_challenge or self._nonce_for(token_endpoint))
             proof_header = DPOP_HEADER
             retry_proof = dpop_proof
-        else:
+        else:   # _POP_JWT, checked at the top of the flow
             # The PoP audience must be PF's configured issuer, which the attester advertises as
             # pop_audience. Falling back to the token endpoint URL only works when the dialed URL
             # matches PF's issuer (no proxy in between) — so prefer the advertised value.
@@ -606,6 +618,18 @@ class ClientAttestation:
         except TransportError as error:
             _log_http_failed(step, method, url, error)
             raise
+
+
+def _check_pop_method(pop_method) -> str:
+    """The PoP method to use: `None` or `""` (unset, as from `os.environ.get`) is the default, and any
+    other value must be exactly one of the two the draft names. A case variant, surrounding whitespace or
+    a non-string is refused, so a misspelt value can't quietly send a PoP JWT (vectors/pop-method.json)."""
+    if pop_method is None or (isinstance(pop_method, str) and pop_method == ""):
+        return _POP_JWT
+    for name in _POP_METHODS:
+        if isinstance(pop_method, str) and pop_method == name:
+            return name   # the constant itself, not a str subclass the caller passed
+    raise ValueError(f"pop_method must be {_POP_METHODS[0]!r} or {_POP_METHODS[1]!r}, got {pop_method!r}")
 
 
 def _normalize_base_url(attester_url: str) -> str:

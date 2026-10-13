@@ -2,6 +2,7 @@
 cross-language agreement check."""
 import json
 import os
+import urllib.parse
 
 from client_attestation_sdk.errors import TransportError
 from client_attestation_sdk.token_validator import (AccessTokenValidator, IntrospectionConfig, ProtectedResource,
@@ -90,16 +91,38 @@ for case in load("introspection.json")["cases"]:
         row = {"name": case["name"], "valid": False, "error": "raises"}
     guard_results.append(row)
 
+client_auth_results = []
+for case in load("introspection.json")["client_auth"]:
+    sent = {}
+
+    def post(url, body, headers, sent=sent):
+        sent.update(body=body, headers=headers)
+        return {"active": True}
+
+    extra = {"auth_method": case["auth_method"]} if "auth_method" in case else {}
+    endpoint = IntrospectionConfig("https://issuer.example.com/introspect", case["client_id"], case["client_secret"],
+                                   **extra)
+    AccessTokenValidator(config_for(introspection=endpoint), http_post=post).introspect("opaque-token")
+    form = urllib.parse.parse_qs(sent["body"])
+    client_auth_results.append({
+        "name": case["name"], "authorization": sent["headers"].get("Authorization"),
+        "form": {"client_id": form.get("client_id", [None])[0], "client_secret": form.get("client_secret", [None])[0]}
+        if "client_id" in form or "client_secret" in form else None})
+
 config_results = []
 for case in load("config.json")["cases"]:
     cfg = case["config"]
     options = {"jwks": None if "jwks_uri" in cfg else vectors["jwks"], "jwks_uri": cfg.get("jwks_uri"),
                "allow_insecure": cfg.get("allow_insecure", False)}
-    if "introspection_endpoint" in cfg:
-        options["introspection"] = IntrospectionConfig(cfg["introspection_endpoint"], "rs", "secret")
     if "leeway_seconds" in cfg:
         options["leeway_seconds"] = cfg["leeway_seconds"]
     try:
+        if "introspection_endpoint" in cfg:
+            extra = ({"auth_method": cfg["introspection_auth_method"]} if "introspection_auth_method" in cfg
+                     else {})
+            options["introspection"] = IntrospectionConfig(cfg["introspection_endpoint"],
+                                                           cfg.get("introspection_client_id", "rs"),
+                                                           cfg.get("introspection_client_secret", "secret"), **extra)
         AccessTokenValidator(ValidatorConfig(issuer=vectors["issuer"], audiences=[vectors["audience"]], **options))
         row = {"name": case["name"], "valid": True, "error": None}
     except ValueError:
@@ -109,6 +132,6 @@ for case in load("config.json")["cases"]:
 os.makedirs(os.path.join(VALIDATION, "out"), exist_ok=True)
 with open(os.path.join(VALIDATION, "out", "python.json"), "w") as fh:
     json.dump({"language": "python", "results": results, "introspection_results": introspection_results,
-               "guard_results": guard_results,
+               "guard_results": guard_results, "client_auth_results": client_auth_results,
                "config_results": config_results}, fh, indent=2)
 print("wrote validation/out/python.json")
